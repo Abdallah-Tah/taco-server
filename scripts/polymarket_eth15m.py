@@ -212,21 +212,35 @@ def get_clob_prices(condition_id):
 
 # ── Place order via polymarket_executor ───────────────────────────────────────
 def place_order(side, shares, price, condition_id, token_id):
-    """Use the shared executor for orders."""
+    """Use aggressive FOK buy orders for immediate 15m fills and verify them."""
     import subprocess
     cmd = [
         str(VENV_PY),
         str(WORK_DIR / "scripts" / "polymarket_executor.py"),
-        "buy" if side.upper() == "BUY" else "sell",
+        "buy_fok" if side.upper() == "BUY" else "sell",
         token_id,
         str(shares),
         str(price),
     ]
     if DRY_RUN:
         log(f"[DRY] {'BUY' if side.upper()=='BUY' else 'SELL'} {shares} @{price:.4f} token={token_id}")
-        return {"success": True, "dry": True}
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-    return {"success": result.returncode == 0, "output": result.stdout, "error": result.stderr}
+        return {"success": True, "dry": True, "filled": True}
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
+    payload = {"success": result.returncode == 0, "output": result.stdout, "error": result.stderr, "filled": False}
+    try:
+        marker = '__RESULT__'
+        for line in result.stdout.splitlines():
+            if line.startswith(marker):
+                import json as _json
+                data = _json.loads(line[len(marker):])
+                fill = (data.get('fill_check') or {})
+                payload['filled'] = bool(fill.get('filled'))
+                payload['filled_size'] = fill.get('filled_size', 0)
+                payload['posted'] = data
+                break
+    except Exception:
+        pass
+    return payload
 
 # ── Journal logging ───────────────────────────────────────────────────────────
 def log_trade(engine, direction, size_usd, entry_price, pnl, exit_type, hold_sec, notes=""):
@@ -328,9 +342,21 @@ def check_snipe(market, seconds_remaining):
 
     log(f"[ETH-SNIPE] {direction} signal! ETH delta={delta_pct:+.3f}% size=${size:.2f} price={price:.4f} shares={shares:.2f}")
     r = place_order("BUY", shares, price, market["condition_id"], token_id)
+    # Log executor output so [ATTEMPT]/[RESULT] lines are visible
+    for line in (r.get("output") or "").splitlines():
+        if any(tag in line for tag in ("[ATTEMPT]", "[RESULT]", "Book best", "FILL")):
+            log(f"[EXEC] {line.strip()}")
+    if r.get("error"):
+        for line in r["error"].splitlines():
+            if line.strip():
+                log(f"[EXEC-ERR] {line.strip()}")
     notes = f"snipe {direction} delta={delta_pct:+.3f}% price={price:.4f} size=${size:.2f}"
-    log(f"[ETH-SNIPE] Result: {r.get('success')}. {notes}")
-    tg(f"[ETH-SNIPE] {notes}")
+    log(f"[ETH-SNIPE] Result: {r.get('success')} filled={r.get('filled')}. {notes}")
+    if not r.get('filled') and not DRY_RUN:
+        log(f"[ETH-SNIPE] No fill confirmed — not counting this trade as real")
+        tg(f"[ETH-SNIPE] NO FILL confirmed | {notes}")
+        return False
+    tg(f"[ETH-SNIPE] FILL CONFIRMED {r.get('filled_size', shares):.2f} shares | {notes}")
 
     _state["snipe_done"]        = True
     _state["prev_snipe_side"]  = direction
