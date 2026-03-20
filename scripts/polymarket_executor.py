@@ -25,6 +25,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+DATA_API = "https://data-api.polymarket.com"
+
 # ─── Dependencies ───
 
 try:
@@ -216,19 +218,80 @@ def get_open_orders(client):
         print(f"ERROR getting orders: {e}", file=sys.stderr)
         return []
 
-def place_order(client, token_id, amount, price, side=BUY, market_question="", condition_id=""):
+
+def get_order_book_raw(token_id):
+    r = requests.get(f"{CLOB_HOST}/book", params={"token_id": token_id}, timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+
+def get_best_prices(token_id):
+    ob = get_order_book_raw(token_id)
+    bids = [float(x.get("price", 0) or 0) for x in (ob.get("bids") or [])]
+    asks = [float(x.get("price", 0) or 0) for x in (ob.get("asks") or [])]
+    best_bid = max(bids) if bids else None
+    best_ask = min(asks) if asks else None
+    tick = float(ob.get("tick_size") or 0.01)
+    return {"best_bid": best_bid, "best_ask": best_ask, "tick_size": tick, "raw": ob}
+
+
+def verify_fill(token_id, min_size=0.0, lookback_sec=120):
+    """Check Data API for a recent executed BUY fill on this asset.
+    Activity is usually faster than trades, so prefer that first.
     """
-    Place a limit order.
-    
-    Args:
-        token_id: The YES or NO token to trade
-        amount: Number of shares (not dollar amount)
-        price: Limit price per share (0.01 - 0.99)
-        side: BUY or SELL
-        market_question: For logging
-        condition_id: For tracking
-    """
-    # Validate
+    try:
+        user = load_secrets().get("POLYMARKET_FUNDER")
+        if not user:
+            return {"filled": False, "reason": "missing_funder"}
+        after = int(time.time()) - lookback_sec
+
+        # Fast path: activity feed
+        ra = requests.get(f"{DATA_API}/activity", params={"user": user, "limit": 200, "offset": 0}, timeout=15)
+        if ra.status_code == 200:
+            acts = ra.json()
+            hits = []
+            total = 0.0
+            for a in acts:
+                if a.get("type") != "TRADE":
+                    continue
+                if str(a.get("asset")) != str(token_id):
+                    continue
+                if str(a.get("side", "")).upper() != "BUY":
+                    continue
+                ts = int(a.get("timestamp") or 0)
+                if ts < after:
+                    continue
+                sz = float(a.get("size") or 0)
+                total += sz
+                hits.append(a)
+            if total > 0:
+                return {"filled": total >= max(0.0, min_size * 0.5), "filled_size": total, "trades": hits, "source": "activity"}
+
+        # Slower fallback: trades feed
+        r = requests.get(f"{DATA_API}/trades", params={"user": user, "limit": 500, "offset": 0, "takerOnly": "false"}, timeout=15)
+        if r.status_code != 200:
+            return {"filled": False, "reason": f"trades_http_{r.status_code}"}
+        trades = r.json()
+        hits = []
+        total = 0.0
+        for t in trades:
+            if str(t.get("asset")) != str(token_id):
+                continue
+            if str(t.get("side", "")).upper() != "BUY":
+                continue
+            ts = int(t.get("timestamp") or 0)
+            if ts < after:
+                continue
+            sz = float(t.get("size") or 0)
+            total += sz
+            hits.append(t)
+        return {"filled": total > 0 and total >= max(0.0, min_size * 0.5), "filled_size": total, "trades": hits, "source": "trades"}
+    except Exception as e:
+        return {"filled": False, "reason": str(e)}
+
+
+def place_order(client, token_id, amount, price, side=BUY, market_question="", condition_id="", order_type=None, verify=False):
+    """Place an order. For 15m snipes we prefer FOK at/through the current best ask."""
     if price <= 0 or price >= 1:
         print(f"ERROR: Price must be between 0.01 and 0.99, got {price}", file=sys.stderr)
         return None
@@ -242,42 +305,76 @@ def place_order(client, token_id, amount, price, side=BUY, market_question="", c
         return None
 
     side_str = "BUY" if side == BUY else "SELL"
+    # --- PRECISION FIX: Polymarket decimal constraints ---
+    # taker_amount (shares): max 4 decimals | maker_amount (USDC): max 2 decimals
+    amount = round(amount, 4)
+    dollar_cost = round(amount * price, 2)
+
     print(f"Placing {side_str} order: {amount} shares @ ${price:.3f} = ${dollar_cost:.2f}")
     print(f"  Market: {market_question[:80]}")
     print(f"  Token: {token_id[:40]}...")
 
     try:
+        actual_price = price
+        actual_order_type = order_type or OrderType.GTC
+        best_ask = None
+        tick = 0.01
+        if side == BUY and order_type in (OrderType.FOK, OrderType.FAK):
+            book = get_best_prices(token_id)
+            best_ask = book.get("best_ask")
+            tick = book.get("tick_size") or 0.01
+            if best_ask is not None:
+                actual_price = min(0.99, max(price, best_ask + tick))
+                actual_price = round(actual_price, 2)
+                print(f"[ATTEMPT] side={side_str} best_ask={best_ask:.4f} submitted_price={actual_price:.4f} shares={amount} size=${dollar_cost:.2f}")
+            else:
+                print(f"[ATTEMPT] side={side_str} best_ask=NONE -- skipping FOK order", file=sys.stderr)
+                return None
+        else:
+            print(f"[ATTEMPT] side={side_str} price={actual_price:.4f} shares={amount} size=${dollar_cost:.2f} order_type={actual_order_type}")
+
         order_args = OrderArgs(
             token_id=token_id,
-            price=price,
+            price=round(actual_price, 2),
             size=amount,
             side=side,
         )
-        signed_order = client.create_and_post_order(order_args)
-        
-        order_id = None
-        if isinstance(signed_order, dict):
-            order_id = signed_order.get("orderID") or signed_order.get("id")
-            print(f"✅ Order placed! ID: {order_id}")
-            print(f"   Response: {json.dumps(signed_order, indent=2)[:500]}")
-        else:
-            print(f"✅ Order response: {signed_order}")
+        signed = client.create_order(order_args)
+        posted = client.post_order(signed, orderType=actual_order_type)
 
-        # Log it
+        order_id = None
+        if isinstance(posted, dict):
+            order_id = posted.get("orderID") or posted.get("id")
+            print(f"[RESULT] filled=pending order_id={order_id} reason=posted_ok")
+            print(f"   Response: {json.dumps(posted, indent=2)[:500]}")
+        else:
+            print(f"[RESULT] filled=pending order_id=none reason=non_dict_response")
+
         log_trade(
             action=side_str,
             token_id=token_id,
             amount=amount,
-            price=price,
+            price=actual_price,
             order_id=order_id,
             market_question=market_question,
+            extra={"order_type": str(actual_order_type), "best_ask": best_ask, "submitted_price": actual_price, "tick_size": tick},
         )
 
-        # Track position if buy
-        if side == BUY:
-            save_position(token_id, amount, price, side_str, market_question, condition_id)
+        fill = None
+        if verify and side == BUY:
+            time.sleep(2)
+            fill = verify_fill(token_id, min_size=amount, lookback_sec=180)
+            if fill.get("filled"):
+                print(f"[RESULT] filled=true order_id={order_id} reason=fill_confirmed shares={fill.get('filled_size', 0):.4f}")
+                save_position(token_id, fill.get("filled_size", amount), actual_price, side_str, market_question, condition_id)
+            else:
+                print(f"[RESULT] filled=false order_id={order_id} reason=no_fill_confirmed", file=sys.stderr)
 
-        return signed_order
+        if isinstance(posted, dict):
+            posted["fill_check"] = fill
+            posted["submitted_price"] = actual_price
+            posted["submitted_order_type"] = str(actual_order_type)
+        return posted
 
     except Exception as e:
         error_msg = str(e)
@@ -621,6 +718,16 @@ def main():
         question = " ".join(args[4:]) if len(args) > 4 else ""
         client = get_client()
         place_order(client, token_id, amount, price, BUY, question)
+
+    elif cmd == "buy_fok" and len(args) >= 4:
+        token_id = args[1]
+        amount = float(args[2])
+        price = float(args[3])
+        question = " ".join(args[4:]) if len(args) > 4 else ""
+        client = get_client()
+        result = place_order(client, token_id, amount, price, BUY, question, order_type=OrderType.FOK, verify=True)
+        if isinstance(result, dict):
+            print("__RESULT__" + json.dumps(result, default=str))
 
     elif cmd == "sell" and len(args) >= 4:
         token_id = args[1]
