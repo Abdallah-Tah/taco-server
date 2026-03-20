@@ -339,6 +339,10 @@ def check_snipe(market, seconds_remaining):
 
     size = SNIPE_STRONG if abs(delta_pct) >= SNIPE_STRONG_D * 100 else SNIPE_DEFAULT
     shares = size / price
+    # Ensure minimum 5 shares for Polymarket
+    if shares < 5:
+        shares = 5
+        size = shares * price
 
     log(f"[ETH-SNIPE] {direction} signal! ETH delta={delta_pct:+.3f}% size=${size:.2f} price={price:.4f} shares={shares:.2f}")
     r = place_order("BUY", shares, price, market["condition_id"], token_id)
