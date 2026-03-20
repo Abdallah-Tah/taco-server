@@ -1,0 +1,29 @@
+# Python venv
+.polymarket-venv/
+*.venv/
+__pycache__/
+*.pyc
+
+# Embedded repos
+freqtrade/
+*/.git/
+
+# Sensitive files
+secrets.env
+.env
+*.env
+*.json
+!.gitignore
+
+# State files
+.positions.json
+.positions.bak
+.trade_log.json
+.poly_positions.json
+.poly_trade_log.json
+.poly_*.json
+*.log
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,659 @@
+#!/usr/bin/env python3
+"""
+Taco Polymarket Executor — Place real trades on Polymarket CLOB via Tor.
+
+Functions:
+  - buy_yes / buy_no: Place limit orders
+  - get_positions: Check current positions
+  - get_balance: Check USDC balance
+  - cancel_order: Cancel open orders
+  - scan_and_trade: Auto-trade from scanner output
+
+Usage:
+  python3 polymarket_executor.py balance              # Check balance
+  python3 polymarket_executor.py positions             # Show positions
+  python3 polymarket_executor.py orders                # Show open orders
+  python3 polymarket_executor.py buy <token_id> <amount> <price>   # Buy limit order
+  python3 polymarket_executor.py sell <token_id> <amount> <price>  # Sell limit order
+  python3 polymarket_executor.py cancel <order_id>     # Cancel order
+  python3 polymarket_executor.py auto                  # Scan + auto-trade top picks
+"""
+import json
+import os
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+# ─── Dependencies ───
+
+try:
+    from py_clob_client.client import ClobClient
+    from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType, BalanceAllowanceParams, AssetType
+    from py_clob_client.order_builder.constants import BUY, SELL
+except ImportError:
+    print("ERROR: py_clob_client not installed. Run: pip install py-clob-client", file=sys.stderr)
+    sys.exit(1)
+
+import requests
+
+# ─── CRITICAL: Patch httpx client for Tor SOCKS proxy ───
+# py_clob_client uses httpx internally, not requests.Session
+# We must replace the global _http_client before any API calls
+import httpx
+from py_clob_client.http_helpers import helpers as _clob_helpers
+_clob_helpers._http_client = httpx.Client(proxy='socks5://127.0.0.1:9050', http2=True)
+
+# ─── Config ───
+
+CLOB_HOST = "https://clob.polymarket.com"
+CHAIN_ID = 137
+SIGNATURE_TYPE = 0  # EOA
+
+TOR_PROXY = {"http": "socks5h://127.0.0.1:9050", "https": "socks5h://127.0.0.1:9050"}
+SECRETS_FILE = Path.home() / ".config" / "openclaw" / "secrets.env"
+
+# State files
+STATE_DIR = Path.home() / ".openclaw" / "workspace" / "trading"
+POLY_POSITIONS_FILE = STATE_DIR / ".poly_positions.json"
+POLY_TRADE_LOG = STATE_DIR / ".poly_trade_log.json"
+
+# ─── Load config constants ───
+import logging
+import sys as _sys
+_sys.path.insert(0, str(STATE_DIR / "scripts"))
+
+try:
+    from config import (
+        POLY_MAX_SIZE as MAX_TRADE_SIZE,
+        POLY_DEFAULT_SIZE as DEFAULT_TRADE_SIZE,
+        POLY_MIN_SHARES as MIN_SHARES,
+        POLY_MAX_POSITIONS as MAX_POSITIONS,
+        POLY_MAX_ORDERS as MAX_OPEN_ORDERS,
+        POLY_HIGH_CONVICTION_SIZE,
+        NEWS_EDGE_MIN,
+        NEWS_CONFIDENCE_MIN,
+        HIGH_CONVICTION_EDGE,
+        BLOCKED_CATEGORIES,
+        MAX_CORRELATED_POSITIONS,
+        PAUSE_THRESHOLD_USD,
+    )
+except ImportError:
+    # Fallback defaults if config not available
+    MAX_TRADE_SIZE = 10.0
+    DEFAULT_TRADE_SIZE = 5.0
+    MIN_SHARES = 5
+    MAX_POSITIONS = 8
+    MAX_OPEN_ORDERS = 10
+    POLY_HIGH_CONVICTION_SIZE = 7.50
+    NEWS_EDGE_MIN = 8.0
+    NEWS_CONFIDENCE_MIN = 30.0
+    HIGH_CONVICTION_EDGE = 15.0
+    BLOCKED_CATEGORIES = ["sports", "spreads"]
+    MAX_CORRELATED_POSITIONS = 2
+    PAUSE_THRESHOLD_USD = 70.0
+
+MIN_TRADE_SIZE = 1.0  # Hard floor
+
+logger = logging.getLogger(__name__)
+
+# ─── Helpers ───
+
+def load_secrets():
+    """Load Polymarket credentials from secrets file."""
+    secrets = {}
+    if SECRETS_FILE.exists():
+        for line in SECRETS_FILE.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                secrets[k.strip()] = v.strip().strip('"').strip("'")
+    return secrets
+
+def get_client():
+    """Create authenticated ClobClient routed through Tor."""
+    secrets = load_secrets()
+
+    funder = secrets.get("POLYMARKET_FUNDER")
+    private_key = secrets.get("POLYMARKET_PRIVATE_KEY")
+    api_key = secrets.get("POLYMARKET_API_KEY")
+    api_secret = secrets.get("POLYMARKET_API_SECRET")
+    passphrase = secrets.get("POLYMARKET_PASSPHRASE")
+
+    if not all([funder, private_key, api_key, api_secret, passphrase]):
+        print("ERROR: Missing Polymarket credentials in secrets.env", file=sys.stderr)
+        sys.exit(1)
+
+    creds = ApiCreds(
+        api_key=api_key,
+        api_secret=api_secret,
+        api_passphrase=passphrase,
+    )
+
+    client = ClobClient(
+        host=CLOB_HOST,
+        chain_id=CHAIN_ID,
+        key=private_key,
+        signature_type=SIGNATURE_TYPE,
+        funder=funder,
+        creds=creds,
+    )
+
+    # Tor routing is handled by the httpx monkey-patch at module level
+    return client
+
+def log_trade(action, token_id, amount, price, order_id=None, market_question="", extra=None):
+    """Append trade to log file."""
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "action": action,
+        "token_id": token_id[:20] + "..." if token_id and len(token_id) > 20 else token_id,
+        "amount": amount,
+        "price": price,
+        "order_id": order_id,
+        "market": market_question[:80] if market_question else "",
+    }
+    if extra:
+        entry.update(extra)
+
+    log = []
+    if POLY_TRADE_LOG.exists():
+        try:
+            log = json.loads(POLY_TRADE_LOG.read_text())
+        except:
+            pass
+    log.append(entry)
+    POLY_TRADE_LOG.write_text(json.dumps(log, indent=2))
+
+def save_position(token_id, amount, price, side, market_question="", condition_id=""):
+    """Track a position."""
+    positions = load_positions()
+    positions[token_id] = {
+        "amount": amount,
+        "avg_price": price,
+        "side": side,
+        "market": market_question[:80],
+        "condition_id": condition_id,
+        "opened": datetime.now(timezone.utc).isoformat(),
+    }
+    POLY_POSITIONS_FILE.write_text(json.dumps(positions, indent=2))
+
+def load_positions():
+    """Load tracked positions."""
+    if POLY_POSITIONS_FILE.exists():
+        try:
+            return json.loads(POLY_POSITIONS_FILE.read_text())
+        except:
+            pass
+    return {}
+
+def remove_position(token_id):
+    """Remove a closed position."""
+    positions = load_positions()
+    if token_id in positions:
+        del positions[token_id]
+        POLY_POSITIONS_FILE.write_text(json.dumps(positions, indent=2))
+
+# ─── Core Operations ───
+
+def check_balance(client):
+    """Check USDC balance and allowances."""
+    try:
+        params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+        bal = client.get_balance_allowance(params)
+        print(f"USDC Balance: {json.dumps(bal, indent=2)}")
+        return bal
+    except Exception as e:
+        print(f"ERROR getting balance: {e}", file=sys.stderr)
+        return None
+
+def get_open_orders(client):
+    """Get all open orders."""
+    try:
+        orders = client.get_orders()
+        return orders
+    except Exception as e:
+        print(f"ERROR getting orders: {e}", file=sys.stderr)
+        return []
+
+def place_order(client, token_id, amount, price, side=BUY, market_question="", condition_id=""):
+    """
+    Place a limit order.
+    
+    Args:
+        token_id: The YES or NO token to trade
+        amount: Number of shares (not dollar amount)
+        price: Limit price per share (0.01 - 0.99)
+        side: BUY or SELL
+        market_question: For logging
+        condition_id: For tracking
+    """
+    # Validate
+    if price <= 0 or price >= 1:
+        print(f"ERROR: Price must be between 0.01 and 0.99, got {price}", file=sys.stderr)
+        return None
+
+    dollar_cost = amount * price
+    if dollar_cost > MAX_TRADE_SIZE:
+        print(f"ERROR: Trade cost ${dollar_cost:.2f} exceeds max ${MAX_TRADE_SIZE}", file=sys.stderr)
+        return None
+    if amount < MIN_SHARES:
+        print(f"ERROR: Shares {amount} below Polymarket minimum {MIN_SHARES}", file=sys.stderr)
+        return None
+
+    side_str = "BUY" if side == BUY else "SELL"
+    print(f"Placing {side_str} order: {amount} shares @ ${price:.3f} = ${dollar_cost:.2f}")
+    print(f"  Market: {market_question[:80]}")
+    print(f"  Token: {token_id[:40]}...")
+
+    try:
+        order_args = OrderArgs(
+            token_id=token_id,
+            price=price,
+            size=amount,
+            side=side,
+        )
+        signed_order = client.create_and_post_order(order_args)
+        
+        order_id = None
+        if isinstance(signed_order, dict):
+            order_id = signed_order.get("orderID") or signed_order.get("id")
+            print(f"✅ Order placed! ID: {order_id}")
+            print(f"   Response: {json.dumps(signed_order, indent=2)[:500]}")
+        else:
+            print(f"✅ Order response: {signed_order}")
+
+        # Log it
+        log_trade(
+            action=side_str,
+            token_id=token_id,
+            amount=amount,
+            price=price,
+            order_id=order_id,
+            market_question=market_question,
+        )
+
+        # Track position if buy
+        if side == BUY:
+            save_position(token_id, amount, price, side_str, market_question, condition_id)
+
+        return signed_order
+
+    except Exception as e:
+        error_msg = str(e)
+        print(f"❌ Order failed: {error_msg}", file=sys.stderr)
+        log_trade(
+            action=f"FAILED_{side_str}",
+            token_id=token_id,
+            amount=amount,
+            price=price,
+            market_question=market_question,
+            extra={"error": error_msg[:200]},
+        )
+        return None
+
+def cancel_order(client, order_id):
+    """Cancel an open order."""
+    try:
+        result = client.cancel(order_id)
+        print(f"✅ Cancelled order {order_id}: {result}")
+        log_trade("CANCEL", "", 0, 0, order_id=order_id)
+        return result
+    except Exception as e:
+        print(f"❌ Cancel failed: {e}", file=sys.stderr)
+        return None
+
+def cancel_all_orders(client):
+    """Cancel all open orders."""
+    try:
+        result = client.cancel_all()
+        print(f"✅ Cancelled all orders: {result}")
+        return result
+    except Exception as e:
+        print(f"❌ Cancel all failed: {e}", file=sys.stderr)
+        return None
+
+# ─── Auto-Trade ───
+
+def auto_trade(client, scanner_json=None):
+    """
+    Scan markets and place trades on top opportunities.
+    Uses polymarket_scanner_v2.py output or runs it fresh.
+    """
+    import subprocess
+
+    # Check current positions
+    positions = load_positions()
+    if len(positions) >= MAX_POSITIONS:
+        print(f"Already at max positions ({MAX_POSITIONS}). Skipping auto-trade.")
+        return
+
+    # Check open orders
+    open_orders = get_open_orders(client)
+    if isinstance(open_orders, list) and len(open_orders) >= MAX_OPEN_ORDERS:
+        print(f"Already at max open orders ({MAX_OPEN_ORDERS}). Skipping.")
+        return
+
+    # Run scanner
+    if not scanner_json:
+        print("Running scanner...")
+        scanner_path = STATE_DIR / "scripts" / "polymarket_scanner_v2.py"
+        venv_python = STATE_DIR / ".polymarket-venv" / "bin" / "python3"
+        
+        result = subprocess.run(
+            [str(venv_python), str(scanner_path), "--json"],
+            capture_output=True, text=True, timeout=120,
+        )
+        if result.returncode != 0:
+            print(f"Scanner error: {result.stderr[:300]}", file=sys.stderr)
+            return
+        
+        try:
+            opportunities = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            print("Scanner output not valid JSON", file=sys.stderr)
+            return
+    else:
+        opportunities = scanner_json
+
+    if not opportunities:
+        print("No opportunities found.")
+        return
+
+    print(f"\nFound {len(opportunities)} opportunities above threshold")
+
+    # Filter: skip markets we already have positions in
+    existing_tokens = set(positions.keys())
+    candidates = []
+
+    # Load correlation guard
+    try:
+        from correlation import check_correlation
+        has_correlation = True
+    except ImportError:
+        has_correlation = False
+
+    for opp in opportunities:
+        token_ids = opp.get("token_ids", [])
+        if not token_ids:
+            continue
+        if any(t in existing_tokens for t in token_ids):
+            continue
+
+        # BLOCKED CATEGORIES check (from config)
+        cat = opp.get("category", "").lower()
+        q = opp.get("question", "").lower()
+        blocked = False
+        for bc in BLOCKED_CATEGORIES:
+            if bc == cat or bc in q:
+                print(f"BLOCKED CATEGORY: {bc} — skipping '{opp.get('question','')[:60]}'")
+                logger.info("BLOCKED CATEGORY: %s for market '%s'", bc, opp.get('question','')[:60])
+                blocked = True
+                break
+        if blocked:
+            continue
+
+        # Correlation guard
+        if has_correlation:
+            allowed, thesis, corr_count = check_correlation(opp.get("question", ""), positions)
+            if not allowed:
+                msg = f"CORRELATION GUARD: blocked '{opp.get('question','')[:60]}' (thesis={thesis}, count={corr_count})"
+                print(msg)
+                logger.warning(msg)
+                continue
+
+        # Need a tight spread to trade
+        spread = opp.get("spread")
+        if spread is not None and spread > 0.05:
+            continue
+        candidates.append(opp)
+
+    if not candidates:
+        print("No new candidates after filtering.")
+        return
+
+    # ── Drawdown / pause check ──
+    try:
+        from portfolio import check_drawdown, _load_portfolio, _save_portfolio, snapshot, is_paused
+        _portfolio = _load_portfolio()
+        _snap = snapshot()
+        _total_usd = _snap.get("total_usd", None)
+        if _total_usd is None:
+            print("⚠️ snapshot() returned no total_usd, using fallback $100")
+            _total_usd = 100.0
+        _portfolio = check_drawdown(_portfolio, _total_usd)
+        _save_portfolio(_portfolio)
+        if is_paused(_portfolio):
+            print(f"⛔ DRAWDOWN PAUSE: capital=${_total_usd:.2f} — skipping auto-trade.")
+            return
+    except ImportError:
+        pass
+
+    # Pick top candidates — but validate with news first
+    slots = MAX_POSITIONS - len(positions)
+    
+    # Import news edge analyzer
+    try:
+        sys.path.insert(0, str(STATE_DIR / "scripts"))
+        from polymarket_news_edge import analyze_opportunity
+        has_news = True
+        print("\n📰 News edge validation enabled")
+    except ImportError:
+        has_news = False
+        print("\n⚠️ News edge module not available, trading without validation")
+
+    validated = []
+    for opp in candidates[:slots * 3]:  # Check 3x candidates to find enough valid ones
+        if len(validated) >= slots:
+            break
+
+        question = opp.get("question", "?")
+        yes_price = opp.get("yes", 0.5)
+        token_ids = opp.get("token_ids", [])
+        
+        if has_news:
+            print(f"\n  📰 Checking news for: {question[:60]}...")
+            analysis = analyze_opportunity(question, yes_price)
+            rec = analysis.get("recommendation", "SKIP")
+            edge = analysis.get("edge", 0)
+            confidence = analysis.get("confidence", 0)
+            
+            if rec == "SKIP":
+                print(f"     ⏭️ SKIP — {analysis.get('reason', 'no edge')}")
+                continue
+            
+            print(f"     ✅ {rec} — edge:{edge:+.3f} conf:{confidence:.0%}")
+            
+            # Override direction based on news
+            if edge > 0:
+                opp["_direction"] = "YES"
+                opp["_token"] = token_ids[0] if token_ids else None
+                opp["_price"] = yes_price
+            else:
+                opp["_direction"] = "NO"
+                opp["_token"] = token_ids[1] if len(token_ids) > 1 else None
+                opp["_price"] = 1 - yes_price
+            
+            # Size based on conviction
+            if rec == "STRONG_BUY":
+                opp["_size_mult"] = 1.5
+            else:
+                opp["_size_mult"] = 1.0
+            
+            validated.append(opp)
+            time.sleep(0.5)
+        else:
+            validated.append(opp)
+
+    picks = validated
+
+    print(f"\n🎯 Trading {len(picks)} news-validated markets:")
+    for opp in picks:
+        token_ids = opp.get("token_ids", [])
+        yes_token = token_ids[0] if token_ids else None
+        no_token = token_ids[1] if len(token_ids) > 1 else None
+        yes_price = opp.get("yes", 0.5)
+        question = opp.get("question", "?")
+        condition_id = opp.get("condition_id", "")
+        score = opp.get("score", 0)
+
+        # Use news-validated direction if available
+        if "_direction" in opp:
+            direction = opp["_direction"]
+            token = opp["_token"]
+            price = opp["_price"]
+            size_mult = opp.get("_size_mult", 1.0)
+        else:
+            if yes_price <= 0.5:
+                token = yes_token
+                price = yes_price
+                direction = "YES"
+            else:
+                token = no_token
+                price = 1 - yes_price
+                direction = "NO"
+            size_mult = 1.0
+
+        if not token:
+            continue
+
+        # Size: scale by score and conviction
+        if score >= 80:
+            size_usd = DEFAULT_TRADE_SIZE * 1.5 * size_mult
+        elif score >= 70:
+            size_usd = DEFAULT_TRADE_SIZE * size_mult
+        else:
+            size_usd = DEFAULT_TRADE_SIZE * 0.75
+
+        size_usd = min(size_usd, MAX_TRADE_SIZE)
+        shares = round(size_usd / price, 1) if price > 0 else 0
+
+        if shares <= 0:
+            continue
+
+        print(f"\n  [{direction}] {question[:70]}")
+        print(f"  Score: {score} | Price: {price:.3f} | Shares: {shares} | Cost: ~${shares * price:.2f}")
+
+        result = place_order(
+            client,
+            token_id=token,
+            amount=shares,
+            price=round(price, 2),
+            side=BUY,
+            market_question=question,
+            condition_id=condition_id,
+        )
+
+        if result:
+            print(f"  ✅ Order placed")
+        else:
+            print(f"  ❌ Order failed")
+
+        time.sleep(1)  # Rate limit between orders
+
+# ─── CLI ───
+
+def show_positions():
+    """Display tracked positions."""
+    positions = load_positions()
+    if not positions:
+        print("No tracked positions.")
+        return
+    print(f"\n📊 Polymarket Positions ({len(positions)}):")
+    print("-" * 60)
+    for token_id, pos in positions.items():
+        print(f"  {pos.get('side', '?')} | ${pos.get('avg_price', 0):.3f} x {pos.get('amount', 0)}")
+        print(f"  {pos.get('market', '?')}")
+        print(f"  Token: {token_id[:40]}...")
+        print(f"  Opened: {pos.get('opened', '?')}")
+        print()
+
+def show_trade_log():
+    """Display trade history."""
+    if not POLY_TRADE_LOG.exists():
+        print("No trade history.")
+        return
+    try:
+        log = json.loads(POLY_TRADE_LOG.read_text())
+    except:
+        print("Trade log corrupted.")
+        return
+    print(f"\n📜 Trade Log ({len(log)} entries):")
+    print("-" * 60)
+    for entry in log[-10:]:  # Last 10
+        print(f"  {entry.get('timestamp', '?')[:19]} | {entry.get('action', '?')} | ${entry.get('price', 0):.3f} x {entry.get('amount', 0)}")
+        if entry.get('market'):
+            print(f"    {entry['market']}")
+        if entry.get('error'):
+            print(f"    ❌ {entry['error']}")
+        print()
+
+def main():
+    args = sys.argv[1:]
+    if not args:
+        print(__doc__)
+        return
+
+    cmd = args[0].lower()
+
+    if cmd == "balance":
+        client = get_client()
+        check_balance(client)
+
+    elif cmd == "positions":
+        show_positions()
+
+    elif cmd == "orders":
+        client = get_client()
+        orders = get_open_orders(client)
+        if orders:
+            print(json.dumps(orders, indent=2, default=str)[:2000])
+        else:
+            print("No open orders.")
+
+    elif cmd == "log":
+        show_trade_log()
+
+    elif cmd == "buy" and len(args) >= 4:
+        token_id = args[1]
+        amount = float(args[2])
+        price = float(args[3])
+        question = " ".join(args[4:]) if len(args) > 4 else ""
+        client = get_client()
+        place_order(client, token_id, amount, price, BUY, question)
+
+    elif cmd == "sell" and len(args) >= 4:
+        token_id = args[1]
+        amount = float(args[2])
+        price = float(args[3])
+        client = get_client()
+        place_order(client, token_id, amount, price, SELL)
+
+    elif cmd == "cancel" and len(args) >= 2:
+        order_id = args[1]
+        client = get_client()
+        if order_id == "all":
+            cancel_all_orders(client)
+        else:
+            cancel_order(client, order_id)
+
+    elif cmd == "auto":
+        client = get_client()
+        auto_trade(client)
+
+    elif cmd == "test":
+        # Test connectivity only
+        print("Testing Polymarket connection via Tor...")
+        client = get_client()
+        bal = check_balance(client)
+        if bal:
+            print("✅ Connection working!")
+        else:
+            print("❌ Connection failed")
+
+    else:
+        print(f"Unknown command: {cmd}")
+        print(__doc__)
+
+if __name__ == "__main__":
+    main()
