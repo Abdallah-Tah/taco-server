@@ -11,6 +11,7 @@ Dry run by default. Set DRY_RUN=false to go live.
 import json
 import math
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -39,6 +40,18 @@ def _load_env():
 
 ENV = _load_env()
 
+def _float(key, default):
+    try:
+        return float(os.environ.get(key, ENV.get(key, default)))
+    except Exception:
+        return float(default)
+
+def _int(key, default):
+    try:
+        return int(os.environ.get(key, ENV.get(key, default)))
+    except Exception:
+        return int(default)
+
 TELEGRAM_TOKEN = ENV.get("TELEGRAM_TOKEN", "8457917317:AAGtnuRix7Ei-rslwVAbfFIFJSK0UIwi0d4")
 CHAT_ID        = ENV.get("CHAT_ID",        "7520899464")
 POLY_WALLET    = ENV.get("POLY_WALLET",    "0x1a4c163a134D7154ebD5f7359919F9c439424f00")
@@ -46,18 +59,18 @@ VENV_PY        = Path("/home/abdaltm86/.openclaw/workspace/trading/.polymarket-v
 DRY_RUN        = os.environ.get("BTC15M_DRY_RUN",  ENV.get("BTC15M_DRY_RUN",  "true")).lower() != "false"
 
 # ── Config ────────────────────────────────────────────────────────────────────
-WINDOW_SEC       = 900          # 15 minutes
-ARB_THRESHOLD    = 0.98
-ARB_SIZE         = 10.00
-SNIPE_DELTA_MIN = 0.035        # percent  (BTC has smaller deltas)
-SNIPE_MAX_PRICE = 0.88         # tighter max price
-SNIPE_DEFAULT   = 5.00
-SNIPE_STRONG    = 7.50
-SNIPE_STRONG_D  = 0.10          # delta threshold for strong size
-SNIPE_WINDOW    = 15            # seconds before close to snipe
-POLL_SEC        = 5
-SCAN_SEC        = 10
-MAX_DAILY_LOSS  = 15.00        # conservative first day
+WINDOW_SEC      = _int("BTC15M_WINDOW_SEC", 900)          # 15 minutes
+ARB_THRESHOLD   = _float("BTC15M_ARB_THRESHOLD", 0.98)
+ARB_SIZE        = _float("BTC15M_ARB_SIZE", 10.00)
+SNIPE_DELTA_MIN = _float("BTC15M_SNIPE_DELTA_MIN", 0.025)
+SNIPE_MAX_PRICE = _float("BTC15M_SNIPE_MAX_PRICE", 0.90)
+SNIPE_DEFAULT   = _float("BTC15M_SNIPE_DEFAULT_SIZE", 5.00)
+SNIPE_STRONG    = _float("BTC15M_SNIPE_STRONG_SIZE", 7.50)
+SNIPE_STRONG_D  = _float("BTC15M_SNIPE_STRONG_DELTA", 0.10)  # percent
+SNIPE_WINDOW    = _int("BTC15M_SNIPE_WINDOW_SEC", 30)
+POLL_SEC        = _int("BTC15M_PRICE_POLL_SEC", 5)
+SCAN_SEC        = _int("BTC15M_SCAN_INTERVAL", 10)
+MAX_DAILY_LOSS  = _float("BTC15M_MAX_DAILY_LOSS", 15.00)
 SERIES_ID       = "10192"
 SERIES_SLUG     = "btc-up-or-down-15m"
 
@@ -96,6 +109,16 @@ def tg(msg):
         except Exception:
             pass
     threading.Thread(target=_send, daemon=True).start()
+
+
+def trigger_post_resolution_tasks():
+    if DRY_RUN:
+        return
+    try:
+        subprocess.Popen([str(VENV_PY), str(WORK_DIR / 'scripts' / 'polymarket_reconcile.py')], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.Popen([str(VENV_PY), str(WORK_DIR / 'scripts' / 'polymarket_redeem.py')], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        log(f"[POST-RESOLUTION] task launch error: {e}")
 
 # ── Persistence ───────────────────────────────────────────────────────────────
 def save_state():
@@ -301,14 +324,6 @@ def setup_new_window(slug, window_ts):
     if btc_price is None:
         btc_price = _state.get("window_open_btc", 0.0)
 
-    # Check previous window result before resetting
-    check_previous_result(
-        _state.get("prev_slug", ""),
-        _state.get("prev_snipe_side", ""),
-        _state.get("prev_snipe_price", 0.0),
-        _state.get("prev_snipe_size", 0.0),
-    )
-
     _state["window_ts"]       = window_ts
     _state["window_open_btc"] = btc_price
     _state["arb_done"]        = False
@@ -316,6 +331,7 @@ def setup_new_window(slug, window_ts):
     _state["btc_prices"]      = [(int(time.time()), btc_price)]
     _state["prev_slug"]       = slug
     save_state()
+    trigger_post_resolution_tasks()
 
     log(f"[NEW WINDOW] ts={window_ts} BTC={btc_price} slug={slug}")
     # Window start — no telegram noise

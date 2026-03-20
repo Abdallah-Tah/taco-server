@@ -304,6 +304,142 @@ def redeemable_report():
     return result
 
 
+
+
+def engine_report():
+    """Summarize BTC/ETH 15m engine status and resolved trade results."""
+    import sqlite3
+    import subprocess
+    result = {"btc": {}, "eth": {}}
+    engine_specs = {
+        "btc": {
+            "label": "BTC-15m",
+            "engine": "btc15m",
+            "pid": "/tmp/polymarket_btc15m.pid",
+            "log": "/tmp/polymarket_btc15m.log",
+            "script": ROOT / 'scripts' / 'polymarket_btc15m.py',
+        },
+        "eth": {
+            "label": "ETH-15m",
+            "engine": "eth15m",
+            "pid": "/tmp/polymarket_eth15m.pid",
+            "log": "/tmp/polymarket_eth15m.log",
+            "script": ROOT / 'scripts' / 'polymarket_eth15m.py',
+        },
+    }
+
+    conn = sqlite3.connect(str(ROOT / 'journal.db'))
+    c = conn.cursor()
+    for key, spec in engine_specs.items():
+        info = {
+            'label': spec['label'], 'running': False, 'pid': None,
+            'resolved': 0, 'wins': 0, 'losses': 0, 'pnl': 0.0,
+            'threshold': '?', 'recent_error': None,
+        }
+        pid_path = Path(spec['pid'])
+        if pid_path.exists():
+            try:
+                pid = int(pid_path.read_text().strip())
+                info['pid'] = pid
+                subprocess.run(['kill', '-0', str(pid)], check=True, capture_output=True)
+                info['running'] = True
+            except Exception:
+                pass
+
+        try:
+            c.execute("""
+                SELECT COUNT(*),
+                       COALESCE(SUM(CASE WHEN pnl_percent > 0 THEN 1 ELSE 0 END), 0),
+                       COALESCE(SUM(CASE WHEN pnl_percent <= 0 THEN 1 ELSE 0 END), 0),
+                       COALESCE(SUM(pnl_absolute), 0)
+                FROM trades
+                WHERE engine = ? AND timestamp_close IS NOT NULL AND exit_price > 0
+            """, (spec['engine'],))
+            row = c.fetchone()
+            info['resolved'], info['wins'], info['losses'], info['pnl'] = row
+        except Exception:
+            pass
+
+        try:
+            import re
+            for line in Path(spec['script']).read_text().splitlines():
+                if 'SNIPE_DELTA_MIN' in line and '=' in line:
+                    rhs = line.split('=', 1)[1].split('#', 1)[0].strip()
+                    m = re.search(r'_float\([^,]+,\s*([0-9.]+)\)', rhs)
+                    info['threshold'] = m.group(1) if m else rhs
+                    break
+        except Exception:
+            pass
+
+        try:
+            lines = Path(spec['log']).read_text(errors='ignore').splitlines()[-200:]
+            info['last_signal'] = None
+            info['last_skip'] = None
+            info['last_order'] = None
+            info['last_price_skip'] = None
+            info['last_delta_skip'] = None
+            info['last_arb_skip'] = None
+            info['last_activity'] = lines[-1].strip() if lines else None
+            for line in reversed(lines):
+                low = line.lower()
+                if info['recent_error'] is None and ('traceback' in low or 'nameerror' in low or 'error:' in low or 'failed' in low):
+                    info['recent_error'] = line.strip()
+                if info['last_order'] is None and ('Result:' in line or '[DRY]' in line):
+                    info['last_order'] = line.strip()
+                if info['last_signal'] is None and 'signal!' in line:
+                    info['last_signal'] = line.strip()
+                if info['last_price_skip'] is None and ('> max' in line and 'skipping' in line):
+                    info['last_price_skip'] = line.strip()
+                if info['last_delta_skip'] is None and ('too small, skipping' in line):
+                    info['last_delta_skip'] = line.strip()
+                if info['last_arb_skip'] is None and ('No arb.' in line):
+                    info['last_arb_skip'] = line.strip()
+                if info['last_skip'] is None and (('too small, skipping' in line) or ('> max' in line and 'skipping' in line) or ('No arb.' in line)):
+                    info['last_skip'] = line.strip()
+        except Exception:
+            pass
+
+        result[key] = info
+    conn.close()
+    return result
+
+
+
+def reconcile_report():
+    """Load BTC/ETH 15m placed/resolved/pending stats from reconciliation."""
+    import json as _json
+    import subprocess as _sp
+    out = {
+        'rows': [],
+        'summary': {'placed': 0, 'resolved': 0, 'wins': 0, 'losses': 0, 'pending': 0, 'win_rate': 0.0, 'net_pnl': 0.0},
+        'by_engine': {
+            'btc15m': {'placed': 0, 'resolved': 0, 'wins': 0, 'losses': 0, 'pending': 0, 'net_pnl': 0.0},
+            'eth15m': {'placed': 0, 'resolved': 0, 'wins': 0, 'losses': 0, 'pending': 0, 'net_pnl': 0.0},
+        }
+    }
+    try:
+        cp = _sp.run([str(ROOT / '.polymarket-venv' / 'bin' / 'python3'), str(ROOT / 'scripts' / 'polymarket_reconcile.py'), '--json', '--no-sync'], capture_output=True, text=True, timeout=60)
+        data = _json.loads(cp.stdout)
+        out['rows'] = data.get('rows', [])
+        out['summary'] = data.get('summary', out['summary'])
+        for row in out['rows']:
+            eng = row.get('engine')
+            if eng not in out['by_engine']:
+                continue
+            out['by_engine'][eng]['placed'] += 1
+            if row.get('result') in ('WON','LOST'):
+                out['by_engine'][eng]['resolved'] += 1
+                if row.get('result') == 'WON':
+                    out['by_engine'][eng]['wins'] += 1
+                else:
+                    out['by_engine'][eng]['losses'] += 1
+                out['by_engine'][eng]['net_pnl'] += float(row.get('pnl') or 0)
+            else:
+                out['by_engine'][eng]['pending'] += 1
+    except Exception as e:
+        logger.error('Reconcile report error: %s', e)
+    return out
+
 def fmt_money(x):
     return f"${x:.2f}"
 
@@ -312,6 +448,8 @@ def main():
     poly = poly_report()
     sol = sol_report()
     an = analytics_report()
+    engines = engine_report()
+    recon = reconcile_report()
     milestones = milestone_report(poly['current_total_capital'])
     bl_count = blacklist_count()
     redeem = redeemable_report()
@@ -376,6 +514,32 @@ def main():
     lines.append(f"• Regime: {regime_label} ({regime_wr:.1f}%)")
     lines.append("")
 
+    lines.append("ENGINES")
+    for key in ['btc', 'eth']:
+        e = engines[key]
+        status = 'LIVE' if e['running'] else 'DOWN'
+        lines.append(f"• {e['label']}: {status} | delta>={e['threshold']}")
+        rs = recon['by_engine'].get(key + '15m', {}) if key in ('btc','eth') else {}
+        lines.append(f"  Placed: {rs.get('placed', 0)} | W: {rs.get('wins', 0)} L: {rs.get('losses', 0)} Pending: {rs.get('pending', 0)} | Realized: {fmt_money(rs.get('net_pnl', 0.0))}")
+        lines.append(f"  Reconciled resolved: {rs.get('resolved', 0)} | Win rate: {(rs.get('wins', 0) / rs.get('resolved', 1) * 100 if rs.get('resolved', 0) else 0):.1f}%")
+        if e.get('last_signal'):
+            lines.append(f"  Last signal: {e['last_signal'].split('] ',1)[-1][:100]}")
+        if e.get('last_order'):
+            lines.append(f"  Last order: {e['last_order'].split('] ',1)[-1][:100]}")
+        if e.get('last_skip'):
+            lines.append(f"  Last skip: {e['last_skip'].split('] ',1)[-1][:100]}")
+        if e.get('last_price_skip'):
+            lines.append(f"  Last price skip: {e['last_price_skip'].split('] ',1)[-1][:100]}")
+        if e.get('last_delta_skip'):
+            lines.append(f"  Last delta skip: {e['last_delta_skip'].split('] ',1)[-1][:100]}")
+        if e.get('last_arb_skip'):
+            lines.append(f"  Last arb skip: {e['last_arb_skip'].split('] ',1)[-1][:100]}")
+        if e.get('last_activity'):
+            lines.append(f"  Last activity: {e['last_activity'].split('] ',1)[-1][:100]}")
+        if e.get('recent_error'):
+            lines.append(f"  Last error: {e['recent_error'][:100]}")
+    lines.append("")
+
     lines.append("SOLANA")
     sol_status = "Running" if sol['running'] else "Stopped"
     lines.append(f"• {sol_status}, {sol['positions']} positions, {sol.get('balance_line', '').split('SOL balance: ')[-1].split(' |')[0] if sol.get('balance_line') else '?'} SOL")
@@ -392,6 +556,7 @@ def main():
 
     lines.append("REDEEM")
     lines.append(f"• Redeemable: {fmt_money(redeem['value'])} across {redeem['count']} market(s)")
+    lines.append("• Auto-redeem: enabled via polymarket_redeem.py after window rollover")
     if redeem['value'] > 0:
         lines.append("• Action: redeem/claim now")
     else:

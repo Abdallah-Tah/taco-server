@@ -145,7 +145,7 @@ BTC15M_ENABLED            = os.environ.get("BTC15M_ENABLED",      "true").lower(
 BTC15M_DRY_RUN            = os.environ.get("BTC15M_DRY_RUN",      "true").lower() != "false"
 BTC15M_ARB_THRESHOLD      = _float("BTC15M_ARB_THRESHOLD",        0.98)
 BTC15M_ARB_SIZE           = _float("BTC15M_ARB_SIZE",            10.00)
-BTC15M_SNIPE_DELTA_MIN    = _float("BTC15M_SNIPE_DELTA_MIN",     0.05)
+BTC15M_SNIPE_DELTA_MIN    = _float("BTC15M_SNIPE_DELTA_MIN",     0.025)
 BTC15M_SNIPE_MAX_PRICE    = _float("BTC15M_SNIPE_MAX_PRICE",    0.92)
 BTC15M_SNIPE_DEFAULT_SIZE = _float("BTC15M_SNIPE_DEFAULT_SIZE",   5.00)
 BTC15M_SNIPE_STRONG_SIZE  = _float("BTC15M_SNIPE_STRONG_SIZE",   7.50)

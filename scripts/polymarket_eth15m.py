@@ -11,6 +11,7 @@ Dry run by default. Set DRY_RUN=false to go live.
 import json
 import os
 import math
+import subprocess
 import sys
 import threading
 import time
@@ -39,25 +40,37 @@ def _load_env():
 
 ENV = _load_env()
 
+def _float(key, default):
+    try:
+        return float(os.environ.get(key, ENV.get(key, default)))
+    except Exception:
+        return float(default)
+
+def _int(key, default):
+    try:
+        return int(os.environ.get(key, ENV.get(key, default)))
+    except Exception:
+        return int(default)
+
 TELEGRAM_TOKEN = ENV.get("TELEGRAM_TOKEN", "8457917317:AAGtnuRix7Ei-rslwVAbfFIFJSK0UIwi0d4")
 CHAT_ID        = ENV.get("CHAT_ID",        "7520899464")
 POLY_WALLET    = ENV.get("POLY_WALLET",    "0x1a4c163a134D7154ebD5f7359919F9c439424f00")
 VENV_PY        = Path("/home/abdaltm86/.openclaw/workspace/trading/.polymarket-venv/bin/python3")
-DRY_RUN        = ENV.get("ETH15M_DRY_RUN",  "true").lower() != "false"
+DRY_RUN        = os.environ.get("ETH15M_DRY_RUN", ENV.get("ETH15M_DRY_RUN", "true")).lower() != "false"
 
 # ── Config ────────────────────────────────────────────────────────────────────
-WINDOW_SEC       = 900          # 15 minutes
-ARB_THRESHOLD    = 0.98
-ARB_SIZE         = 10.00
-SNIPE_DELTA_MIN = 0.05         # percent
-SNIPE_MAX_PRICE = 0.92
-SNIPE_DEFAULT   = 5.00
-SNIPE_STRONG    = 7.50
-SNIPE_STRONG_D  = 0.10          # delta threshold for strong size
-SNIPE_WINDOW    = 15            # seconds before close to snipe
-POLL_SEC        = 5
-SCAN_SEC        = 10
-MAX_DAILY_LOSS  = 15.00        # conservative first day
+WINDOW_SEC      = _int("ETH15M_WINDOW_SEC", 900)          # 15 minutes
+ARB_THRESHOLD   = _float("ETH15M_ARB_THRESHOLD", 0.98)
+ARB_SIZE        = _float("ETH15M_ARB_SIZE", 10.00)
+SNIPE_DELTA_MIN = _float("ETH15M_SNIPE_DELTA_MIN", 0.035)
+SNIPE_MAX_PRICE = _float("ETH15M_SNIPE_MAX_PRICE", 0.90)
+SNIPE_DEFAULT   = _float("ETH15M_SNIPE_DEFAULT_SIZE", 5.00)
+SNIPE_STRONG    = _float("ETH15M_SNIPE_STRONG_SIZE", 7.50)
+SNIPE_STRONG_D  = _float("ETH15M_SNIPE_STRONG_DELTA", 0.10)  # percent
+SNIPE_WINDOW    = _int("ETH15M_SNIPE_WINDOW_SEC", 15)
+POLL_SEC        = _int("ETH15M_PRICE_POLL_SEC", 5)
+SCAN_SEC        = _int("ETH15M_SCAN_INTERVAL", 10)
+MAX_DAILY_LOSS  = _float("ETH15M_MAX_DAILY_LOSS", 15.00)
 SERIES_ID       = "10216"
 SERIES_SLUG     = "eth-up-or-down-15m"
 
@@ -97,6 +110,16 @@ def tg(msg):
             pass
     threading.Thread(target=_send, daemon=True).start()
 
+
+def trigger_post_resolution_tasks():
+    if DRY_RUN:
+        return
+    try:
+        subprocess.Popen([str(VENV_PY), str(WORK_DIR / 'scripts' / 'polymarket_reconcile.py')], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.Popen([str(VENV_PY), str(WORK_DIR / 'scripts' / 'polymarket_redeem.py')], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        log(f"[POST-RESOLUTION] task launch error: {e}")
+
 # ── Persistence ───────────────────────────────────────────────────────────────
 def save_state():
     with open(STATE_F, "w") as f:
@@ -115,10 +138,31 @@ def get_eth_price():
             "https://api.exchange.coinbase.com/products/ETH-USD/ticker",
             timeout=5,
         )
-        return float(r.json()["price"])
+        r.raise_for_status()
+        data = r.json()
+        price = data.get("price")
+        if price is not None:
+            return float(price)
     except Exception as e:
-        log(f"BTC price error: {e}")
+        log(f"ETH Coinbase price error: {e}")
+
+    try:
+        r = requests.get(
+            "https://api.coingecko.com/api/v3/simple/price",
+            params={"ids": "ethereum", "vs_currencies": "usd"},
+            timeout=5,
+        )
+        r.raise_for_status()
+        data = r.json()
+        price = data.get("ethereum", {}).get("usd")
+        if price is not None:
+            log("ETH price fallback: CoinGecko")
+            return float(price)
+    except Exception as e:
+        log(f"ETH CoinGecko fallback error: {e}")
         return None
+
+    return None
 
 # ── Find current market slug ──────────────────────────────────────────────────
 def get_current_slug():
@@ -282,7 +326,7 @@ def check_snipe(market, seconds_remaining):
     size = SNIPE_STRONG if abs(delta_pct) >= SNIPE_STRONG_D * 100 else SNIPE_DEFAULT
     shares = size / price
 
-    log(f"[ETH-SNIPE] {direction} signal! BTC delta={delta_pct:+.3f}% size=${size:.2f} price={price:.4f} shares={shares:.2f}")
+    log(f"[ETH-SNIPE] {direction} signal! ETH delta={delta_pct:+.3f}% size=${size:.2f} price={price:.4f} shares={shares:.2f}")
     r = place_order("BUY", shares, price, market["condition_id"], token_id)
     notes = f"snipe {direction} delta={delta_pct:+.3f}% price={price:.4f} size=${size:.2f}"
     log(f"[ETH-SNIPE] Result: {r.get('success')}. {notes}")
@@ -307,8 +351,9 @@ def setup_new_window(slug, window_ts):
     _state["snipe_done"]      = False
     _state["eth_prices"]      = [(int(time.time()), eth_price)]
     save_state()
+    trigger_post_resolution_tasks()
 
-    log(f"[ETH-NEW WINDOW] ts={window_ts} BTC={eth_price} slug={slug}")
+    log(f"[ETH-NEW WINDOW] ts={window_ts} ETH={eth_price} slug={slug}")
     # Window start — no telegram noise
 
 # ── Daily loss check ───────────────────────────────────────────────────────────
