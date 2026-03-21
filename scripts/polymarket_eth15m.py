@@ -57,6 +57,12 @@ CHAT_ID        = ENV.get("CHAT_ID",        "7520899464")
 POLY_WALLET    = ENV.get("POLY_WALLET",    "0x1a4c163a134D7154ebD5f7359919F9c439424f00")
 VENV_PY        = Path("/home/abdaltm86/.openclaw/workspace/trading/.polymarket-venv/bin/python3")
 DRY_RUN        = os.environ.get("ETH15M_DRY_RUN", ENV.get("ETH15M_DRY_RUN", "true")).lower() != "false"
+MAKER_ENABLED  = os.environ.get("ETH15M_MAKER_ENABLED", ENV.get("ETH15M_MAKER_ENABLED", "false")).lower() == "true"
+MAKER_DRY_RUN  = os.environ.get("ETH15M_MAKER_DRY_RUN", ENV.get("ETH15M_MAKER_DRY_RUN", "true")).lower() != "false"
+MAKER_START_SEC = _int("ETH15M_MAKER_START_SEC", 300)
+MAKER_CANCEL_SEC = _int("ETH15M_MAKER_CANCEL_SEC", 60)
+MAKER_OFFSET = _float("ETH15M_MAKER_OFFSET", 0.02)
+MAKER_POLL_SEC = _int("ETH15M_MAKER_POLL_SEC", 10)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 WINDOW_SEC      = _int("ETH15M_WINDOW_SEC", 900)          # 15 minutes
@@ -84,6 +90,13 @@ _state = {
     "daily_pnl":       0.0,
     "daily_reset":     "",
     "trades":          [],
+    "maker_order_id":   "",
+    "maker_token_id":   "",
+    "maker_side":       "",
+    "maker_price":      0.0,
+    "maker_shares":     0.0,
+    "maker_done":       False,
+    "maker_last_poll":  0,
 }
 _positions = []   # list of dicts for open/confirmation positions
 
@@ -272,6 +285,117 @@ def log_trade(engine, direction, size_usd, entry_price, pnl, exit_type, hold_sec
     except Exception as e:
         log(f"Journal error: {e}")
 
+
+
+def maker_place_order(side, shares, price, condition_id, token_id):
+    cmd = [str(VENV_PY), str(WORK_DIR / "scripts" / "polymarket_executor.py"), "maker_buy", token_id, str(shares), str(price)]
+    if MAKER_DRY_RUN:
+        log(f"[ETH-MAKER-DRY] {side} {shares} @{price:.4f} token={token_id}")
+        return {"success": True, "dry": True, "order_id": f"dry-{int(time.time())}"}
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
+    payload = {"success": result.returncode == 0, "output": result.stdout, "error": result.stderr}
+    for line in result.stdout.splitlines():
+        if line.startswith('__RESULT__'):
+            import json as _json
+            payload['posted'] = _json.loads(line[len('__RESULT__'):])
+            payload['order_id'] = payload['posted'].get('order_id') or payload['posted'].get('orderID') or payload['posted'].get('id')
+            break
+    return payload
+
+
+def maker_order_status(order_id):
+    cmd = [str(VENV_PY), str(WORK_DIR / "scripts" / "polymarket_executor.py"), "order_status", str(order_id)]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    for line in result.stdout.splitlines():
+        if line.startswith('__RESULT__'):
+            import json as _json
+            return _json.loads(line[len('__RESULT__'):])
+    return {"status": "error", "error": result.stderr or result.stdout or 'no_status'}
+
+
+def maker_verify_fill(token_id, min_size):
+    cmd = [str(VENV_PY), str(WORK_DIR / "scripts" / "polymarket_executor.py"), "verify_fill", str(token_id), str(min_size)]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    for line in result.stdout.splitlines():
+        if line.startswith('__RESULT__'):
+            import json as _json
+            return _json.loads(line[len('__RESULT__'):])
+    return {"filled": False, "reason": result.stderr or result.stdout or 'no_verify'}
+
+
+def maker_cancel_order(order_id):
+    cmd = [str(VENV_PY), str(WORK_DIR / "scripts" / "polymarket_executor.py"), "cancel", str(order_id)]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    return {"success": result.returncode == 0, "output": result.stdout, "error": result.stderr}
+
+
+def check_maker_snipe(market, seconds_remaining):
+    if not MAKER_ENABLED:
+        return None
+    oid = _state.get("maker_order_id")
+    if oid and (time.time() - _state.get("maker_last_poll", 0) >= MAKER_POLL_SEC or seconds_remaining <= MAKER_CANCEL_SEC):
+        _state["maker_last_poll"] = int(time.time())
+        st = maker_order_status(oid)
+        log(f"[ETH-MAKER] status order_id={oid} -> {st.get('status')}")
+        if st.get('status') in ('filled', 'partially_filled'):
+            _state['maker_done'] = True
+            _state['snipe_done'] = True
+            save_state()
+            tg(f"[ETH-MAKER] FILLED order {oid}")
+            return True
+        if st.get('status') == 'not_found':
+            vf = maker_verify_fill(_state.get('maker_token_id'), _state.get('maker_shares', 0))
+            if vf.get('filled'):
+                log(f"[ETH-MAKER] fill verified via activity/trades size={vf.get('filled_size')}")
+                _state['maker_done'] = True
+                _state['snipe_done'] = True
+                save_state()
+                tg(f"[ETH-MAKER] FILL VERIFIED {vf.get('filled_size')} shares")
+                return True
+        if seconds_remaining <= MAKER_CANCEL_SEC and st.get('status') in ('open', 'partially_filled'):
+            maker_cancel_order(oid)
+            log(f"[ETH-MAKER] cancel by deadline order_id={oid} sec_rem={seconds_remaining}")
+            _state['maker_done'] = True
+            save_state()
+            return False
+    if _state.get('maker_done') or oid:
+        return None
+    if seconds_remaining > MAKER_START_SEC or seconds_remaining <= MAKER_CANCEL_SEC:
+        return None
+
+    base_price = get_eth_price()
+    if base_price is None:
+        return None
+    if not _state.get('window_open_eth'):
+        return None
+    delta_pct = (base_price - _state['window_open_eth']) / _state['window_open_eth'] * 100
+    log(f"[ETH-MAKER] now={base_price} open={_state['window_open_eth']} delta={delta_pct:+.3f}% sec_rem={seconds_remaining}")
+    direction = 'UP' if delta_pct > SNIPE_DELTA_MIN else ('DOWN' if delta_pct < -SNIPE_DELTA_MIN else None)
+    if not direction:
+        return None
+    token_id = market['clob_token_id'][0] if direction == 'UP' else (market['clob_token_id'][1] if len(market['clob_token_id']) > 1 else '')
+    token_price = market['yes_price'] if direction == 'UP' else market['no_price']
+    limit_price = max(0.01, round(token_price - MAKER_OFFSET, 2))
+    shares = max(5.0, math.floor((SNIPE_DEFAULT / max(limit_price, 0.01)) * 100) / 100)
+    log(f"[ETH-MAKER] {direction} signal token_mid={token_price:.4f} limit={limit_price:.4f} shares={shares:.2f} dry={MAKER_DRY_RUN}")
+    r = maker_place_order('BUY', shares, limit_price, market['condition_id'], token_id)
+    for line in (r.get('output') or '').splitlines():
+        if line.strip() and ('[MAKER' in line or '[RESULT' in line or '[ATTEMPT' in line):
+            log(f"[EXEC] {line.strip()}")
+    if r.get('error'):
+        for line in r['error'].splitlines():
+            if line.strip():
+                log(f"[EXEC-ERR] {line.strip()}")
+    _state['maker_order_id'] = str(r.get('order_id') or (r.get('posted') or {}).get('order_id') or '')
+    _state['maker_token_id'] = token_id
+    _state['maker_side'] = direction
+    _state['maker_price'] = limit_price
+    _state['maker_shares'] = shares
+    _state['maker_last_poll'] = int(time.time())
+    _state['maker_done'] = False
+    save_state()
+    return r.get('success')
+
 # ── Strategy A: Arb check ─────────────────────────────────────────────────────
 def check_arb(market):
     if _state["arb_done"]:
@@ -379,6 +503,13 @@ def setup_new_window(slug, window_ts):
     _state["window_open_eth"] = eth_price
     _state["arb_done"]        = False
     _state["snipe_done"]      = False
+    _state["maker_order_id"]  = ""
+    _state["maker_token_id"]  = ""
+    _state["maker_side"]      = ""
+    _state["maker_price"]     = 0.0
+    _state["maker_shares"]    = 0.0
+    _state["maker_done"]      = False
+    _state["maker_last_poll"] = 0
     _state["eth_prices"]      = [(int(time.time()), eth_price)]
     save_state()
     trigger_post_resolution_tasks()
@@ -404,7 +535,7 @@ def main():
     load_state()
     log("=" * 60)
     log(f"[ETH-15M] STARTING {'(DRY RUN)' if DRY_RUN else '(LIVE)'}")
-    log(f"[ETH-15M] Arb threshold=${ARB_THRESHOLD}, snipe delta>={SNIPE_DELTA_MIN}%, max daily loss=${MAX_DAILY_LOSS}")
+    log(f"[ETH-15M] Arb threshold=${ARB_THRESHOLD}, snipe delta>={SNIPE_DELTA_MIN}%, max daily loss=${MAX_DAILY_LOSS} | maker={MAKER_ENABLED} dry={MAKER_DRY_RUN} start=T-{MAKER_START_SEC} cancel=T-{MAKER_CANCEL_SEC} offset={MAKER_OFFSET}")
     tg("[ETH-15M] Engine started!")
 
     while True:
@@ -447,8 +578,10 @@ def main():
         if sec_rem > 15:
             check_arb(market)
 
-        # Strategy B: Snipe (last 15 sec)
-        if sec_rem <= SNIPE_WINDOW and sec_rem > 5:
+        # Strategy B: Snipe / Maker Snipe
+        if MAKER_ENABLED:
+            check_maker_snipe(market, sec_rem)
+        elif sec_rem <= SNIPE_WINDOW and sec_rem > 5:
             check_snipe(market, sec_rem)
 
         # Sleep

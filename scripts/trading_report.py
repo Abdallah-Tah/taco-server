@@ -31,6 +31,7 @@ CLOB_HOST = "https://clob.polymarket.com"
 CHAIN_ID = 137
 SIGNATURE_TYPE = 0
 TOR_PROXY = {"http": "socks5h://127.0.0.1:9050", "https": "socks5h://127.0.0.1:9050"}
+POSITIONS_API = "https://data-api.polymarket.com/positions?user={user}"
 
 sys.path.insert(0, str(ROOT / "scripts"))
 
@@ -70,29 +71,45 @@ def get_client():
 
 def poly_report():
     client = get_client()
+    s = load_secrets()
     bal = client.get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
     cash = int(bal["balance"]) / 1e6
 
-    positions = json.loads(POLY_POS.read_text()) if POLY_POS.exists() else {}
     trade_log = json.loads(POLY_LOG.read_text()) if POLY_LOG.exists() else []
     tor = requests.Session()
     tor.proxies = TOR_PROXY
+
+    # Source of truth for open Polymarket positions: live positions API, not stale local tracker.
+    live_positions = []
+    try:
+        r = tor.get(POSITIONS_API.format(user=s["POLYMARKET_FUNDER"]), timeout=20)
+        api_positions = r.json() if r.status_code == 200 else []
+        for p in api_positions:
+            title = (p.get("title") or "").strip()
+            # Keep only real long-dated/open titled positions in the portfolio summary.
+            if not title:
+                continue
+            live_positions.append({
+                "token_id": p.get("asset", ""),
+                "market": title,
+                "amount": float(p.get("size") or 0),
+                "avg_price": float(p.get("avgPrice") or 0),
+                "current_value": float(p.get("currentValue") or 0),
+                "cash_pnl": float(p.get("cashPnl") or 0),
+                "percent_pnl": float(p.get("percentPnl") or 0),
+            })
+    except Exception as e:
+        logger.error("Positions API error: %s", e)
 
     invested = 0.0
     value = 0.0
     winners = []
     losers = []
 
-    # Unrealized/current positions
-    for token_id, pos in positions.items():
-        try:
-            r = tor.get("https://clob.polymarket.com/price", params={"token_id": token_id, "side": "sell"}, timeout=10)
-            cur = float(r.json().get("price", 0))
-        except Exception:
-            cur = 0.0
+    for pos in live_positions:
         cost = pos["avg_price"] * pos["amount"]
-        val = cur * pos["amount"]
-        pnl_pct = ((cur - pos["avg_price"]) / pos["avg_price"] * 100) if pos["avg_price"] else 0.0
+        val = pos["current_value"]
+        pnl_pct = pos["percent_pnl"]
         invested += cost
         value += val
         item = (pnl_pct, pos["market"])
@@ -101,7 +118,6 @@ def poly_report():
         elif pnl_pct <= -2:
             losers.append(item)
 
-    # Historical total invested from all unique BUYs
     historical_invested = 0.0
     unique_buys = set()
     for entry in trade_log:
@@ -113,10 +129,9 @@ def poly_report():
         unique_buys.add(key)
         historical_invested += float(entry.get("amount", 0)) * float(entry.get("price", 0))
 
-    # Realized totals from BUYs no longer in tracked positions
     realized_win = 0.0
     realized_loss = 0.0
-    current_markets = {p.get("market", "") for p in positions.values()}
+    current_markets = {p.get("market", "") for p in live_positions}
     seen = set()
     for entry in trade_log:
         if entry.get("action") != "BUY":
@@ -129,13 +144,9 @@ def poly_report():
         if market in current_markets:
             continue
         stake = float(entry.get("amount", 0)) * float(entry.get("price", 0))
-        # If it's no longer tracked, assume resolved/closed. Use current title clues/history.
         if stake <= 0:
             continue
         try:
-            # Resolved winners on Polymarket settle near $1. Current losers near $0.
-            # For removed historical positions, fetch not possible from shortened token_id in log,
-            # so infer from known removed market names.
             if "Pistons vs. Raptors" in market:
                 realized_win += float(entry.get("amount", 0)) * (1 - float(entry.get("price", 0)))
             else:
@@ -157,7 +168,7 @@ def poly_report():
 
     return {
         "cash": cash,
-        "positions": len(positions),
+        "positions": len(live_positions),
         "open_orders": len(live_orders),
         "invested": invested,
         "value": value,
@@ -411,10 +422,10 @@ def reconcile_report():
     import subprocess as _sp
     out = {
         'rows': [],
-        'summary': {'placed': 0, 'resolved': 0, 'wins': 0, 'losses': 0, 'pending': 0, 'win_rate': 0.0, 'net_pnl': 0.0},
+        'summary': {'attempted': 0, 'filled': 0, 'fill_rate': 0.0, 'placed': 0, 'resolved': 0, 'wins': 0, 'losses': 0, 'pending': 0, 'unfilled': 0, 'win_rate': 0.0, 'net_pnl': 0.0},
         'by_engine': {
-            'btc15m': {'placed': 0, 'resolved': 0, 'wins': 0, 'losses': 0, 'pending': 0, 'net_pnl': 0.0},
-            'eth15m': {'placed': 0, 'resolved': 0, 'wins': 0, 'losses': 0, 'pending': 0, 'net_pnl': 0.0},
+            'btc15m': {'attempted': 0, 'filled': 0, 'fill_rate': 0.0, 'placed': 0, 'resolved': 0, 'wins': 0, 'losses': 0, 'pending': 0, 'unfilled': 0, 'net_pnl': 0.0},
+            'eth15m': {'attempted': 0, 'filled': 0, 'fill_rate': 0.0, 'placed': 0, 'resolved': 0, 'wins': 0, 'losses': 0, 'pending': 0, 'unfilled': 0, 'net_pnl': 0.0},
         }
     }
     try:
@@ -520,8 +531,8 @@ def main():
         status = 'LIVE' if e['running'] else 'DOWN'
         lines.append(f"• {e['label']}: {status} | delta>={e['threshold']}")
         rs = recon['by_engine'].get(key + '15m', {}) if key in ('btc','eth') else {}
-        lines.append(f"  Placed: {rs.get('placed', 0)} | W: {rs.get('wins', 0)} L: {rs.get('losses', 0)} Pending: {rs.get('pending', 0)} | Realized: {fmt_money(rs.get('net_pnl', 0.0))}")
-        lines.append(f"  Reconciled resolved: {rs.get('resolved', 0)} | Win rate: {(rs.get('wins', 0) / rs.get('resolved', 1) * 100 if rs.get('resolved', 0) else 0):.1f}%")
+        lines.append(f"  Attempted: {rs.get('attempted', 0)} | Filled: {rs.get('filled', 0)} ({rs.get('fill_rate', 0.0):.1f}%) | Unfilled: {rs.get('unfilled', 0)}")
+        lines.append(f"  Resolved filled: {rs.get('resolved', 0)} | W: {rs.get('wins', 0)} L: {rs.get('losses', 0)} Pending: {rs.get('pending', 0)} | P&L: {fmt_money(rs.get('net_pnl', 0.0))}")
         if e.get('last_signal'):
             lines.append(f"  Last signal: {e['last_signal'].split('] ',1)[-1][:100]}")
         if e.get('last_order'):

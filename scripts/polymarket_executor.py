@@ -290,6 +290,73 @@ def verify_fill(token_id, min_size=0.0, lookback_sec=120):
         return {"filled": False, "reason": str(e)}
 
 
+def place_maker_order(client, token_id, amount, price, side=BUY, market_question="", condition_id="", verify=False):
+    """Place a maker GTC order; caller is responsible for later status polling/cancel."""
+    import math
+    if price <= 0 or price >= 1:
+        print(f"ERROR: Price must be between 0.01 and 0.99, got {price}", file=sys.stderr)
+        return None
+    side_str = "BUY" if side == BUY else "SELL"
+    price = round(float(price), 2)
+    amount = math.floor(float(amount) * 100) / 100
+    if amount < MIN_SHARES:
+        amount = float(MIN_SHARES)
+    dollar_cost = round(amount * price, 2)
+    print(f"[MAKER-ATTEMPT] side={side_str} submitted_price={price:.4f} shares={amount} size=${dollar_cost:.2f}")
+    try:
+        order_args = OrderArgs(token_id=token_id, price=price, size=amount, side=side)
+        signed = client.create_order(order_args)
+        posted = client.post_order(signed, orderType=OrderType.GTC)
+        order_id = None
+        if isinstance(posted, dict):
+            order_id = posted.get("orderID") or posted.get("id")
+        print(f"[MAKER-RESULT] order_id={order_id} status=posted")
+        log_trade(
+            action=f"MAKER_{side_str}", token_id=token_id, amount=amount, price=price,
+            order_id=order_id, market_question=market_question,
+            extra={"order_type": "GTC", "submitted_price": price}
+        )
+        if isinstance(posted, dict):
+            posted["order_id"] = order_id
+            posted["submitted_price"] = price
+            posted["submitted_order_type"] = "GTC"
+        return posted
+    except Exception as e:
+        error_msg = str(e)
+        print(f"❌ Maker order failed: {error_msg}", file=sys.stderr)
+        log_trade(
+            action=f"FAILED_MAKER_{side_str}", token_id=token_id, amount=amount, price=price,
+            market_question=market_question, extra={"error": error_msg[:200]}
+        )
+        return None
+
+
+def check_order_status(client, order_id):
+    """Normalize order status using open orders list; not_found means not currently open."""
+    try:
+        orders = client.get_orders() or []
+        found = None
+        for o in orders:
+            oid = o.get("orderID") or o.get("id")
+            if str(oid) == str(order_id):
+                found = o
+                break
+        if not found:
+            return {"status": "not_found", "order_id": order_id}
+        status = str(found.get("status") or found.get("state") or "open").lower()
+        size = float(found.get("original_size") or found.get("size") or 0)
+        filled = float(found.get("filled") or found.get("sizeFilled") or found.get("matched_size") or 0)
+        if status in ("live", "active"):
+            status = "open"
+        if filled > 0 and filled < size:
+            status = "partially_filled"
+        elif filled >= size and size > 0:
+            status = "filled"
+        return {"status": status, "order_id": order_id, "size": size, "filled": filled, "raw": found}
+    except Exception as e:
+        return {"status": "error", "order_id": order_id, "error": str(e)}
+
+
 def place_order(client, token_id, amount, price, side=BUY, market_question="", condition_id="", order_type=None, verify=False):
     """Place an order. For 15m snipes we prefer FOK at/through the current best ask."""
     if price <= 0 or price >= 1:
@@ -745,6 +812,28 @@ def main():
         result = place_order(client, token_id, amount, price, BUY, question, order_type=OrderType.FOK, verify=True)
         if isinstance(result, dict):
             print("__RESULT__" + json.dumps(result, default=str))
+
+    elif cmd == "maker_buy" and len(args) >= 4:
+        token_id = args[1]
+        amount = float(args[2])
+        price = float(args[3])
+        question = " ".join(args[4:]) if len(args) > 4 else ""
+        client = get_client()
+        result = place_maker_order(client, token_id, amount, price, BUY, question)
+        if isinstance(result, dict):
+            print("__RESULT__" + json.dumps(result, default=str))
+
+    elif cmd == "order_status" and len(args) >= 2:
+        order_id = args[1]
+        client = get_client()
+        result = check_order_status(client, order_id)
+        print("__RESULT__" + json.dumps(result, default=str))
+
+    elif cmd == "verify_fill" and len(args) >= 2:
+        token_id = args[1]
+        min_size = float(args[2]) if len(args) >= 3 else 0.0
+        result = verify_fill(token_id, min_size=min_size, lookback_sec=600)
+        print("__RESULT__" + json.dumps(result, default=str))
 
     elif cmd == "sell" and len(args) >= 4:
         token_id = args[1]

@@ -20,6 +20,7 @@ ETH_LOG = Path('/tmp/polymarket_eth15m.log')
 VENV = ROOT / '.polymarket-venv' / 'bin' / 'python3'
 EXECUTOR = ROOT / 'scripts' / 'polymarket_executor.py'
 POSITIONS_API = 'https://data-api.polymarket.com/positions?user={user}'
+TRADES_API = 'https://data-api.polymarket.com/trades'
 
 WINDOW_SEC = 900
 LOCAL_TZ = ZoneInfo('America/New_York')
@@ -125,6 +126,7 @@ def fetch_market_result(slug):
         m = data[0]
         outcome_prices = json.loads(m.get('outcomePrices', '[]'))
         outcomes = json.loads(m.get('outcomes', '[]'))
+        tokens = json.loads(m.get('clobTokenIds', '[]'))
         closed = bool(m.get('closed'))
         winner = None
         if len(outcome_prices) >= 2 and len(outcomes) >= 2:
@@ -139,14 +141,31 @@ def fetch_market_result(slug):
             'question': m.get('question'),
             'outcomes': outcomes,
             'outcomePrices': outcome_prices,
+            'tokens': tokens,
         }
     except Exception:
         return None
 
 
+def fetch_user_fills(user):
+    try:
+        r = requests.get(TRADES_API, params={'user': user, 'limit': 1000, 'offset': 0, 'takerOnly': 'false'}, timeout=30)
+        data = r.json() if r.status_code == 200 else []
+        by_asset = {}
+        for t in data:
+            asset = str(t.get('asset') or '')
+            by_asset.setdefault(asset, []).append(t)
+        return by_asset
+    except Exception:
+        return {}
+
+
 def reconcile():
+    s = load_secrets()
+    user = s.get('POLYMARKET_FUNDER', '').lower()
     positions = load_positions()
     orders = load_open_orders()
+    user_fills = fetch_user_fills(user)
     positions_by_slug = {}
     for p in positions:
         slug = p.get('slug')
@@ -166,25 +185,53 @@ def reconcile():
             market = fetch_market_result(event['slug'])
             market_cache[event['slug']] = market
 
-        # Prefer positions match by slug + outcome
-        plist = positions_by_slug.get(event['slug'], [])
-        for p in plist:
-            outcome = (p.get('outcome') or '').upper()
-            if outcome == event['side']:
-                matched = p
+        asset_id = None
+        if market and market.get('tokens'):
+            asset_id = str(market['tokens'][0] if event['side'] == 'UP' else market['tokens'][1])
+        fills = user_fills.get(asset_id or '', [])
+        fill = None
+        for t in fills:
+            try:
+                t_local = datetime.fromtimestamp(int(t.get('timestamp') or 0), tz=timezone.utc).astimezone(LOCAL_TZ)
+            except Exception:
+                continue
+            if abs((t_local - datetime.fromisoformat(event['time'])).total_seconds()) <= 180 and (t.get('outcome') or '').upper() == event['side']:
+                fill = t
                 break
 
-        if matched:
-            redeemable = bool(matched.get('redeemable'))
-            cur_val = float(matched.get('currentValue', 0) or 0)
-            cash_pnl = float(matched.get('cashPnl', 0) or 0)
-            pnl = cash_pnl
-            if redeemable:
-                status = 'WON' if cur_val > 0 else 'LOST'
+        if fill:
+            filled_shares = float(fill.get('size') or 0)
+            fill_price = float(fill.get('price') or event['entry_price'] or 0)
+            # Prefer live position if still open/unredeemed
+            plist = positions_by_slug.get(event['slug'], [])
+            for p in plist:
+                outcome = (p.get('outcome') or '').upper()
+                if outcome == event['side']:
+                    matched = p
+                    break
+            if matched:
+                redeemable = bool(matched.get('redeemable'))
+                cur_val = float(matched.get('currentValue', 0) or 0)
+                if redeemable:
+                    status = 'WON' if cur_val > 0 else 'LOST'
+                    pnl = cur_val - (filled_shares * fill_price)
+                else:
+                    status = 'PENDING'
+                    pnl = float(matched.get('cashPnl', 0) or 0)
             else:
-                status = 'PENDING'
+                window_end = datetime.fromtimestamp(event['window_ts'] + WINDOW_SEC, tz=LOCAL_TZ)
+                now = datetime.now(LOCAL_TZ)
+                if market and market.get('closed') and market.get('winner') in ('UP','DOWN'):
+                    win = market['winner'] == event['side']
+                    status = 'WON' if win else 'LOST'
+                    cur_val = filled_shares * (1.0 if win else 0.0)
+                    pnl = cur_val - (filled_shares * fill_price)
+                elif now < window_end:
+                    status = 'PENDING'
+                else:
+                    status = 'UNKNOWN'
         else:
-            # Then try open orders by time proximity / price / outcome
+            # No fill => not a real trade. Maybe open resting order or just posted+not matched.
             for o in orders:
                 if o.get('status') != 'LIVE':
                     continue
@@ -194,25 +241,13 @@ def reconcile():
                     continue
                 price = float(o.get('price', 0) or 0)
                 outcome = (o.get('outcome') or '').upper()
-                if abs((created - datetime.fromisoformat(event['time'])).total_seconds()) < 180 and abs(price - event['entry_price']) < 0.02 and outcome == event['side']:
+                asset = str(o.get('asset_id') or '')
+                if abs((created - datetime.fromisoformat(event['time'])).total_seconds()) < 180 and abs(price - event['entry_price']) < 0.03 and outcome == event['side'] and (not asset_id or asset == asset_id):
                     status = 'OPEN_ORDER'
                     matched = o
                     break
-
-            # If market resolved, use market outcome directly
-            window_end = datetime.fromtimestamp(event['window_ts'] + WINDOW_SEC, tz=LOCAL_TZ)
-            now = datetime.now(LOCAL_TZ)
-            if market and market.get('closed') and market.get('winner') in ('UP','DOWN'):
-                win = market['winner'] == event['side']
-                status = 'WON' if win else 'LOST'
-                shares = (event['size_usd'] / event['entry_price']) if event['entry_price'] else 0.0
-                cur_val = shares * (1.0 if win else 0.0)
-                pnl = cur_val - event['size_usd']
-            elif matched is None:
-                if now < window_end:
-                    status = 'PENDING'
-                else:
-                    status = 'UNKNOWN'
+            if matched is None:
+                status = 'UNFILLED'
 
         rows.append({
             'time': event['time'],
@@ -221,6 +256,8 @@ def reconcile():
             'entry_price': event['entry_price'],
             'size_usd': event['size_usd'],
             'slug': event['slug'],
+            'asset_id': asset_id,
+            'filled': fill is not None,
             'resolved': bool(market.get('closed')) if market else False,
             'winner': market.get('winner') if market else None,
             'result': status,
@@ -270,17 +307,25 @@ def sync_journal(rows):
 
 
 def summarize(rows):
-    resolved = [r for r in rows if r['result'] in ('WON', 'LOST')]
+    attempted = len(rows)
+    filled_rows = [r for r in rows if r.get('filled')]
+    filled = len(filled_rows)
+    resolved = [r for r in filled_rows if r['result'] in ('WON', 'LOST')]
     wins = sum(1 for r in resolved if r['result'] == 'WON')
     losses = sum(1 for r in resolved if r['result'] == 'LOST')
-    pending = sum(1 for r in rows if r['result'] in ('PENDING', 'OPEN_ORDER', 'PLACED', 'UNKNOWN'))
+    pending = sum(1 for r in filled_rows if r['result'] in ('PENDING', 'OPEN_ORDER', 'PLACED', 'UNKNOWN'))
+    unfilled = sum(1 for r in rows if r['result'] == 'UNFILLED')
     net = sum(float(r['pnl'] or 0.0) for r in resolved)
     return {
-        'placed': len(rows),
+        'attempted': attempted,
+        'filled': filled,
+        'fill_rate': (filled / attempted * 100.0) if attempted else 0.0,
+        'placed': attempted,
         'resolved': len(resolved),
         'wins': wins,
         'losses': losses,
         'pending': pending,
+        'unfilled': unfilled,
         'win_rate': (wins / len(resolved) * 100.0) if resolved else 0.0,
         'net_pnl': net,
     }
