@@ -63,6 +63,7 @@ MAKER_START_SEC = _int("BTC15M_MAKER_START_SEC", 300)
 MAKER_CANCEL_SEC = _int("BTC15M_MAKER_CANCEL_SEC", 60)
 MAKER_OFFSET = _float("BTC15M_MAKER_OFFSET", 0.02)
 MAKER_POLL_SEC = _int("BTC15M_MAKER_POLL_SEC", 10)
+MAKER_MIN_PRICE = _float("BTC15M_MAKER_MIN_PRICE", 0.01)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 WINDOW_SEC      = _int("BTC15M_WINDOW_SEC", 900)          # 15 minutes
@@ -354,6 +355,9 @@ def check_maker_snipe(market, seconds_remaining):
         return None
     token_id = market['clob_token_id'][0] if direction == 'UP' else (market['clob_token_id'][1] if len(market['clob_token_id']) > 1 else '')
     token_price = market['yes_price'] if direction == 'UP' else market['no_price']
+    if token_price < MAKER_MIN_PRICE:
+        log(f"[BTC-MAKER] token_mid={token_price:.4f} < min {MAKER_MIN_PRICE:.4f}, skipping")
+        return None
     limit_price = max(0.01, round(token_price - MAKER_OFFSET, 2))
     shares = max(5.0, math.floor((SNIPE_DEFAULT / max(limit_price, 0.01)) * 100) / 100)
     log(f"[BTC-MAKER] {direction} signal token_mid={token_price:.4f} limit={limit_price:.4f} shares={shares:.2f} dry={MAKER_DRY_RUN}")

@@ -147,125 +147,206 @@ def fetch_market_result(slug):
         return None
 
 
-def fetch_user_fills(user):
+def fetch_user_trades(user):
     try:
         r = requests.get(TRADES_API, params={'user': user, 'limit': 1000, 'offset': 0, 'takerOnly': 'false'}, timeout=30)
-        data = r.json() if r.status_code == 200 else []
-        by_asset = {}
-        for t in data:
-            asset = str(t.get('asset') or '')
-            by_asset.setdefault(asset, []).append(t)
-        return by_asset
+        return r.json() if r.status_code == 200 else []
     except Exception:
-        return {}
+        return []
+
+
+def fetch_user_activity(user):
+    try:
+        r = requests.get('https://data-api.polymarket.com/activity', params={'user': user, 'limit': 1000, 'offset': 0}, timeout=30)
+        return r.json() if r.status_code == 200 else []
+    except Exception:
+        return []
+
+
+def load_maker_log_entries():
+    entries = []
+    log_path = ROOT / '.poly_trade_log.json'
+    if not log_path.exists():
+        return entries
+    try:
+        data = json.loads(log_path.read_text())
+    except Exception:
+        return entries
+    for row in data:
+        if row.get('action') != 'MAKER_BUY':
+            continue
+        ts = row.get('timestamp')
+        try:
+            dt = datetime.fromisoformat(ts)
+        except Exception:
+            continue
+        token_prefix = str(row.get('token_id') or '').replace('...', '')
+        entries.append({
+            'timestamp': dt,
+            'token_prefix': token_prefix,
+            'amount': float(row.get('amount') or 0),
+            'price': float(row.get('price') or 0),
+            'order_id': row.get('order_id'),
+            'submitted_price': float(row.get('submitted_price') or row.get('price') or 0),
+        })
+    return entries
+
+
+def match_order_id(trade, maker_entries):
+    asset = str(trade.get('asset') or '')
+    price = float(trade.get('price') or 0)
+    size = float(trade.get('size') or 0)
+    try:
+        ts = datetime.fromtimestamp(int(trade.get('timestamp') or 0), tz=timezone.utc)
+    except Exception:
+        ts = None
+    matches = []
+    for e in maker_entries:
+        if e['token_prefix'] and not asset.startswith(e['token_prefix']):
+            continue
+        if abs(e['price'] - price) > 0.05:
+            continue
+        if abs(e['amount'] - size) > 0.2:
+            continue
+        if ts is not None:
+            diff = abs((ts - e['timestamp']).total_seconds())
+            if diff > 300:
+                continue
+        else:
+            diff = 999999
+        matches.append((diff, e))
+    matches.sort(key=lambda x: x[0])
+    return matches[0][1] if matches else None
+
+
+def sync_live_positions_file(live_positions):
+    clean = {}
+    for p in live_positions:
+        asset = str(p.get('asset') or '')
+        title = (p.get('title') or '').strip()
+        if not asset or not title:
+            continue
+        clean[asset] = {
+            'amount': float(p.get('size') or 0),
+            'avg_price': float(p.get('avgPrice') or 0),
+            'side': 'BUY',
+            'market': title,
+            'condition_id': p.get('conditionId') or '',
+            'opened': p.get('endDateIso') or p.get('slug') or '',
+            'slug': p.get('slug') or '',
+            'outcome': p.get('outcome') or '',
+            'current_value': float(p.get('currentValue') or 0),
+            'cash_pnl': float(p.get('cashPnl') or 0),
+            'redeemable': bool(p.get('redeemable')),
+        }
+    (ROOT / '.poly_positions.json').write_text(json.dumps(clean, indent=2))
+    return clean
 
 
 def reconcile():
     s = load_secrets()
     user = s.get('POLYMARKET_FUNDER', '').lower()
-    positions = load_positions()
-    orders = load_open_orders()
-    user_fills = fetch_user_fills(user)
-    positions_by_slug = {}
-    for p in positions:
-        slug = p.get('slug')
-        if slug:
-            positions_by_slug.setdefault(slug, []).append(p)
+    live_positions = load_positions()
+    positions_by_asset = {str(p.get('asset') or ''): p for p in live_positions if p.get('asset')}
+    sync_live_positions_file(live_positions)
+    open_orders = load_open_orders()
+    maker_entries = load_maker_log_entries()
+    trades = fetch_user_trades(user)
+    activity = fetch_user_activity(user)
+
+    target_trades = []
+    seen = set()
+    for t in trades:
+        slug = str(t.get('slug') or '')
+        if not (slug.startswith('btc-updown-15m-') or slug.startswith('eth-updown-15m-')):
+            continue
+        key = (t.get('transactionHash'), str(t.get('asset')), float(t.get('size') or 0), float(t.get('price') or 0))
+        if key in seen:
+            continue
+        seen.add(key)
+        target_trades.append(t)
 
     market_cache = {}
-    rows = []
-    for event in parse_log(BTC_LOG, 'btc15m') + parse_log(ETH_LOG, 'eth15m'):
-        if event['mode'] != 'LIVE' or not event.get('placed'):
+    redeem_by_slug = {}
+    for a in activity:
+        if a.get('type') != 'REDEEM':
             continue
-        status = 'PLACED'
-        pnl = None
-        matched = None
-        market = market_cache.get(event['slug'])
+        slug = str(a.get('slug') or '')
+        if not slug:
+            continue
+        redeem_by_slug.setdefault(slug, []).append(a)
+
+    rows = []
+    for t in sorted(target_trades, key=lambda x: int(x.get('timestamp') or 0)):
+        slug = str(t.get('slug') or '')
+        engine = 'btc15m' if slug.startswith('btc-') else 'eth15m'
+        side = str(t.get('outcome') or '').upper()
+        asset_id = str(t.get('asset') or '')
+        size = float(t.get('size') or 0)
+        price = float(t.get('price') or 0)
+        size_usd = size * price
+        ts = datetime.fromtimestamp(int(t.get('timestamp') or 0), tz=timezone.utc).astimezone(LOCAL_TZ).isoformat()
+        market = market_cache.get(slug)
         if market is None:
-            market = fetch_market_result(event['slug'])
-            market_cache[event['slug']] = market
-
-        asset_id = None
-        if market and market.get('tokens'):
-            asset_id = str(market['tokens'][0] if event['side'] == 'UP' else market['tokens'][1])
-        fills = user_fills.get(asset_id or '', [])
-        fill = None
-        for t in fills:
-            try:
-                t_local = datetime.fromtimestamp(int(t.get('timestamp') or 0), tz=timezone.utc).astimezone(LOCAL_TZ)
-            except Exception:
-                continue
-            if abs((t_local - datetime.fromisoformat(event['time'])).total_seconds()) <= 180 and (t.get('outcome') or '').upper() == event['side']:
-                fill = t
-                break
-
-        if fill:
-            filled_shares = float(fill.get('size') or 0)
-            fill_price = float(fill.get('price') or event['entry_price'] or 0)
-            # Prefer live position if still open/unredeemed
-            plist = positions_by_slug.get(event['slug'], [])
-            for p in plist:
-                outcome = (p.get('outcome') or '').upper()
-                if outcome == event['side']:
-                    matched = p
+            market = fetch_market_result(slug)
+            market_cache[slug] = market
+        pos = positions_by_asset.get(asset_id)
+        redeem_events = sorted(redeem_by_slug.get(slug, []), key=lambda x: int(x.get('timestamp') or 0))
+        redeem_usdc = 0.0
+        redeem_tx = None
+        if redeem_events:
+            redeem_usdc = max(float(a.get('usdcSize') or 0) for a in redeem_events)
+            for a in redeem_events:
+                if float(a.get('usdcSize') or 0) > 0:
+                    redeem_tx = a.get('transactionHash')
                     break
-            if matched:
-                redeemable = bool(matched.get('redeemable'))
-                cur_val = float(matched.get('currentValue', 0) or 0)
-                if redeemable:
-                    status = 'WON' if cur_val > 0 else 'LOST'
-                    pnl = cur_val - (filled_shares * fill_price)
-                else:
-                    status = 'PENDING'
-                    pnl = float(matched.get('cashPnl', 0) or 0)
+        order = match_order_id(t, maker_entries)
+        is_open_order = False
+        if not pos:
+            for o in open_orders:
+                if str(o.get('asset_id') or '') == asset_id and (o.get('status') or '').upper() == 'LIVE':
+                    is_open_order = True
+                    break
+
+        result = 'PENDING'
+        pnl = None
+        if market and market.get('closed'):
+            winner = str(market.get('winner') or '').upper()
+            if winner in ('UP', 'DOWN'):
+                win = winner == side
+                result = 'WON' if win else 'LOST'
+                payout = redeem_usdc if redeem_usdc > 0 else (size if win else 0.0)
+                pnl = payout - size_usd
             else:
-                window_end = datetime.fromtimestamp(event['window_ts'] + WINDOW_SEC, tz=LOCAL_TZ)
-                now = datetime.now(LOCAL_TZ)
-                if market and market.get('closed') and market.get('winner') in ('UP','DOWN'):
-                    win = market['winner'] == event['side']
-                    status = 'WON' if win else 'LOST'
-                    cur_val = filled_shares * (1.0 if win else 0.0)
-                    pnl = cur_val - (filled_shares * fill_price)
-                elif now < window_end:
-                    status = 'PENDING'
-                else:
-                    status = 'UNKNOWN'
-        else:
-            # No fill => not a real trade. Maybe open resting order or just posted+not matched.
-            for o in orders:
-                if o.get('status') != 'LIVE':
-                    continue
-                try:
-                    created = datetime.fromtimestamp(int(o.get('created_at')), tz=timezone.utc).astimezone(LOCAL_TZ)
-                except Exception:
-                    continue
-                price = float(o.get('price', 0) or 0)
-                outcome = (o.get('outcome') or '').upper()
-                asset = str(o.get('asset_id') or '')
-                if abs((created - datetime.fromisoformat(event['time'])).total_seconds()) < 180 and abs(price - event['entry_price']) < 0.03 and outcome == event['side'] and (not asset_id or asset == asset_id):
-                    status = 'OPEN_ORDER'
-                    matched = o
-                    break
-            if matched is None:
-                status = 'UNFILLED'
+                result = 'UNKNOWN'
+        elif is_open_order:
+            result = 'OPEN_ORDER'
 
         rows.append({
-            'time': event['time'],
-            'engine': event['engine'],
-            'side': event['side'],
-            'entry_price': event['entry_price'],
-            'size_usd': event['size_usd'],
-            'slug': event['slug'],
+            'time': ts,
+            'engine': engine,
+            'side': side,
+            'entry_price': price,
+            'size_usd': size_usd,
+            'shares': size,
+            'slug': slug,
             'asset_id': asset_id,
-            'filled': fill is not None,
+            'order_id': order.get('order_id') if order else None,
+            'submitted_price': order.get('submitted_price') if order else price,
+            'filled': True,
             'resolved': bool(market.get('closed')) if market else False,
             'winner': market.get('winner') if market else None,
-            'result': status,
+            'result': result,
             'pnl': pnl,
+            'question': t.get('title') or (market.get('question') if market else ''),
+            'redeemed': redeem_usdc > 0,
+            'redeem_usdc': redeem_usdc,
+            'redeem_tx': redeem_tx,
+            'fill_tx': t.get('transactionHash'),
+            'live_position': bool(pos),
         })
     rows.sort(key=lambda r: r['time'])
     return rows
-
 
 def sync_journal(rows):
     conn = sqlite3.connect(str(JOURNAL_DB))
@@ -273,7 +354,7 @@ def sync_journal(rows):
     for r in rows:
         if r['result'] not in ('WON', 'LOST'):
             continue
-        trade_id = f"{r['engine']}_{r['slug']}_{r['side'].lower()}"
+        trade_id = f"{r['engine']}_{r['slug']}_{r['side'].lower()}_{str(r.get('fill_tx') or 'nofill')[:12]}"
         ts_open = r['time']
         ts_close = datetime.fromtimestamp((int(datetime.fromisoformat(ts_open).timestamp()) - (int(datetime.fromisoformat(ts_open).timestamp()) % WINDOW_SEC)) + WINDOW_SEC, tz=timezone.utc).isoformat()
         exit_price = 1.0 if r['result'] == 'WON' else 0.0

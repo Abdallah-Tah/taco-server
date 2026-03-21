@@ -437,16 +437,25 @@ def reconcile_report():
             eng = row.get('engine')
             if eng not in out['by_engine']:
                 continue
-            out['by_engine'][eng]['placed'] += 1
+            bucket = out['by_engine'][eng]
+            bucket['attempted'] += 1
+            bucket['placed'] += 1
+            if row.get('filled'):
+                bucket['filled'] += 1
+            if row.get('result') == 'UNFILLED':
+                bucket['unfilled'] += 1
             if row.get('result') in ('WON','LOST'):
-                out['by_engine'][eng]['resolved'] += 1
+                bucket['resolved'] += 1
                 if row.get('result') == 'WON':
-                    out['by_engine'][eng]['wins'] += 1
+                    bucket['wins'] += 1
                 else:
-                    out['by_engine'][eng]['losses'] += 1
-                out['by_engine'][eng]['net_pnl'] += float(row.get('pnl') or 0)
+                    bucket['losses'] += 1
+                bucket['net_pnl'] += float(row.get('pnl') or 0)
             else:
-                out['by_engine'][eng]['pending'] += 1
+                bucket['pending'] += 1
+        for bucket in out['by_engine'].values():
+            if bucket['attempted']:
+                bucket['fill_rate'] = bucket['filled'] / bucket['attempted'] * 100.0
     except Exception as e:
         logger.error('Reconcile report error: %s', e)
     return out

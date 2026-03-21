@@ -12,6 +12,7 @@ SCRIPTS = {
     "solana_sniper": "taco_trader.py",
     "btc_15m":       "polymarket_btc15m.py",
     "eth_15m":       "polymarket_eth15m.py",
+    "auto_redeem":   "polymarket_auto_redeem_daemon.py",
     "whale_tracker": "polymarket_whale_tracker.py",
     "news_arb":      "polymarket_news_arb.py",
 }
@@ -26,6 +27,7 @@ RESTART_CMD = {
     "solana_sniper": [RESTART_VENV, "scripts/taco_trader.py"],
     "btc_15m":       [RESTART_VENV, "scripts/polymarket_btc15m.py"],
     "eth_15m":       [RESTART_VENV, "scripts/polymarket_eth15m.py"],
+    "auto_redeem":   [RESTART_VENV, "scripts/polymarket_auto_redeem_daemon.py"],
     "whale_tracker": [RESTART_VENV, "scripts/polymarket_whale_tracker.py"],
     "news_arb":      [RESTART_VENV, "scripts/polymarket_news_arb.py", "run", "--live"],
 }

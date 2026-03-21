@@ -10,11 +10,13 @@ mkdir -p "$STATE_DIR"
 
 TELEGRAM_TOKEN=""
 CHAT_ID=""
+ETH15M_PAUSED="false"
 if [ -f "$SECRETS" ]; then
   while IFS='=' read -r k v; do
     case "$k" in
       TELEGRAM_TOKEN) TELEGRAM_TOKEN=$(printf '%s' "$v" | sed "s/^['\"]//;s/['\"]$//") ;;
       CHAT_ID) CHAT_ID=$(printf '%s' "$v" | sed "s/^['\"]//;s/['\"]$//") ;;
+      ETH15M_PAUSED) ETH15M_PAUSED=$(printf '%s' "$v" | tr '[:upper:]' '[:lower:]' | sed "s/^['\"]//;s/['\"]$//") ;;
     esac
   done < "$SECRETS"
 fi
@@ -41,6 +43,7 @@ check_engine() {
   local script="$2"
   local pidfile="$3"
   local logfile="$4"
+  local mode="${5:-python}"
   local statefile="$STATE_DIR/${name}.state"
   local was_down=0
   [ -f "$statefile" ] && grep -q '^down$' "$statefile" && was_down=1
@@ -69,7 +72,11 @@ check_engine() {
   fi
 
   log "$name DOWN — restarting"
-  nohup "$VENV" "$WORK/scripts/$script" >> "$logfile" 2>&1 &
+  if [ "$mode" = "shell" ]; then
+    nohup "$WORK/scripts/$script" >> "$logfile" 2>&1 &
+  else
+    nohup "$VENV" "$WORK/scripts/$script" >> "$logfile" 2>&1 &
+  fi
   local newpid=$!
   echo "$newpid" > "$pidfile"
   sleep 4
@@ -85,4 +92,9 @@ check_engine() {
 }
 
 check_engine "BTC-15m" "polymarket_btc15m.py" "/tmp/polymarket_btc15m.pid" "/tmp/polymarket_btc15m.log"
-check_engine "ETH-15m" "polymarket_eth15m.py" "/tmp/polymarket_eth15m.pid" "/tmp/polymarket_eth15m.log"
+if [ "$ETH15M_PAUSED" != "true" ]; then
+  check_engine "ETH-15m" "polymarket_eth15m.py" "/tmp/polymarket_eth15m.pid" "/tmp/polymarket_eth15m.log"
+else
+  log "ETH-15m paused via ETH15M_PAUSED=true"
+fi
+check_engine "AUTO-REDEEM" "polymarket_auto_redeem_daemon.py" "/tmp/polymarket_auto_redeem.pid" "/tmp/polymarket_auto_redeem.log"
