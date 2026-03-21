@@ -306,8 +306,14 @@ def place_order(client, token_id, amount, price, side=BUY, market_question="", c
 
     side_str = "BUY" if side == BUY else "SELL"
     # --- PRECISION FIX: Polymarket decimal constraints ---
-    # taker_amount (shares): max 4 decimals | maker_amount (USDC): max 2 decimals
-    amount = round(amount, 4)
+    # maker_amount (USDC): max 2 decimals | taker_amount (shares): max 4 decimals
+    # We must ensure: shares * price rounds cleanly to 2 decimals
+    import math
+    price = round(price, 2)
+    # Floor shares to 2 decimals so shares*price stays within 2-decimal USDC precision
+    amount = math.floor(amount * 100) / 100
+    if amount < 5:
+        amount = 5.0  # Polymarket minimum
     dollar_cost = round(amount * price, 2)
 
     print(f"Placing {side_str} order: {amount} shares @ ${price:.3f} = ${dollar_cost:.2f}")
@@ -332,6 +338,11 @@ def place_order(client, token_id, amount, price, side=BUY, market_question="", c
                     return None
                 actual_price = min(0.99, max(price, aggressive_price))
                 actual_price = round(actual_price, 2)
+                # Re-floor shares for the actual submitted price
+                amount = math.floor(amount * 100) / 100
+                if amount < 5:
+                    amount = 5.0
+                dollar_cost = round(amount * actual_price, 2)
                 print(f"[ATTEMPT] side={side_str} best_ask={best_ask:.4f} submitted_price={actual_price:.4f} slippage_cap={slippage_cap:.4f} shares={amount} size=${dollar_cost:.2f}")
             else:
                 print(f"[ATTEMPT] side={side_str} best_ask=NONE -- skipping FOK order", file=sys.stderr)
