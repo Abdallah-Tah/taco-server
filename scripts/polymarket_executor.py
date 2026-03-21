@@ -324,9 +324,15 @@ def place_order(client, token_id, amount, price, side=BUY, market_question="", c
             best_ask = book.get("best_ask")
             tick = book.get("tick_size") or 0.01
             if best_ask is not None:
-                actual_price = min(0.99, max(price, best_ask + tick))
+                # Cap slippage: never pay more than 10% above model price
+                slippage_cap = round(price * 1.10, 2)
+                aggressive_price = round(best_ask + tick, 2)
+                if aggressive_price > slippage_cap:
+                    print(f"[ATTEMPT] side={side_str} best_ask={best_ask:.4f} aggressive={aggressive_price:.4f} slippage_cap={slippage_cap:.4f} — SKIP (spread too wide)", file=sys.stderr)
+                    return None
+                actual_price = min(0.99, max(price, aggressive_price))
                 actual_price = round(actual_price, 2)
-                print(f"[ATTEMPT] side={side_str} best_ask={best_ask:.4f} submitted_price={actual_price:.4f} shares={amount} size=${dollar_cost:.2f}")
+                print(f"[ATTEMPT] side={side_str} best_ask={best_ask:.4f} submitted_price={actual_price:.4f} slippage_cap={slippage_cap:.4f} shares={amount} size=${dollar_cost:.2f}")
             else:
                 print(f"[ATTEMPT] side={side_str} best_ask=NONE -- skipping FOK order", file=sys.stderr)
                 return None
