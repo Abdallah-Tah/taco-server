@@ -18,6 +18,7 @@ import os
 import signal
 import sqlite3
 import sys
+import threading
 import time
 import uuid
 from collections import deque
@@ -26,6 +27,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
+import requests
 from coinbase.rest import RESTClient
 
 ROOT = Path.home() / '.openclaw' / 'workspace' / 'trading'
@@ -53,12 +55,12 @@ CB_ENABLED = env_bool('CB_ENABLED', True)
 CB_POLL_INTERVAL = env_int('CB_POLL_INTERVAL', 30)
 CB_PAIRS = [x.strip() for x in os.environ.get('CB_PAIRS', 'BTC-USD,ETH-USD').split(',') if x.strip()]
 CB_MA_WINDOW = env_int('CB_MA_WINDOW', 30)
-CB_CONSECUTIVE_MIN = env_int('CB_CONSECUTIVE_MIN', 3)
-CB_MOMENTUM_MIN = env_float('CB_MOMENTUM_MIN', 0.08)
-CB_TAKE_PROFIT = env_float('CB_TAKE_PROFIT', 1.5)
-CB_STOP_LOSS = env_float('CB_STOP_LOSS', -0.8)
-CB_TIME_EXIT_HOURS = env_float('CB_TIME_EXIT_HOURS', 2)
-CB_USD_BUFFER = env_float('CB_USD_BUFFER', 0.50)
+CB_CONSECUTIVE_MIN = env_int('CB_CONSECUTIVE_MIN', 2)
+CB_MOMENTUM_MIN = env_float('CB_MOMENTUM_MIN', 0.02)
+CB_TAKE_PROFIT = env_float('CB_TAKE_PROFIT', 0.8)
+CB_STOP_LOSS = env_float('CB_STOP_LOSS', -0.5)
+CB_TIME_EXIT_HOURS = env_float('CB_TIME_EXIT_HOURS', 1)
+CB_USD_BUFFER = env_float('CB_USD_BUFFER', 10.00)
 CB_MAX_POSITIONS = env_int('CB_MAX_POSITIONS', 2)
 CB_DRY_RUN = env_bool('CB_DRY_RUN', True)
 CB_SIGNAL_LOG_EVERY = env_int('CB_SIGNAL_LOG_EVERY', 1)
@@ -71,6 +73,25 @@ logging.basicConfig(
     handlers=[logging.FileHandler(LOG_PATH), logging.StreamHandler(sys.stdout)],
 )
 log = logging.getLogger('coinbase_momentum')
+
+
+# Telegram configuration (shared with other systems)
+TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '8457917317:AAGtnuRix7Ei-rslwVAbfFIFJSK0UIwi0d4')
+CHAT_ID = os.environ.get('CHAT_ID', '7520899464')
+
+
+def tg(msg: str):
+    """Send Telegram message if not in dry run mode."""
+    if CB_DRY_RUN:
+        return
+    try:
+        requests.post(
+            f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage',
+            json={'chat_id': CHAT_ID, 'text': f'[CB] {msg}'},
+            timeout=10,
+        )
+    except Exception:
+        pass
 
 
 @dataclass
@@ -221,13 +242,37 @@ class Bot:
         return 0.0
 
     def market_buy(self, pair: str, usd_budget: float):
-        # Conservative notional market buy. SDK method names vary; keep DRY RUN default.
+        """Execute a market buy order. Returns (price, amount)."""
         product_price = self.get_product_price(pair)
         base_amount = max(0.0, usd_budget / product_price)
+        if not CB_DRY_RUN:
+            try:
+                # Use small tolerance for market order
+                tolerance = 0.01  # 1% tolerance for market order
+                self.client.market_buy(
+                    product_id=pair,
+                    quote_size=str(usd_budget),
+                    funds=str(usd_budget),
+                )
+                log.info('[CB-BUY] Market buy submitted for $%.2f of %s @ ~$%.2f', usd_budget, pair, product_price)
+                tg(f'[CB] BUY {pair} $usd_budget:.2f @ ${product_price:.2f}')
+            except Exception as e:
+                log.warning('[CB-BUY] Submit error: %s', e)
         return product_price, base_amount
 
     def market_sell(self, pair: str, amount: float):
+        """Execute a market sell order. Returns (price, amount)."""
         product_price = self.get_product_price(pair)
+        if not CB_DRY_RUN:
+            try:
+                self.client.market_sell(
+                    product_id=pair,
+                    size=str(amount),
+                )
+                log.info('[CB-SELL] Market sell submitted for %.8f %s @ ~$%.2f', amount, pair, product_price)
+                tg(f'[CB] SELL {pair} {amount:.4f} @ ${product_price:.2f}')
+            except Exception as e:
+                log.warning('[CB-SELL] Submit error: %s', e)
         return product_price, amount
 
     def trend_metrics(self, pair: str):
@@ -291,12 +336,15 @@ class Bot:
         if usd_budget < 1.0:
             log.info('[CB] %s buy signal but usd_budget=%.2f < 1.00, skipping', pair, usd_budget)
             return
+
+        # Telegram notification for entry signal
+        tg(f'[CB] BUY SIGNAL: {pair} | chg5m={m["change_5m_pct"]:+.2f}% | up={m["up_count"]}')
+
         entry_price, amount = self.market_buy(pair, usd_budget)
         if CB_DRY_RUN:
             log.info('[CB-BUY][DRY] Bought %.8f %s at $%.2f | budget=$%.2f', amount, pair.split('-')[0], entry_price, usd_budget)
             trade_id = self._journal_open(pair, 'BUY', entry_price, amount, usd_budget, 'DRY RUN entry')
         else:
-            # Placeholder: wire real market order in live mode only after confirmation.
             log.info('[CB-BUY] Bought %.8f %s at $%.2f', amount, pair.split('-')[0], entry_price)
             trade_id = self._journal_open(pair, 'BUY', entry_price, amount, usd_budget, 'LIVE entry')
         self.positions[pair] = Position(
@@ -336,6 +384,9 @@ class Bot:
             log.info('[CB-SELL][DRY] Sold %.8f %s at $%.2f | P&L: $%.2f | Reason: %s', amount, pair.split('-')[0], exit_price, pnl_abs, reason)
         else:
             log.info('[CB-SELL] Sold %.8f %s at $%.2f | P&L: $%.2f | Reason: %s', amount, pair.split('-')[0], exit_price, pnl_abs, reason)
+        # Telegram notification for exit
+        pnl_sign = '+' if pnl_abs >= 0 else ''
+        tg(f'[CB] SELL: {pair} | P&L: ${pnl_sign}{pnl_abs:.2f} ({pnl_pct:+.1f}%) | {reason}')
         if pos.trade_id:
             self._journal_close(
                 pos.trade_id,
@@ -366,11 +417,6 @@ class Bot:
             except Exception as e:
                 log.exception('[CB] loop error: %s', e)
             time.sleep(CB_POLL_INTERVAL)
-
-
-if __name__ == '__main__':
-    Bot().run()
-(CB_POLL_INTERVAL)
 
 
 if __name__ == '__main__':
