@@ -39,14 +39,42 @@ STATE_PATH = ROOT / '.coinbase_momentum_state.json'
 
 
 def env_bool(key: str, default: bool) -> bool:
+    # First check secrets.env
+    if SECRETS.exists():
+        try:
+            for line in SECRETS.read_text().splitlines():
+                line = line.strip()
+                if line.startswith(key) and '=' in line:
+                    value = line.split('=', 1)[1].strip().lower()
+                    return value in ('1', 'true', 'yes', 'on')
+        except Exception:
+            pass
     return os.environ.get(key, str(default).lower()).lower() in ('1', 'true', 'yes', 'on')
 
 
 def env_float(key: str, default: float) -> float:
+    # First check secrets.env
+    if SECRETS.exists():
+        try:
+            for line in SECRETS.read_text().splitlines():
+                line = line.strip()
+                if line.startswith(key) and '=' in line:
+                    return float(line.split('=', 1)[1].strip())
+        except Exception:
+            pass
     return float(os.environ.get(key, default))
 
 
 def env_int(key: str, default: int) -> int:
+    # First check secrets.env
+    if SECRETS.exists():
+        try:
+            for line in SECRETS.read_text().splitlines():
+                line = line.strip()
+                if line.startswith(key) and '=' in line:
+                    return int(line.split('=', 1)[1].strip())
+        except Exception:
+            pass
     return int(os.environ.get(key, default))
 
 
