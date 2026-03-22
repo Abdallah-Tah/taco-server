@@ -133,7 +133,7 @@ def tg(msg: str):
     try:
         requests.post(
             f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage',
-            json={'chat_id': CHAT_ID, 'text': f'[CB] {msg}'},
+            json={'chat_id': CHAT_ID, 'text': msg},
             timeout=10,
         )
     except Exception:
