@@ -421,15 +421,16 @@ def engine_report():
 
 
 def reconcile_report():
-    """Load BTC/ETH 15m placed/resolved/pending stats from reconciliation."""
+    """Load corrected BTC/ETH 15m market-position reconciliation."""
     import json as _json
     import subprocess as _sp
     out = {
         'rows': [],
-        'summary': {'attempted': 0, 'filled': 0, 'fill_rate': 0.0, 'placed': 0, 'resolved': 0, 'wins': 0, 'losses': 0, 'pending': 0, 'unfilled': 0, 'win_rate': 0.0, 'net_pnl': 0.0},
+        'summary': {'market_positions': 0, 'resolved': 0, 'wins': 0, 'losses': 0, 'pending': 0, 'win_rate': 0.0, 'net_realized_pnl': 0.0},
+        'posted_stats': {'btc15m': {'posted_orders': 0, 'filled_orders': 0}, 'eth15m': {'posted_orders': 0, 'filled_orders': 0}},
         'by_engine': {
-            'btc15m': {'attempted': 0, 'filled': 0, 'fill_rate': 0.0, 'placed': 0, 'resolved': 0, 'wins': 0, 'losses': 0, 'pending': 0, 'unfilled': 0, 'net_pnl': 0.0},
-            'eth15m': {'attempted': 0, 'filled': 0, 'fill_rate': 0.0, 'placed': 0, 'resolved': 0, 'wins': 0, 'losses': 0, 'pending': 0, 'unfilled': 0, 'net_pnl': 0.0},
+            'btc15m': {'market_positions': 0, 'resolved': 0, 'wins': 0, 'losses': 0, 'pending': 0, 'net_realized_pnl': 0.0, 'posted_orders': 0, 'filled_orders': 0, 'true_fill_rate': 0.0},
+            'eth15m': {'market_positions': 0, 'resolved': 0, 'wins': 0, 'losses': 0, 'pending': 0, 'net_realized_pnl': 0.0, 'posted_orders': 0, 'filled_orders': 0, 'true_fill_rate': 0.0},
         }
     }
     try:
@@ -437,29 +438,28 @@ def reconcile_report():
         data = _json.loads(cp.stdout)
         out['rows'] = data.get('rows', [])
         out['summary'] = data.get('summary', out['summary'])
+        out['posted_stats'] = data.get('posted_stats', out['posted_stats'])
         for row in out['rows']:
             eng = row.get('engine')
             if eng not in out['by_engine']:
                 continue
             bucket = out['by_engine'][eng]
-            bucket['attempted'] += 1
-            bucket['placed'] += 1
-            if row.get('filled'):
-                bucket['filled'] += 1
-            if row.get('result') == 'UNFILLED':
-                bucket['unfilled'] += 1
-            if row.get('result') in ('WON','LOST'):
+            bucket['market_positions'] += 1
+            if row.get('status') in ('RESOLVED_WON', 'RESOLVED_LOST'):
                 bucket['resolved'] += 1
-                if row.get('result') == 'WON':
+                if row.get('status') == 'RESOLVED_WON':
                     bucket['wins'] += 1
                 else:
                     bucket['losses'] += 1
-                bucket['net_pnl'] += float(row.get('pnl') or 0)
+                bucket['net_realized_pnl'] += float(row.get('realized_pnl') or 0)
             else:
                 bucket['pending'] += 1
-        for bucket in out['by_engine'].values():
-            if bucket['attempted']:
-                bucket['fill_rate'] = bucket['filled'] / bucket['attempted'] * 100.0
+        for eng, bucket in out['by_engine'].items():
+            ps = out['posted_stats'].get(eng, {})
+            bucket['posted_orders'] = int(ps.get('posted_orders') or 0)
+            bucket['filled_orders'] = int(ps.get('filled_orders') or 0)
+            if bucket['posted_orders']:
+                bucket['true_fill_rate'] = bucket['filled_orders'] / bucket['posted_orders'] * 100.0
     except Exception as e:
         logger.error('Reconcile report error: %s', e)
     return out
@@ -514,17 +514,26 @@ def main():
     reached = milestones.get("reached", [])
     lines.append("")
 
+    open_15m_value = sum(float(r.get('redeem_received') or 0) if r.get('status') == 'OPEN' else 0.0 for r in recon.get('rows', []))
+    non_15m_value = max(0.0, poly['value'] - open_15m_value)
+
     lines.append("CAPITAL")
-    lines.append(f"• Start: {fmt_money(poly['starting_capital'])}")
     lines.append(f"• Current: {fmt_money(poly['current_total_capital'])}")
-    lines.append(f"• Cash: {fmt_money(poly['cash'])}")
-    lines.append(f"• Open value: {fmt_money(poly['value'])}")
+    lines.append(f"• Free cash: {fmt_money(poly['cash'])}")
+    lines.append(f"• Open position value: {fmt_money(poly['value'])}")
+    lines.append(f"• Non-15m holdings in open value: {fmt_money(non_15m_value)}")
     lines.append("")
 
+    btc_rs = recon['by_engine'].get('btc15m', {})
+    eth_rs = recon['by_engine'].get('eth15m', {})
+    open_15m_count = btc_rs.get('pending', 0) + eth_rs.get('pending', 0)
+
     lines.append("RESULTS")
-    lines.append(f"• Won: {fmt_money(poly['realized_win'])} | Lost: {fmt_money(poly['realized_loss'])}")
-    lines.append(f"• Realized net: {fmt_money(poly['realized_net'])}")
-    lines.append(f"• Open PnL: {fmt_money(poly['pnl'])} ({poly['pnl_pct']:+.1f}%)")
+    lines.append(f"• Corrected BTC realized PnL: {fmt_money(btc_rs.get('net_realized_pnl', 0.0))}")
+    lines.append(f"• Corrected ETH realized PnL: {fmt_money(eth_rs.get('net_realized_pnl', 0.0))}")
+    lines.append(f"• Corrected combined 15m realized PnL: {fmt_money(recon['summary'].get('net_realized_pnl', 0.0))}")
+    lines.append(f"• 15m positions currently open: {open_15m_count}")
+    lines.append(f"• Portfolio open/unrealized PnL: {fmt_money(poly['pnl'])} ({poly['pnl_pct']:+.1f}%)")
     lines.append("")
 
     lines.append("7-DAY")
@@ -544,8 +553,9 @@ def main():
         status = 'LIVE' if e['running'] else 'DOWN'
         lines.append(f"• {e['label']}: {status} | delta>={e['threshold']}")
         rs = recon['by_engine'].get(key + '15m', {}) if key in ('btc','eth') else {}
-        lines.append(f"  Attempted: {rs.get('attempted', 0)} | Filled: {rs.get('filled', 0)} ({rs.get('fill_rate', 0.0):.1f}%) | Unfilled: {rs.get('unfilled', 0)}")
-        lines.append(f"  Resolved filled: {rs.get('resolved', 0)} | W: {rs.get('wins', 0)} L: {rs.get('losses', 0)} Pending: {rs.get('pending', 0)} | P&L: {fmt_money(rs.get('net_pnl', 0.0))}")
+        lines.append(f"  Posted orders: {rs.get('posted_orders', 0)} | Filled orders: {rs.get('filled_orders', 0)} | True fill rate: {rs.get('true_fill_rate', 0.0):.1f}%")
+        lines.append(f"  Resolved markets: {rs.get('resolved', 0)} | W: {rs.get('wins', 0)} L: {rs.get('losses', 0)} | Pending/Open: {rs.get('pending', 0)}")
+        lines.append(f"  Corrected realized P&L: {fmt_money(rs.get('net_realized_pnl', 0.0))}")
         if e.get('last_signal'):
             lines.append(f"  Last signal: {e['last_signal'].split('] ',1)[-1][:100]}")
         if e.get('last_order'):
@@ -585,6 +595,91 @@ def main():
         lines.append("• Action: redeem/claim now")
     else:
         lines.append("• Action: nothing to redeem")
+    lines.append("")
+
+    # BTC/ETH Detailed Trades Section
+    lines.append("=" * 40)
+    lines.append("BTC/ETH DETAILED TRADES")
+    lines.append("=" * 40)
+
+    try:
+        import sqlite3
+        conn = sqlite3.connect(str(ROOT / 'journal.db'))
+        c = conn.cursor()
+
+        # BTC trades - last 20
+        lines.append("")
+        lines.append("✅ BTC 15m - LAST 20 TRADES")
+        c.execute("""
+            SELECT timestamp_open, direction, position_size_usd, pnl_absolute, pnl_percent, exit_type
+            FROM trades WHERE engine = 'btc15m'
+            ORDER BY timestamp_open DESC LIMIT 20
+        """)
+        for t in c.fetchall():
+            ts, direction, size, pnl, pnl_pct, status = t
+            ts_str = ts[:16].replace('T', ' ')
+            pnl_sign = "+" if pnl >= 0 else ""
+            pnl_color = "✅" if pnl > 0 else "❌"
+            lines.append(f"  {ts_str} {direction} {pnl_color} ${pnl:.2f} ({pnl_sign}{pnl_pct:.1f}%) [{status}]")
+
+        # ETH trades - last 20
+        lines.append("")
+        lines.append("✅ ETH 15m - LAST 20 TRADES")
+        c.execute("""
+            SELECT timestamp_open, direction, position_size_usd, pnl_absolute, pnl_percent, exit_type
+            FROM trades WHERE engine = 'eth15m'
+            ORDER BY timestamp_open DESC LIMIT 20
+        """)
+        for t in c.fetchall():
+            ts, direction, size, pnl, pnl_pct, status = t
+            ts_str = ts[:16].replace('T', ' ')
+            pnl_sign = "+" if pnl >= 0 else ""
+            pnl_color = "✅" if pnl > 0 else "❌"
+            lines.append(f"  {ts_str} {direction} {pnl_color} ${pnl:.2f} ({pnl_sign}{pnl_pct:.1f}%) [{status}]")
+
+        # BTC daily summary
+        lines.append("")
+        lines.append("📊 BTC 15m - DAILY SUMMARY")
+        c.execute("""
+            SELECT DATE(timestamp_open) as date, COUNT(*) as trades,
+                   SUM(CASE WHEN pnl_absolute > 0 THEN 1 ELSE 0 END) as wins,
+                   SUM(CASE WHEN pnl_absolute < 0 THEN 1 ELSE 0 END) as losses,
+                   SUM(pnl_absolute) as total_pnl
+            FROM trades WHERE engine = 'btc15m'
+            GROUP BY DATE(timestamp_open)
+            ORDER BY date DESC LIMIT 7
+        """)
+        for row in c.fetchall():
+            date, trades, wins, losses, total_pnl = row
+            win_rate = (wins / trades * 100) if trades > 0 else 0
+            pnl_sign = "+" if total_pnl >= 0 else ""
+            lines.append(f"  {date}: {trades} trades | W:{wins} L:{losses} ({win_rate:.1f}%) | {pnl_sign}${total_pnl:.2f}")
+
+        # ETH daily summary
+        lines.append("")
+        lines.append("📊 ETH 15m - DAILY SUMMARY")
+        c.execute("""
+            SELECT DATE(timestamp_open) as date, COUNT(*) as trades,
+                   SUM(CASE WHEN pnl_absolute > 0 THEN 1 ELSE 0 END) as wins,
+                   SUM(CASE WHEN pnl_absolute < 0 THEN 1 ELSE 0 END) as losses,
+                   SUM(pnl_absolute) as total_pnl
+            FROM trades WHERE engine = 'eth15m'
+            GROUP BY DATE(timestamp_open)
+            ORDER BY date DESC LIMIT 7
+        """)
+        for row in c.fetchall():
+            date, trades, wins, losses, total_pnl = row
+            win_rate = (wins / trades * 100) if trades > 0 else 0
+            pnl_sign = "+" if total_pnl >= 0 else ""
+            lines.append(f"  {date}: {trades} trades | W:{wins} L:{losses} ({win_rate:.1f}%) | {pnl_sign}${total_pnl:.2f}")
+
+        conn.close()
+
+    except Exception as e:
+        lines.append(f"  Error fetching detailed trades: {e}")
+
+    lines.append("")
+    lines.append("=" * 40)
     print("\n".join(lines))
 
 

@@ -61,7 +61,7 @@ MAKER_ENABLED  = os.environ.get("BTC15M_MAKER_ENABLED", ENV.get("BTC15M_MAKER_EN
 MAKER_DRY_RUN  = os.environ.get("BTC15M_MAKER_DRY_RUN", ENV.get("BTC15M_MAKER_DRY_RUN", "true")).lower() != "false"
 MAKER_START_SEC = _int("BTC15M_MAKER_START_SEC", 300)
 MAKER_CANCEL_SEC = _int("BTC15M_MAKER_CANCEL_SEC", 60)
-MAKER_OFFSET = _float("BTC15M_MAKER_OFFSET", 0.02)
+MAKER_OFFSET = _float("BTC15M_MAKER_OFFSET", 0.005)
 MAKER_POLL_SEC = _int("BTC15M_MAKER_POLL_SEC", 10)
 MAKER_MIN_PRICE = _float("BTC15M_MAKER_MIN_PRICE", 0.01)
 
@@ -342,6 +342,7 @@ def check_maker_snipe(market, seconds_remaining):
         if seconds_remaining <= MAKER_CANCEL_SEC and st.get('status') in ('open', 'partially_filled'):
             maker_cancel_order(oid)
             log(f"[BTC-MAKER] cancel by deadline order_id={oid} sec_rem={seconds_remaining}")
+            tg(f"[BTC-MAKER] ORDER CANCELLED: {oid} | sec_rem={seconds_remaining}")
             _state['maker_done'] = True
             save_state()
             return False
@@ -384,6 +385,8 @@ def check_maker_snipe(market, seconds_remaining):
     _state['maker_last_poll'] = int(time.time())
     _state['maker_done'] = False
     save_state()
+    # Send Telegram notification for order placement
+    tg(f"[BTC-MAKER] ORDER PLACED: {direction} {shares:.2f} shares @ {limit_price:.4f} | Order: {r.get('order_id') or (r.get('posted') or {}).get('order_id') or ''}")
     return r.get('success')
 
 # ── Strategy A: Arb check ─────────────────────────────────────────────────────
