@@ -98,6 +98,7 @@ _state = {
     "maker_shares":     0.0,
     "maker_done":       False,
     "maker_last_poll":  0,
+    "maker_seen_fills": [],
 }
 _positions = []   # list of dicts for open/confirmation positions
 
@@ -144,6 +145,7 @@ def load_state():
     if STATE_F.exists():
         with open(STATE_F) as f:
             _state = json.load(f)
+    _state.setdefault('maker_seen_fills', [])
 
 # ── BTC price from Coinbase ────────────────────────────────────────────────────
 def get_eth_price():
@@ -347,11 +349,16 @@ def check_maker_snipe(market, seconds_remaining):
         if st.get('status') == 'not_found':
             vf = maker_verify_fill(_state.get('maker_token_id'), _state.get('maker_shares', 0))
             if vf.get('filled'):
-                log(f"[ETH-MAKER] fill verified via activity/trades size={vf.get('filled_size')}")
+                fill_key = f"{oid}:{vf.get('filled_size')}"
+                seen = set(_state.get('maker_seen_fills', []))
+                if fill_key not in seen:
+                    log(f"[ETH-MAKER] fill verified via activity/trades size={vf.get('filled_size')}")
+                    tg(f"[ETH-MAKER] FILL VERIFIED {vf.get('filled_size')} shares")
+                    seen.add(fill_key)
+                    _state['maker_seen_fills'] = list(seen)[-200:]
                 _state['maker_done'] = True
                 _state['snipe_done'] = True
                 save_state()
-                tg(f"[ETH-MAKER] FILL VERIFIED {vf.get('filled_size')} shares")
                 return True
         if seconds_remaining <= MAKER_CANCEL_SEC and st.get('status') in ('open', 'partially_filled'):
             maker_cancel_order(oid)

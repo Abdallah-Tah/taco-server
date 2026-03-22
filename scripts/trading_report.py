@@ -154,7 +154,11 @@ def poly_report():
         except Exception:
             pass
 
-    orders = client.get_orders() or []
+    try:
+        orders = client.get_orders() or []
+    except Exception as e:
+        logger.error("Orders API error: %s", e)
+        orders = []
     live_orders = [o for o in orders if o.get("status") == "live"]
     pnl = value - invested
     pnl_pct = (pnl / invested * 100) if invested else 0.0
