@@ -50,10 +50,28 @@ def env_int(key: str, default: int) -> int:
     return int(os.environ.get(key, default))
 
 
+def env_pairs(key: str, default: str) -> list[str]:
+    """Parse comma-separated pairs from secrets.env or env."""
+    # First try to read from secrets.env file
+    if SECRETS.exists():
+        try:
+            for line in SECRETS.read_text().splitlines():
+                line = line.strip()
+                if line.startswith(key) and '=' in line:
+                    value = line.split('=', 1)[1].strip()
+                    return [x.strip() for x in value.split(',') if x.strip()]
+        except Exception:
+            pass
+    # Fallback to environment variable
+    raw = os.environ.get(key, default)
+    return [x.strip() for x in raw.split(',') if x.strip()]
+
+
 # Coinbase Momentum Bot (isolated defaults; NOT using shared config.py to honor isolation)
+# Note: CB_PAIRS is loaded from secrets.env if available, otherwise from env
 CB_ENABLED = env_bool('CB_ENABLED', True)
 CB_POLL_INTERVAL = env_int('CB_POLL_INTERVAL', 30)
-CB_PAIRS = [x.strip() for x in os.environ.get('CB_PAIRS', 'BTC-USD,ETH-USD').split(',') if x.strip()]
+CB_PAIRS = env_pairs('CB_PAIRS', 'BTC-USD,ETH-USD')
 CB_MA_WINDOW = env_int('CB_MA_WINDOW', 30)
 CB_CONSECUTIVE_MIN = env_int('CB_CONSECUTIVE_MIN', 2)
 CB_MOMENTUM_MIN = env_float('CB_MOMENTUM_MIN', 0.02)
