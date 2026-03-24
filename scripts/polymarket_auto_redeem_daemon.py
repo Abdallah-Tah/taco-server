@@ -6,6 +6,7 @@
 - Claims immediately when found.
 - Logs a heartbeat "Nothing to claim" at most every 30 minutes.
 - Uses a lock file to avoid overlapping runs/conflicts.
+- Sends a Telegram cha-ching sound on successful redeems.
 """
 import json
 import os
@@ -14,6 +15,11 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
+
+try:
+    from openclaw_runtime import channel_output
+except Exception:
+    channel_output = None
 
 ROOT = Path.home() / '.openclaw' / 'workspace' / 'trading'
 VENV = ROOT / '.polymarket-venv' / 'bin' / 'python3'
@@ -24,6 +30,9 @@ LOCK_FILE = Path('/tmp/polymarket_auto_redeem.lock')
 STATE_FILE = Path('/tmp/polymarket_auto_redeem_state.json')
 CHECK_EVERY_SEC = 300
 NOTHING_LOG_EVERY_SEC = 1800
+CHA_CHING_FILE = Path.home() / '.openclaw' / 'media' / 'inbound' / 'shopify_sale_sound---241c049a-5aef-4109-a430-38b2d21b6413.mp3'
+TELEGRAM_TARGET = '7520899464'
+PUSHCUT_URL = 'https://api.pushcut.io/Sp32e9ypdNreANO8BpJGG/notifications/My%20First%20Notification'
 
 
 def log(msg: str):
@@ -104,6 +113,40 @@ def run_redeem_check():
     return {"claimed": bool(claimed_items), "items": claimed_items, "claimed_total": claimed_total}
 
 
+def send_telegram_cha_ching(item):
+    if not CHA_CHING_FILE.exists():
+        log(f"[REDEEM] Cha-ching file missing: {CHA_CHING_FILE}")
+        return
+    title = item.get('title') or 'Polymarket redeem'
+    value = float(item.get('value') or 0)
+    caption = f"💰 Redeemed ${value:.2f} back to USDC.e\n{title}"
+    try:
+        subprocess.run([
+            'openclaw', 'message', 'send',
+            '--channel', 'telegram',
+            '--target', TELEGRAM_TARGET,
+            '--media', str(CHA_CHING_FILE),
+            '--caption', caption
+        ], check=False, capture_output=True, text=True, timeout=30)
+    except Exception as e:
+        log(f"[REDEEM] Cha-ching send failed: {e}")
+
+
+def send_pushcut_notification(item):
+    title = item.get('title') or 'Polymarket redeem'
+    value = float(item.get('value') or 0)
+    body = f"Redeemed ${value:.2f} back to USDC.e — {title}"
+    try:
+        subprocess.run([
+            'curl', '-sS', '-X', 'POST',
+            PUSHCUT_URL,
+            '-H', 'Content-Type: application/json',
+            '-d', json.dumps({'text': body})
+        ], check=False, capture_output=True, text=True, timeout=20)
+    except Exception as e:
+        log(f"[REDEEM] Pushcut send failed: {e}")
+
+
 def main():
     PID_FILE.write_text(str(os.getpid()))
     log('[REDEEM] Auto-redeem daemon started')
@@ -115,6 +158,8 @@ def main():
                 if result['claimed']:
                     for item in result['items']:
                         log(f"[REDEEM] Claimed ${float(item.get('value') or 0):.2f} from {item.get('title')}")
+                        send_telegram_cha_ching(item)
+                        send_pushcut_notification(item)
                 else:
                     now = int(time.time())
                     if now - int(state.get('last_nothing_log') or 0) >= NOTHING_LOG_EVERY_SEC:

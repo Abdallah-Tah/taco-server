@@ -17,8 +17,8 @@ POSITIONS_API = 'https://data-api.polymarket.com/positions?user={user}'
 POLYGON_RPCS = [
     'https://polygon-rpc.com',
     'https://rpc.ankr.com/polygon',
-    'https://polygon.drpc.org',
     'https://polygon-bor-rpc.publicnode.com',
+    'https://polygon.drpc.org',
 ]
 CHAIN_ID = 137
 CTF_ADDRESS = Web3.to_checksum_address('0x4D97DCd97eC945f40cF65F87097ACe5EA0476045')

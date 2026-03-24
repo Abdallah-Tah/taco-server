@@ -64,10 +64,6 @@ MAKER_CANCEL_SEC = _int("BTC15M_MAKER_CANCEL_SEC", 30)
 MAKER_OFFSET = _float("BTC15M_MAKER_OFFSET", 0.005)
 MAKER_POLL_SEC = _int("BTC15M_MAKER_POLL_SEC", 10)
 MAKER_MIN_PRICE = _float("BTC15M_MAKER_MIN_PRICE", 0.01)
-BTC15M_GABAGOOL_ENABLED = os.environ.get("BTC15M_GABAGOOL_ENABLED", ENV.get("BTC15M_GABAGOOL_ENABLED", "false")).lower() == "true"
-BTC15M_GABAGOOL_DRY_RUN = os.environ.get("BTC15M_GABAGOOL_DRY_RUN", ENV.get("BTC15M_GABAGOOL_DRY_RUN", "true")).lower() != "false"
-GABAGOOL_MAX_LEG = _float("GABAGOOL_MAX_LEG", 0.48)
-GABAGOOL_TARGET_COMBINED = _float("GABAGOOL_TARGET_COMBINED", 0.97)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 WINDOW_SEC      = _int("BTC15M_WINDOW_SEC", 900)          # 15 minutes
@@ -107,11 +103,6 @@ _state = {
     "maker_done":       False,
     "maker_last_poll":  0,
     "maker_seen_fills": [],
-    "gabagool_yes_low": None,
-    "gabagool_yes_ts": 0,
-    "gabagool_no_low": None,
-    "gabagool_no_ts": 0,
-    "gabagool_window_logged": False,
 }
 _positions = []   # list of dicts for open/confirmation positions
 
@@ -441,47 +432,6 @@ def check_maker_snipe(market, seconds_remaining):
     return r.get('success')
 
 # ── Strategy A: Arb check ─────────────────────────────────────────────────────
-def check_gabagool(market, seconds_remaining=None):
-    if not BTC15M_GABAGOOL_ENABLED:
-        return None
-    if market.get("closed"):
-        return None
-
-    yes_price = market.get("yes_price", 1.0)
-    no_price = market.get("no_price", 1.0)
-    now_ts = int(time.time())
-
-    if yes_price < GABAGOOL_MAX_LEG:
-        prev = _state.get("gabagool_yes_low")
-        if prev is None or yes_price < prev:
-            _state["gabagool_yes_low"] = yes_price
-            _state["gabagool_yes_ts"] = now_ts
-            log(f"[GABAGOOL] YES dip ts={now_ts} price={yes_price:.4f}")
-            save_state()
-
-    if no_price < GABAGOOL_MAX_LEG:
-        prev = _state.get("gabagool_no_low")
-        if prev is None or no_price < prev:
-            _state["gabagool_no_low"] = no_price
-            _state["gabagool_no_ts"] = now_ts
-            log(f"[GABAGOOL] NO dip ts={now_ts} price={no_price:.4f}")
-            save_state()
-
-    if seconds_remaining is not None and seconds_remaining <= 5 and not _state.get("gabagool_window_logged"):
-        y = _state.get("gabagool_yes_low")
-        n = _state.get("gabagool_no_low")
-        yts = _state.get("gabagool_yes_ts", 0)
-        nts = _state.get("gabagool_no_ts", 0)
-        if y is not None and n is not None:
-            combined = y + n
-            profit = 1.00 - combined
-            log(f"[GABAGOOL SUMMARY] YES low=${y:.4f} at {yts}, NO low=${n:.4f} at {nts}, combined=${combined:.4f}, profit=${profit:.4f}")
-        else:
-            log(f"[GABAGOOL SUMMARY] incomplete yes={y} no={n}")
-        _state["gabagool_window_logged"] = True
-        save_state()
-    return None
-
 def check_arb(market):
     if _state["arb_done"]:
         return None
@@ -668,9 +618,6 @@ def main():
         # Strategy A: Arb (first 14.75 min)
         if sec_rem > 15:
             check_arb(market)
-
-        # Gabagool tracking (dry-run aware, no real orders unless explicitly enabled elsewhere)
-        check_gabagool(market, sec_rem)
 
         # Strategy B: Snipe / Maker Snipe
         if MAKER_ENABLED:

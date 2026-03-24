@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-polymarket_btc15m.py — BTC 15-Minute Polymarket Engine
+polymarket_btc5m.py — BTC 5-Minute Polymarket Engine
 ======================================================
 Two strategies:
   A) Binary Arb      — buy UP+DOWN when combined < $0.98, guaranteed profit
@@ -24,9 +24,9 @@ import requests
 WORK_DIR      = Path("/home/abdaltm86/.openclaw/workspace/trading")
 JOURNAL_DB    = WORK_DIR / "journal.db"
 CREDS_FILE    = Path("/home/abdaltm86/.config/openclaw/secrets.env")
-POSITIONS_F  = WORK_DIR / ".poly_btc15m_positions.json"
-STATE_F       = WORK_DIR / ".poly_btc15m_state.json"
-LOG_F        = WORK_DIR / ".poly_btc15m.log"
+POSITIONS_F  = WORK_DIR / ".poly_btc5m_positions.json"
+STATE_F       = WORK_DIR / ".poly_btc5m_state.json"
+LOG_F        = WORK_DIR / ".poly_btc5m.log"
 
 # ── Load credentials ─────────────────────────────────────────────────────────
 def _load_env():
@@ -56,38 +56,38 @@ TELEGRAM_TOKEN = ENV.get("TELEGRAM_TOKEN", "8457917317:AAGtnuRix7Ei-rslwVAbfFIFJ
 CHAT_ID        = ENV.get("CHAT_ID",        "7520899464")
 POLY_WALLET    = ENV.get("POLY_WALLET",    "0x1a4c163a134D7154ebD5f7359919F9c439424f00")
 VENV_PY        = Path("/home/abdaltm86/.openclaw/workspace/trading/.polymarket-venv/bin/python3")
-DRY_RUN        = os.environ.get("BTC15M_DRY_RUN",  ENV.get("BTC15M_DRY_RUN",  "true")).lower() != "false"
-MAKER_ENABLED  = os.environ.get("BTC15M_MAKER_ENABLED", ENV.get("BTC15M_MAKER_ENABLED", "false")).lower() == "true"
-MAKER_DRY_RUN  = os.environ.get("BTC15M_MAKER_DRY_RUN", ENV.get("BTC15M_MAKER_DRY_RUN", "true")).lower() != "false"
-MAKER_START_SEC = _int("BTC15M_MAKER_START_SEC", 300)
-MAKER_CANCEL_SEC = _int("BTC15M_MAKER_CANCEL_SEC", 30)
-MAKER_OFFSET = _float("BTC15M_MAKER_OFFSET", 0.005)
-MAKER_POLL_SEC = _int("BTC15M_MAKER_POLL_SEC", 10)
-MAKER_MIN_PRICE = _float("BTC15M_MAKER_MIN_PRICE", 0.01)
-BTC15M_GABAGOOL_ENABLED = os.environ.get("BTC15M_GABAGOOL_ENABLED", ENV.get("BTC15M_GABAGOOL_ENABLED", "false")).lower() == "true"
-BTC15M_GABAGOOL_DRY_RUN = os.environ.get("BTC15M_GABAGOOL_DRY_RUN", ENV.get("BTC15M_GABAGOOL_DRY_RUN", "true")).lower() != "false"
+DRY_RUN        = os.environ.get("BTC5M_DRY_RUN",  ENV.get("BTC5M_DRY_RUN",  "true")).lower() != "false"
+MAKER_ENABLED  = os.environ.get("BTC5M_MAKER_ENABLED", ENV.get("BTC5M_MAKER_ENABLED", "false")).lower() == "true"
+MAKER_DRY_RUN  = os.environ.get("BTC5M_MAKER_DRY_RUN", ENV.get("BTC5M_MAKER_DRY_RUN", "true")).lower() != "false"
+MAKER_START_SEC = _int("BTC5M_MAKER_START_SEC", 300)
+MAKER_CANCEL_SEC = _int("BTC5M_MAKER_CANCEL_SEC", 30)
+MAKER_OFFSET = _float("BTC5M_MAKER_OFFSET", 0.005)
+MAKER_POLL_SEC = _int("BTC5M_MAKER_POLL_SEC", 10)
+MAKER_MIN_PRICE = _float("BTC5M_MAKER_MIN_PRICE", 0.01)
+BTC5M_ENABLED = os.environ.get("BTC5M_ENABLED", ENV.get("BTC5M_ENABLED", "false")).lower() == "true"
+GABAGOOL_ENABLED = os.environ.get("GABAGOOL_ENABLED", ENV.get("GABAGOOL_ENABLED", "false")).lower() == "true"
 GABAGOOL_MAX_LEG = _float("GABAGOOL_MAX_LEG", 0.48)
 GABAGOOL_TARGET_COMBINED = _float("GABAGOOL_TARGET_COMBINED", 0.97)
 
 # ── Config ────────────────────────────────────────────────────────────────────
-WINDOW_SEC      = _int("BTC15M_WINDOW_SEC", 900)          # 15 minutes
-ARB_THRESHOLD   = _float("BTC15M_ARB_THRESHOLD", 0.98)
-ARB_SIZE        = _float("BTC15M_ARB_SIZE", 10.00)
-SNIPE_DELTA_MIN = _float("BTC15M_SNIPE_DELTA_MIN", 0.025)
-SNIPE_MAX_PRICE = _float("BTC15M_SNIPE_MAX_PRICE", 0.90)
+WINDOW_SEC      = _int("BTC5M_WINDOW_SEC", 300)          # 15 minutes
+ARB_THRESHOLD   = _float("BTC5M_ARB_THRESHOLD", 0.98)
+ARB_SIZE        = _float("BTC5M_ARB_SIZE", 10.00)
+SNIPE_DELTA_MIN = _float("BTC5M_SNIPE_DELTA_MIN", 0.025)
+SNIPE_MAX_PRICE = _float("BTC5M_SNIPE_MAX_PRICE", 0.90)
 # Signal confirmation (improved filtering)
-SIGNAL_CONFIRM_COUNT   = _int("BTC15M_SIGNAL_CONFIRM_COUNT", 2)   # consecutive polls needed
-SIGNAL_CONFIRM_SEC     = _int("BTC15M_SIGNAL_CONFIRM_SEC", 15)     # max age of confirm samples
-SIGNAL_MAX_ENTRY_PRICE = _float("BTC15M_SIGNAL_MAX_ENTRY_PRICE", 0.85)  # skip if entry worse than this
-SNIPE_DEFAULT   = _float("BTC15M_SNIPE_DEFAULT_SIZE", 5.00)
-SNIPE_STRONG    = _float("BTC15M_SNIPE_STRONG_SIZE", 7.50)
-SNIPE_STRONG_D  = _float("BTC15M_SNIPE_STRONG_DELTA", 0.10)  # percent
-SNIPE_WINDOW    = _int("BTC15M_SNIPE_WINDOW_SEC", 30)
-POLL_SEC        = _int("BTC15M_PRICE_POLL_SEC", 5)
-SCAN_SEC        = _int("BTC15M_SCAN_INTERVAL", 10)
-MAX_DAILY_LOSS  = _float("BTC15M_MAX_DAILY_LOSS", 15.00)
-SERIES_ID       = "10192"
-SERIES_SLUG     = "btc-up-or-down-15m"
+SIGNAL_CONFIRM_COUNT   = _int("BTC5M_SIGNAL_CONFIRM_COUNT", 2)   # consecutive polls needed
+SIGNAL_CONFIRM_SEC     = _int("BTC5M_SIGNAL_CONFIRM_SEC", 15)     # max age of confirm samples
+SIGNAL_MAX_ENTRY_PRICE = _float("BTC5M_SIGNAL_MAX_ENTRY_PRICE", 0.85)  # skip if entry worse than this
+SNIPE_DEFAULT   = _float("BTC5M_SNIPE_DEFAULT_SIZE", 5.00)
+SNIPE_STRONG    = _float("BTC5M_SNIPE_STRONG_SIZE", 7.50)
+SNIPE_STRONG_D  = _float("BTC5M_SNIPE_STRONG_DELTA", 0.10)  # percent
+SNIPE_WINDOW    = _int("BTC5M_SNIPE_WINDOW_SEC", 30)
+POLL_SEC        = _int("BTC5M_PRICE_POLL_SEC", 5)
+SCAN_SEC        = _int("BTC5M_SCAN_INTERVAL", 10)
+MAX_DAILY_LOSS  = _float("BTC5M_MAX_DAILY_LOSS", 15.00)
+SERIES_ID       = "BTC5M"
+SERIES_SLUG     = "btc-up-or-down-5m"
 
 # ── State ─────────────────────────────────────────────────────────────────────
 _state = {
@@ -107,11 +107,6 @@ _state = {
     "maker_done":       False,
     "maker_last_poll":  0,
     "maker_seen_fills": [],
-    "gabagool_yes_low": None,
-    "gabagool_yes_ts": 0,
-    "gabagool_no_low": None,
-    "gabagool_no_ts": 0,
-    "gabagool_window_logged": False,
 }
 _positions = []   # list of dicts for open/confirmation positions
 
@@ -174,9 +169,11 @@ def get_btc_price():
 
 # ── Find current market slug ──────────────────────────────────────────────────
 def get_current_slug():
+    if not BTC5M_ENABLED:
+        return None, 0
     now = int(time.time())
     window_ts = now - (now % WINDOW_SEC)
-    return f"btc-updown-15m-{window_ts}", window_ts
+    return f"btc-updown-5m-{window_ts}", window_ts
 
 # ── Gamma API: get market info ────────────────────────────────────────────────
 def get_market(slug):
@@ -264,7 +261,7 @@ def log_trade(engine, direction, size_usd, entry_price, pnl, exit_type, hold_sec
                 exit_type, hold_duration_seconds, regime, notes
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            f"btc15m_{int(time.time()*1000)}",
+            f"btc5m_{int(time.time()*1000)}",
             engine, datetime.now(timezone.utc).isoformat(),
             datetime.now(timezone.utc).isoformat() if exit_type else None,
             "btc-15m",
@@ -337,7 +334,7 @@ def check_maker_snipe(market, seconds_remaining):
             _state['snipe_done'] = True
             save_state()
             tg(f"[BTC-MAKER] FILLED order {oid}")
-            log_trade("btc15m", _state.get('maker_side', 'UP'), 
+            log_trade("btc5m", _state.get('maker_side', 'UP'), 
                 _state.get('maker_shares', 0) * _state.get('maker_price', 0),
                 _state.get('maker_price', 0), 0, 'filled',
                 int(time.time()) - _state.get('maker_last_poll', int(time.time())),
@@ -352,7 +349,7 @@ def check_maker_snipe(market, seconds_remaining):
                     log(f"[BTC-MAKER] fill verified via activity/trades size={vf.get('filled_size')}")
                     tg(f"[BTC-MAKER] FILL VERIFIED {vf.get('filled_size')} shares")
                     # Log verified fill to journal
-                    log_trade("btc15m", _state.get('maker_side', 'UP'),
+                    log_trade("btc5m", _state.get('maker_side', 'UP'),
                         vf.get('filled_size', 0) * _state.get('maker_price', 0),
                         _state.get('maker_price', 0), 0, 'filled',
                         int(time.time()) - _state.get('maker_last_poll', int(time.time())),
@@ -441,45 +438,41 @@ def check_maker_snipe(market, seconds_remaining):
     return r.get('success')
 
 # ── Strategy A: Arb check ─────────────────────────────────────────────────────
-def check_gabagool(market, seconds_remaining=None):
-    if not BTC15M_GABAGOOL_ENABLED:
+def check_gabagool(market):
+    if not GABAGOOL_ENABLED:
         return None
     if market.get("closed"):
         return None
-
     yes_price = market.get("yes_price", 1.0)
     no_price = market.get("no_price", 1.0)
-    now_ts = int(time.time())
-
-    if yes_price < GABAGOOL_MAX_LEG:
-        prev = _state.get("gabagool_yes_low")
-        if prev is None or yes_price < prev:
-            _state["gabagool_yes_low"] = yes_price
-            _state["gabagool_yes_ts"] = now_ts
-            log(f"[GABAGOOL] YES dip ts={now_ts} price={yes_price:.4f}")
-            save_state()
-
-    if no_price < GABAGOOL_MAX_LEG:
-        prev = _state.get("gabagool_no_low")
-        if prev is None or no_price < prev:
-            _state["gabagool_no_low"] = no_price
-            _state["gabagool_no_ts"] = now_ts
-            log(f"[GABAGOOL] NO dip ts={now_ts} price={no_price:.4f}")
-            save_state()
-
-    if seconds_remaining is not None and seconds_remaining <= 5 and not _state.get("gabagool_window_logged"):
-        y = _state.get("gabagool_yes_low")
-        n = _state.get("gabagool_no_low")
-        yts = _state.get("gabagool_yes_ts", 0)
-        nts = _state.get("gabagool_no_ts", 0)
-        if y is not None and n is not None:
-            combined = y + n
-            profit = 1.00 - combined
-            log(f"[GABAGOOL SUMMARY] YES low=${y:.4f} at {yts}, NO low=${n:.4f} at {nts}, combined=${combined:.4f}, profit=${profit:.4f}")
+    combined = yes_price + no_price
+    if yes_price >= GABAGOOL_MAX_LEG and no_price >= GABAGOOL_MAX_LEG:
+        return None
+    if combined >= GABAGOOL_TARGET_COMBINED:
+        log(f"[GABAGOOL] Skip combined={combined:.4f} >= {GABAGOOL_TARGET_COMBINED:.4f} yes={yes_price:.4f} no={no_price:.4f}")
+        return None
+    yes_tid = market["clob_token_id"][0] if len(market.get("clob_token_id", [])) > 0 else ""
+    no_tid = market["clob_token_id"][1] if len(market.get("clob_token_id", [])) > 1 else ""
+    placed = []
+    if yes_price < GABAGOOL_MAX_LEG and yes_tid:
+        yes_shares = max(5.0, math.floor((SNIPE_DEFAULT / max(yes_price, 0.01)) * 100) / 100)
+        log(f"[GABAGOOL] YES cheap @ {yes_price:.4f} -> {yes_shares:.2f} shares dry={DRY_RUN}")
+        if DRY_RUN:
+            placed.append(("YES", yes_shares, yes_price, True))
         else:
-            log(f"[GABAGOOL SUMMARY] incomplete yes={y} no={n}")
-        _state["gabagool_window_logged"] = True
-        save_state()
+            r = maker_place_order('BUY', yes_shares, round(max(0.01, yes_price - MAKER_OFFSET), 2), market['condition_id'], yes_tid)
+            placed.append(("YES", yes_shares, yes_price, r.get('success')))
+    if no_price < GABAGOOL_MAX_LEG and no_tid:
+        no_shares = max(5.0, math.floor((SNIPE_DEFAULT / max(no_price, 0.01)) * 100) / 100)
+        log(f"[GABAGOOL] NO cheap @ {no_price:.4f} -> {no_shares:.2f} shares dry={DRY_RUN}")
+        if DRY_RUN:
+            placed.append(("NO", no_shares, no_price, True))
+        else:
+            r = maker_place_order('BUY', no_shares, round(max(0.01, no_price - MAKER_OFFSET), 2), market['condition_id'], no_tid)
+            placed.append(("NO", no_shares, no_price, r.get('success')))
+    if placed:
+        log(f"[GABAGOOL] placed={placed} combined={combined:.4f}")
+        return True
     return None
 
 def check_arb(market):
@@ -565,7 +558,7 @@ def check_snipe(market, seconds_remaining):
                 log(f"[EXEC-ERR] {line.strip()}")
     notes = f"snipe {direction} delta={delta_pct:+.3f}% price={price:.4f} size=${size:.2f}"
     log(f"[SNIPE] Result: {r.get('success')} filled={r.get('filled')}. {notes}")
-    if os.getenv("BTC15M_ONE_SHOT_TEST") == "1":
+    if os.getenv("BTC5M_ONE_SHOT_TEST") == "1":
         _state["snipe_done"] = True
         save_state()
         log("[SNIPE] ONE_SHOT_TEST active — stopping after first BTC attempt in this window")
@@ -668,9 +661,6 @@ def main():
         # Strategy A: Arb (first 14.75 min)
         if sec_rem > 15:
             check_arb(market)
-
-        # Gabagool tracking (dry-run aware, no real orders unless explicitly enabled elsewhere)
-        check_gabagool(market, sec_rem)
 
         # Strategy B: Snipe / Maker Snipe
         if MAKER_ENABLED:

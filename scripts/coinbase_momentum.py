@@ -1,14 +1,8 @@
 #!/usr/bin/env python3
-"""Coinbase BTC/ETH momentum spot bot.
+"""Coinbase BTC grid trader (DRY RUN first).
 
-Completely separate from Polymarket/Solana systems.
-- Own process
-- Own log file (/tmp/coinbase_momentum.log)
-- Own state files
-- Reads only Coinbase creds + CB_ config from env/secrets
-- Writes journal rows with engine='coinbase_momentum'
-
-Starts in DRY RUN by default.
+Reuses the existing coinbase_momentum.py entrypoint so surrounding tooling keeps working,
+but switches strategy logic to a spot grid system.
 """
 from __future__ import annotations
 
@@ -18,10 +12,8 @@ import os
 import signal
 import sqlite3
 import sys
-import threading
 import time
 import uuid
-from collections import deque
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -39,7 +31,6 @@ STATE_PATH = ROOT / '.coinbase_momentum_state.json'
 
 
 def env_bool(key: str, default: bool) -> bool:
-    # First check secrets.env
     if SECRETS.exists():
         try:
             for line in SECRETS.read_text().splitlines():
@@ -53,7 +44,6 @@ def env_bool(key: str, default: bool) -> bool:
 
 
 def env_float(key: str, default: float) -> float:
-    # First check secrets.env
     if SECRETS.exists():
         try:
             for line in SECRETS.read_text().splitlines():
@@ -66,7 +56,6 @@ def env_float(key: str, default: float) -> float:
 
 
 def env_int(key: str, default: int) -> int:
-    # First check secrets.env
     if SECRETS.exists():
         try:
             for line in SECRETS.read_text().splitlines():
@@ -79,8 +68,6 @@ def env_int(key: str, default: int) -> int:
 
 
 def env_pairs(key: str, default: str) -> list[str]:
-    """Parse comma-separated pairs from secrets.env or env."""
-    # First try to read from secrets.env file
     if SECRETS.exists():
         try:
             for line in SECRETS.read_text().splitlines():
@@ -90,27 +77,21 @@ def env_pairs(key: str, default: str) -> list[str]:
                     return [x.strip() for x in value.split(',') if x.strip()]
         except Exception:
             pass
-    # Fallback to environment variable
     raw = os.environ.get(key, default)
     return [x.strip() for x in raw.split(',') if x.strip()]
 
 
-# Coinbase Momentum Bot (isolated defaults; NOT using shared config.py to honor isolation)
-# Note: CB_PAIRS is loaded from secrets.env if available, otherwise from env
 CB_ENABLED = env_bool('CB_ENABLED', True)
 CB_POLL_INTERVAL = env_int('CB_POLL_INTERVAL', 30)
-CB_PAIRS = env_pairs('CB_PAIRS', 'BTC-USD,ETH-USD')
-CB_MA_WINDOW = env_int('CB_MA_WINDOW', 30)
-CB_CONSECUTIVE_MIN = env_int('CB_CONSECUTIVE_MIN', 2)
-CB_MOMENTUM_MIN = env_float('CB_MOMENTUM_MIN', 0.02)
-CB_TAKE_PROFIT = env_float('CB_TAKE_PROFIT', 0.8)
-CB_STOP_LOSS = env_float('CB_STOP_LOSS', -0.5)
-CB_TIME_EXIT_HOURS = env_float('CB_TIME_EXIT_HOURS', 1)
-CB_USD_BUFFER = env_float('CB_USD_BUFFER', 10.00)
-CB_MAX_POSITIONS = env_int('CB_MAX_POSITIONS', 2)
+CB_PAIRS = env_pairs('CB_PAIRS', 'BTC-USD')
+CB_USD_BUFFER = env_float('CB_USD_BUFFER', 0.50)
 CB_DRY_RUN = env_bool('CB_DRY_RUN', True)
-CB_SIGNAL_LOG_EVERY = env_int('CB_SIGNAL_LOG_EVERY', 1)
-
+CB_GRID_ENABLED = env_bool('CB_GRID_ENABLED', True)
+CB_GRID_SPACING = env_float('CB_GRID_SPACING', 200)
+CB_GRID_PROFIT = env_float('CB_GRID_PROFIT', 300)
+CB_GRID_LEVELS = env_int('CB_GRID_LEVELS', 5)
+CB_GRID_SIZE_USD = env_float('CB_GRID_SIZE_USD', 4.00)
+CB_GRID_RESET_HOURS = env_int('CB_GRID_RESET_HOURS', 4)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -118,16 +99,13 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S',
     handlers=[logging.FileHandler(LOG_PATH), logging.StreamHandler(sys.stdout)],
 )
-log = logging.getLogger('coinbase_momentum')
+log = logging.getLogger('coinbase_grid')
 
-
-# Telegram configuration (shared with other systems)
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '8457917317:AAGtnuRix7Ei-rslwVAbfFIFJSK0UIwi0d4')
 CHAT_ID = os.environ.get('CHAT_ID', '7520899464')
 
 
 def tg(msg: str):
-    """Send Telegram message if not in dry run mode."""
     if CB_DRY_RUN:
         return
     try:
@@ -141,15 +119,17 @@ def tg(msg: str):
 
 
 @dataclass
-class Position:
-    asset: str
-    entry_price: float
+class GridLevel:
+    level: int
+    buy_price: float
+    sell_price: float
+    size_usd: float
     amount: float
-    entry_time: str
-    high_watermark: float
-    status: str = 'open'
+    status: str = 'waiting_buy'  # waiting_buy | holding | completed
+    bought_at: Optional[str] = None
+    sold_at: Optional[str] = None
     trade_id: Optional[str] = None
-    entry_value_usd: float = 0.0
+    sell_trade_id: Optional[str] = None
 
 
 class Bot:
@@ -157,17 +137,16 @@ class Bot:
         self.running = True
         self.secrets = self._load_secrets()
         self.client = self._client()
-        self.price_history: dict[str, deque[float]] = {pair: deque(maxlen=CB_MA_WINDOW) for pair in CB_PAIRS}
-        self.positions: dict[str, Position] = {}
-        self.counters = {pair: {'up': 0, 'down': 0, 'ticks': 0} for pair in CB_PAIRS}
-        self.signal_counts = {pair: {'buy_signals': 0, 'sell_signals': 0} for pair in CB_PAIRS}
+        self.grid = {}
+        self.grid_anchor = {}
+        self.last_reset = {}
         self._load_state()
         signal.signal(signal.SIGTERM, self._handle_stop)
         signal.signal(signal.SIGINT, self._handle_stop)
 
     def _handle_stop(self, *_):
         self.running = False
-        log.info('[CB] stop requested')
+        log.info('[CB-GRID] stop requested')
 
     def _load_secrets(self):
         data = {}
@@ -181,33 +160,33 @@ class Bot:
 
     def _client(self):
         api_key = self.secrets.get('COINBASE_API_KEY')
-        private_json = self.secrets.get('COINBASE_PRIVATE_KEY_JSON')
-        if not api_key or not private_json:
+        private_key = self.secrets.get('COINBASE_PRIVATE_KEY_JSON')
+        if not api_key or not private_key:
             raise RuntimeError('Missing Coinbase credentials in secrets.env')
-        private_key = json.loads(private_json)
         return RESTClient(api_key=api_key, api_secret=private_key)
+
+    def _save_state(self):
+        data = {
+            'grid': {pair: [asdict(x) for x in levels] for pair, levels in self.grid.items()},
+            'grid_anchor': self.grid_anchor,
+            'last_reset': {k: v.isoformat() if isinstance(v, datetime) else v for k, v in self.last_reset.items()},
+            'updated_at': datetime.now(timezone.utc).isoformat(),
+        }
+        STATE_PATH.write_text(json.dumps(data, indent=2))
 
     def _load_state(self):
         if not STATE_PATH.exists():
             return
         try:
             data = json.loads(STATE_PATH.read_text())
-            for pair, prices in data.get('price_history', {}).items():
-                self.price_history[pair] = deque(prices, maxlen=CB_MA_WINDOW)
-            for pair, pos in data.get('positions', {}).items():
-                self.positions[pair] = Position(**pos)
-            self.counters.update(data.get('counters', {}))
+            self.grid = {pair: [GridLevel(**lvl) for lvl in levels] for pair, levels in data.get('grid', {}).items()}
+            self.grid_anchor = data.get('grid_anchor', {})
+            self.last_reset = {
+                k: datetime.fromisoformat(v) if isinstance(v, str) else datetime.now(timezone.utc)
+                for k, v in data.get('last_reset', {}).items()
+            }
         except Exception as e:
-            log.warning('[CB] state load failed: %s', e)
-
-    def _save_state(self):
-        data = {
-            'price_history': {k: list(v) for k, v in self.price_history.items()},
-            'positions': {k: asdict(v) for k, v in self.positions.items()},
-            'counters': self.counters,
-            'updated_at': datetime.now(timezone.utc).isoformat(),
-        }
-        STATE_PATH.write_text(json.dumps(data, indent=2))
+            log.warning('[CB-GRID] state load failed: %s', e)
 
     def _journal_open(self, pair: str, side: str, entry_price: float, amount: float, usd_size: float, notes: str) -> str:
         trade_id = str(uuid.uuid4())
@@ -224,7 +203,7 @@ class Bot:
                 'coinbase_momentum',
                 datetime.now(timezone.utc).isoformat(),
                 pair,
-                'coinbase-spot',
+                'coinbase-grid',
                 side,
                 entry_price,
                 amount,
@@ -284,184 +263,84 @@ class Bot:
                 if currency == 'USD':
                     return float(val or 0)
         except Exception as e:
-            log.warning('[CB] get_available_usd error: %s', e)
+            log.warning('[CB-GRID] get_available_usd error: %s', e)
         return 0.0
 
-    def market_buy(self, pair: str, usd_budget: float):
-        """Execute a market buy order. Returns (price, amount)."""
-        product_price = self.get_product_price(pair)
-        base_amount = max(0.0, usd_budget / product_price)
-        if not CB_DRY_RUN:
-            try:
-                # Use small tolerance for market order
-                tolerance = 0.01  # 1% tolerance for market order
-                self.client.market_buy(
-                    product_id=pair,
-                    quote_size=str(usd_budget),
-                    funds=str(usd_budget),
-                )
-                log.info('[CB-BUY] Market buy submitted for $%.2f of %s @ ~$%.2f', usd_budget, pair, product_price)
-                tg(f'[CB] BUY {pair} $usd_budget:.2f @ ${product_price:.2f}')
-            except Exception as e:
-                log.warning('[CB-BUY] Submit error: %s', e)
-        return product_price, base_amount
-
-    def market_sell(self, pair: str, amount: float):
-        """Execute a market sell order. Returns (price, amount)."""
-        product_price = self.get_product_price(pair)
-        if not CB_DRY_RUN:
-            try:
-                self.client.market_sell(
-                    product_id=pair,
-                    size=str(amount),
-                )
-                log.info('[CB-SELL] Market sell submitted for %.8f %s @ ~$%.2f', amount, pair, product_price)
-                tg(f'[CB] SELL {pair} {amount:.4f} @ ${product_price:.2f}')
-            except Exception as e:
-                log.warning('[CB-SELL] Submit error: %s', e)
-        return product_price, amount
-
-    def trend_metrics(self, pair: str):
-        prices = list(self.price_history[pair])
-        if not prices:
-            return None
-        ma = sum(prices) / len(prices)
-        five_min_ago = prices[-10] if len(prices) >= 10 else prices[0]
-        current = prices[-1]
-        change_5m = ((current - five_min_ago) / five_min_ago * 100) if five_min_ago else 0.0
-        cnt = self.counters[pair]
-        trend = 'UP' if cnt['up'] >= CB_CONSECUTIVE_MIN else ('DOWN' if cnt['down'] >= CB_CONSECUTIVE_MIN else 'FLAT')
-        return {
-            'current': current,
-            'ma': ma,
-            'change_5m_pct': change_5m,
-            'up_count': cnt['up'],
-            'down_count': cnt['down'],
-            'trend': trend,
-        }
-
-    def process_tick(self, pair: str):
-        price = self.get_product_price(pair)
-        prices = self.price_history[pair]
-        prev = prices[-1] if prices else None
-        prices.append(price)
-        ctr = self.counters[pair]
-        ctr['ticks'] += 1
-        if prev is not None:
-            if price > prev:
-                ctr['up'] += 1
-                ctr['down'] = 0
-            elif price < prev:
-                ctr['down'] += 1
-                ctr['up'] = 0
-        metrics = self.trend_metrics(pair)
-        if not metrics:
-            return
-        log.info('[CB] %s price=%.2f ma=%.2f trend=%s up=%s down=%s chg5m=%+.3f%% pos=%s dry=%s',
-                 pair, metrics['current'], metrics['ma'], metrics['trend'], metrics['up_count'], metrics['down_count'],
-                 metrics['change_5m_pct'], 'YES' if pair in self.positions else 'NO', CB_DRY_RUN)
-        self.check_exit(pair, metrics)
-        self.check_entry(pair, metrics)
-
-    def check_entry(self, pair: str, m):
-        if pair in self.positions:
-            return
-        if len(self.positions) >= CB_MAX_POSITIONS:
-            return
-        conds = [
-            m['current'] > m['ma'],
-            m['up_count'] >= CB_CONSECUTIVE_MIN,
-            m['change_5m_pct'] >= CB_MOMENTUM_MIN,
-        ]
-        if not all(conds):
-            return
-        self.signal_counts[pair]['buy_signals'] += 1
-        usd_available = self.get_available_usd()
-        usd_budget = max(0.0, usd_available - CB_USD_BUFFER)
-        log.info('[CB] %s signal funds check usd_available=%.2f usd_budget=%.2f buffer=%.2f', pair, usd_available, usd_budget, CB_USD_BUFFER)
-        if usd_budget < 1.0:
-            log.info('[CB] %s buy signal but usd_budget=%.2f < 1.00, skipping', pair, usd_budget)
-            return
-
-        # Telegram notification for entry signal
-        tg(f'[CB] BUY SIGNAL: {pair} | chg5m={m["change_5m_pct"]:+.2f}% | up={m["up_count"]}')
-
-        entry_price, amount = self.market_buy(pair, usd_budget)
-        if CB_DRY_RUN:
-            log.info('[CB-BUY][DRY] Bought %.8f %s at $%.2f | budget=$%.2f', amount, pair.split('-')[0], entry_price, usd_budget)
-            trade_id = self._journal_open(pair, 'BUY', entry_price, amount, usd_budget, 'DRY RUN entry')
-        else:
-            log.info('[CB-BUY] Bought %.8f %s at $%.2f', amount, pair.split('-')[0], entry_price)
-            trade_id = self._journal_open(pair, 'BUY', entry_price, amount, usd_budget, 'LIVE entry')
-        self.positions[pair] = Position(
-            asset=pair,
-            entry_price=entry_price,
-            amount=amount,
-            entry_time=datetime.now(timezone.utc).isoformat(),
-            high_watermark=entry_price,
-            trade_id=trade_id,
-            entry_value_usd=usd_budget,
+    def ensure_grid(self, pair: str, current_price: float):
+        now = datetime.now(timezone.utc)
+        last = self.last_reset.get(pair)
+        levels = self.grid.get(pair, [])
+        active_holding = any(l.status == 'holding' for l in levels)
+        need_reset = (
+            pair not in self.grid or
+            not levels or
+            last is None or
+            (now - last) >= timedelta(hours=CB_GRID_RESET_HOURS)
         )
-        self._save_state()
-
-    def check_exit(self, pair: str, m):
-        pos = self.positions.get(pair)
-        if not pos:
-            return
-        pos.high_watermark = max(pos.high_watermark, m['current'])
-        pnl_pct = ((m['current'] - pos.entry_price) / pos.entry_price * 100) if pos.entry_price else 0.0
-        held = datetime.now(timezone.utc) - datetime.fromisoformat(pos.entry_time)
-        reason = None
-        if pnl_pct >= CB_TAKE_PROFIT:
-            reason = 'take_profit'
-        elif pnl_pct <= CB_STOP_LOSS:
-            reason = 'stop_loss'
-        elif m['current'] < m['ma'] and m['down_count'] >= CB_CONSECUTIVE_MIN:
-            reason = 'trend_break'
-        elif held >= timedelta(hours=CB_TIME_EXIT_HOURS):
-            reason = 'time_exit'
-        if not reason:
+        if need_reset and not active_holding:
+            self.grid_anchor[pair] = current_price
+            self.last_reset[pair] = now
+            new_levels = []
+            for i in range(1, CB_GRID_LEVELS + 1):
+                buy_price = round(current_price - (CB_GRID_SPACING * i), 2)
+                sell_price = round(buy_price + CB_GRID_PROFIT, 2)
+                amount = round(CB_GRID_SIZE_USD / buy_price, 8)
+                new_levels.append(GridLevel(
+                    level=i,
+                    buy_price=buy_price,
+                    sell_price=sell_price,
+                    size_usd=CB_GRID_SIZE_USD,
+                    amount=amount,
+                ))
+            self.grid[pair] = new_levels
+            log.info('[CB-GRID] Reset grid for %s around $%.2f | levels=%s', pair, current_price, [(l.buy_price, l.sell_price) for l in new_levels])
             self._save_state()
-            return
-        self.signal_counts[pair]['sell_signals'] += 1
-        exit_price, amount = self.market_sell(pair, pos.amount)
-        pnl_abs = amount * (exit_price - pos.entry_price)
-        if CB_DRY_RUN:
-            log.info('[CB-SELL][DRY] Sold %.8f %s at $%.2f | P&L: $%.2f | Reason: %s', amount, pair.split('-')[0], exit_price, pnl_abs, reason)
-        else:
-            log.info('[CB-SELL] Sold %.8f %s at $%.2f | P&L: $%.2f | Reason: %s', amount, pair.split('-')[0], exit_price, pnl_abs, reason)
-        # Telegram notification for exit
-        pnl_sign = '+' if pnl_abs >= 0 else ''
-        tg(f'[CB] SELL: {pair} | P&L: ${pnl_sign}{pnl_abs:.2f} ({pnl_pct:+.1f}%) | {reason}')
-        if pos.trade_id:
-            self._journal_close(
-                pos.trade_id,
-                exit_price=exit_price,
-                pnl_abs=pnl_abs,
-                pnl_pct=pnl_pct,
-                exit_type=reason,
-                hold_seconds=int(held.total_seconds()),
-                notes=f'{"DRY" if CB_DRY_RUN else "LIVE"} exit',
-            )
-        del self.positions[pair]
+
+    def process_pair(self, pair: str):
+        current = self.get_product_price(pair)
+        self.ensure_grid(pair, current)
+        levels = self.grid.get(pair, [])
+        usd_available = self.get_available_usd()
+        for lvl in levels:
+            if lvl.status == 'waiting_buy':
+                if current <= lvl.buy_price and usd_available >= (lvl.size_usd + CB_USD_BUFFER):
+                    lvl.trade_id = self._journal_open(pair, 'BUY', lvl.buy_price, lvl.amount, lvl.size_usd, 'GRID DRY entry' if CB_DRY_RUN else 'GRID LIVE entry')
+                    lvl.status = 'holding'
+                    lvl.bought_at = datetime.now(timezone.utc).isoformat()
+                    log.info('[CB-GRID-BUY][%s] level=%s buy=%.2f sell=%.2f amount=%.8f dry=%s', pair, lvl.level, lvl.buy_price, lvl.sell_price, lvl.amount, CB_DRY_RUN)
+                    tg(f'[CB-GRID] BUY {pair} level {lvl.level} @ ${lvl.buy_price:.2f}')
+            elif lvl.status == 'holding':
+                if current >= lvl.sell_price:
+                    pnl_abs = lvl.amount * (lvl.sell_price - lvl.buy_price)
+                    pnl_pct = ((lvl.sell_price - lvl.buy_price) / lvl.buy_price * 100) if lvl.buy_price else 0.0
+                    hold_seconds = 0
+                    if lvl.bought_at:
+                        hold_seconds = int((datetime.now(timezone.utc) - datetime.fromisoformat(lvl.bought_at)).total_seconds())
+                    if lvl.trade_id:
+                        self._journal_close(lvl.trade_id, lvl.sell_price, pnl_abs, pnl_pct, 'grid_take_profit', hold_seconds, 'GRID DRY exit' if CB_DRY_RUN else 'GRID LIVE exit')
+                    lvl.status = 'completed'
+                    lvl.sold_at = datetime.now(timezone.utc).isoformat()
+                    log.info('[CB-GRID-SELL][%s] level=%s sold=%.2f pnl=$%.2f dry=%s', pair, lvl.level, lvl.sell_price, pnl_abs, CB_DRY_RUN)
+                    tg(f'[CB-GRID] SELL {pair} level {lvl.level} @ ${lvl.sell_price:.2f} | P&L ${pnl_abs:.2f}')
         self._save_state()
+        waiting = sum(1 for l in levels if l.status == 'waiting_buy')
+        holding = sum(1 for l in levels if l.status == 'holding')
+        completed = sum(1 for l in levels if l.status == 'completed')
+        log.info('[CB-GRID] %s current=%.2f waiting=%s holding=%s completed=%s dry=%s', pair, current, waiting, holding, completed, CB_DRY_RUN)
 
     def run(self):
         PID_PATH.write_text(str(os.getpid()))
-        log.info('[CB] Coinbase momentum bot starting | dry=%s poll=%ss pairs=%s', CB_DRY_RUN, CB_POLL_INTERVAL, ','.join(CB_PAIRS))
-        startup_usd = self.get_available_usd()
-        startup_budget = max(0.0, startup_usd - CB_USD_BUFFER)
-        log.info('[CB] USD budget: $%.2f (usd_available=%.2f, buffer=%.2f)', startup_budget, startup_usd, CB_USD_BUFFER)
-        if not CB_ENABLED:
-            log.info('[CB] disabled via CB_ENABLED=false')
+        log.info('[CB-GRID] Coinbase grid bot starting | dry=%s poll=%ss pairs=%s spacing=%s profit=%s levels=%s size=$%.2f reset=%sh',
+                 CB_DRY_RUN, CB_POLL_INTERVAL, ','.join(CB_PAIRS), CB_GRID_SPACING, CB_GRID_PROFIT, CB_GRID_LEVELS, CB_GRID_SIZE_USD, CB_GRID_RESET_HOURS)
+        if not CB_ENABLED or not CB_GRID_ENABLED:
+            log.info('[CB-GRID] disabled via config')
             return
         while self.running:
             try:
                 for pair in CB_PAIRS:
-                    self.process_tick(pair)
-                self._save_state()
+                    self.process_pair(pair)
             except Exception as e:
-                log.exception('[CB] loop error: %s', e)
+                log.exception('[CB-GRID] loop error: %s', e)
             time.sleep(CB_POLL_INTERVAL)
 
 

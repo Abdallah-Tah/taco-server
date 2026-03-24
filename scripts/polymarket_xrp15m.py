@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-polymarket_btc15m.py — BTC 15-Minute Polymarket Engine
+polymarket_xrp15m.py — BTC 15-Minute Polymarket Engine
 ======================================================
 Two strategies:
   A) Binary Arb      — buy UP+DOWN when combined < $0.98, guaranteed profit
@@ -24,9 +24,9 @@ import requests
 WORK_DIR      = Path("/home/abdaltm86/.openclaw/workspace/trading")
 JOURNAL_DB    = WORK_DIR / "journal.db"
 CREDS_FILE    = Path("/home/abdaltm86/.config/openclaw/secrets.env")
-POSITIONS_F  = WORK_DIR / ".poly_btc15m_positions.json"
-STATE_F       = WORK_DIR / ".poly_btc15m_state.json"
-LOG_F        = WORK_DIR / ".poly_btc15m.log"
+POSITIONS_F  = WORK_DIR / ".poly_xrp15m_positions.json"
+STATE_F       = WORK_DIR / ".poly_xrp15m_state.json"
+LOG_F        = WORK_DIR / ".poly_xrp15m.log"
 
 # ── Load credentials ─────────────────────────────────────────────────────────
 def _load_env():
@@ -56,46 +56,42 @@ TELEGRAM_TOKEN = ENV.get("TELEGRAM_TOKEN", "8457917317:AAGtnuRix7Ei-rslwVAbfFIFJ
 CHAT_ID        = ENV.get("CHAT_ID",        "7520899464")
 POLY_WALLET    = ENV.get("POLY_WALLET",    "0x1a4c163a134D7154ebD5f7359919F9c439424f00")
 VENV_PY        = Path("/home/abdaltm86/.openclaw/workspace/trading/.polymarket-venv/bin/python3")
-DRY_RUN        = os.environ.get("BTC15M_DRY_RUN",  ENV.get("BTC15M_DRY_RUN",  "true")).lower() != "false"
-MAKER_ENABLED  = os.environ.get("BTC15M_MAKER_ENABLED", ENV.get("BTC15M_MAKER_ENABLED", "false")).lower() == "true"
-MAKER_DRY_RUN  = os.environ.get("BTC15M_MAKER_DRY_RUN", ENV.get("BTC15M_MAKER_DRY_RUN", "true")).lower() != "false"
-MAKER_START_SEC = _int("BTC15M_MAKER_START_SEC", 300)
-MAKER_CANCEL_SEC = _int("BTC15M_MAKER_CANCEL_SEC", 30)
-MAKER_OFFSET = _float("BTC15M_MAKER_OFFSET", 0.005)
-MAKER_POLL_SEC = _int("BTC15M_MAKER_POLL_SEC", 10)
-MAKER_MIN_PRICE = _float("BTC15M_MAKER_MIN_PRICE", 0.01)
-BTC15M_GABAGOOL_ENABLED = os.environ.get("BTC15M_GABAGOOL_ENABLED", ENV.get("BTC15M_GABAGOOL_ENABLED", "false")).lower() == "true"
-BTC15M_GABAGOOL_DRY_RUN = os.environ.get("BTC15M_GABAGOOL_DRY_RUN", ENV.get("BTC15M_GABAGOOL_DRY_RUN", "true")).lower() != "false"
-GABAGOOL_MAX_LEG = _float("GABAGOOL_MAX_LEG", 0.48)
-GABAGOOL_TARGET_COMBINED = _float("GABAGOOL_TARGET_COMBINED", 0.97)
+DRY_RUN        = os.environ.get("XRP15M_DRY_RUN",  ENV.get("XRP15M_DRY_RUN",  "true")).lower() != "false"
+MAKER_ENABLED  = os.environ.get("XRP15M_MAKER_ENABLED", ENV.get("XRP15M_MAKER_ENABLED", "false")).lower() == "true"
+MAKER_DRY_RUN  = os.environ.get("XRP15M_MAKER_DRY_RUN", ENV.get("XRP15M_MAKER_DRY_RUN", "true")).lower() != "false"
+MAKER_START_SEC = _int("XRP15M_MAKER_START_SEC", 300)
+MAKER_CANCEL_SEC = _int("XRP15M_MAKER_CANCEL_SEC", 30)
+MAKER_OFFSET = _float("XRP15M_MAKER_OFFSET", 0.005)
+MAKER_POLL_SEC = _int("XRP15M_MAKER_POLL_SEC", 10)
+MAKER_MIN_PRICE = _float("XRP15M_MAKER_MIN_PRICE", 0.01)
 
 # ── Config ────────────────────────────────────────────────────────────────────
-WINDOW_SEC      = _int("BTC15M_WINDOW_SEC", 900)          # 15 minutes
-ARB_THRESHOLD   = _float("BTC15M_ARB_THRESHOLD", 0.98)
-ARB_SIZE        = _float("BTC15M_ARB_SIZE", 10.00)
-SNIPE_DELTA_MIN = _float("BTC15M_SNIPE_DELTA_MIN", 0.025)
-SNIPE_MAX_PRICE = _float("BTC15M_SNIPE_MAX_PRICE", 0.90)
+WINDOW_SEC      = _int("XRP15M_WINDOW_SEC", 900)          # 15 minutes
+ARB_THRESHOLD   = _float("XRP15M_ARB_THRESHOLD", 0.98)
+ARB_SIZE        = _float("XRP15M_ARB_SIZE", 10.00)
+SNIPE_DELTA_MIN = _float("XRP15M_SNIPE_DELTA_MIN", 0.025)
+SNIPE_MAX_PRICE = _float("XRP15M_SNIPE_MAX_PRICE", 0.90)
 # Signal confirmation (improved filtering)
-SIGNAL_CONFIRM_COUNT   = _int("BTC15M_SIGNAL_CONFIRM_COUNT", 2)   # consecutive polls needed
-SIGNAL_CONFIRM_SEC     = _int("BTC15M_SIGNAL_CONFIRM_SEC", 15)     # max age of confirm samples
-SIGNAL_MAX_ENTRY_PRICE = _float("BTC15M_SIGNAL_MAX_ENTRY_PRICE", 0.85)  # skip if entry worse than this
-SNIPE_DEFAULT   = _float("BTC15M_SNIPE_DEFAULT_SIZE", 5.00)
-SNIPE_STRONG    = _float("BTC15M_SNIPE_STRONG_SIZE", 7.50)
-SNIPE_STRONG_D  = _float("BTC15M_SNIPE_STRONG_DELTA", 0.10)  # percent
-SNIPE_WINDOW    = _int("BTC15M_SNIPE_WINDOW_SEC", 30)
-POLL_SEC        = _int("BTC15M_PRICE_POLL_SEC", 5)
-SCAN_SEC        = _int("BTC15M_SCAN_INTERVAL", 10)
-MAX_DAILY_LOSS  = _float("BTC15M_MAX_DAILY_LOSS", 15.00)
+SIGNAL_CONFIRM_COUNT   = _int("XRP15M_SIGNAL_CONFIRM_COUNT", 2)   # consecutive polls needed
+SIGNAL_CONFIRM_SEC     = _int("XRP15M_SIGNAL_CONFIRM_SEC", 15)     # max age of confirm samples
+SIGNAL_MAX_ENTRY_PRICE = _float("XRP15M_SIGNAL_MAX_ENTRY_PRICE", 0.85)  # skip if entry worse than this
+SNIPE_DEFAULT   = _float("XRP15M_SNIPE_DEFAULT_SIZE", 5.00)
+SNIPE_STRONG    = _float("XRP15M_SNIPE_STRONG_SIZE", 7.50)
+SNIPE_STRONG_D  = _float("XRP15M_SNIPE_STRONG_DELTA", 0.10)  # percent
+SNIPE_WINDOW    = _int("XRP15M_SNIPE_WINDOW_SEC", 30)
+POLL_SEC        = _int("XRP15M_PRICE_POLL_SEC", 5)
+SCAN_SEC        = _int("XRP15M_SCAN_INTERVAL", 10)
+MAX_DAILY_LOSS  = _float("XRP15M_MAX_DAILY_LOSS", 15.00)
 SERIES_ID       = "10192"
 SERIES_SLUG     = "btc-up-or-down-15m"
 
 # ── State ─────────────────────────────────────────────────────────────────────
 _state = {
     "window_ts":       0,
-    "window_open_btc": 0.0,
+    "window_open_xrp": 0.0,
     "arb_done":        False,
     "snipe_done":      False,
-    "btc_prices":      [],   # list of (timestamp, price)
+    "xrp_prices":      [],   # list of (timestamp, price)
     "daily_pnl":       0.0,
     "daily_reset":     "",
     "trades":          [],
@@ -107,11 +103,6 @@ _state = {
     "maker_done":       False,
     "maker_last_poll":  0,
     "maker_seen_fills": [],
-    "gabagool_yes_low": None,
-    "gabagool_yes_ts": 0,
-    "gabagool_no_low": None,
-    "gabagool_no_ts": 0,
-    "gabagool_window_logged": False,
 }
 _positions = []   # list of dicts for open/confirmation positions
 
@@ -164,7 +155,7 @@ def load_state():
 def get_btc_price():
     try:
         r = requests.get(
-            "https://api.exchange.coinbase.com/products/BTC-USD/ticker",
+            "https://api.exchange.coinbase.com/products/XRP-USD/ticker",
             timeout=5,
         )
         return float(r.json()["price"])
@@ -176,7 +167,7 @@ def get_btc_price():
 def get_current_slug():
     now = int(time.time())
     window_ts = now - (now % WINDOW_SEC)
-    return f"btc-updown-15m-{window_ts}", window_ts
+    return f"xrp-updown-15m-{window_ts}", window_ts
 
 # ── Gamma API: get market info ────────────────────────────────────────────────
 def get_market(slug):
@@ -264,7 +255,7 @@ def log_trade(engine, direction, size_usd, entry_price, pnl, exit_type, hold_sec
                 exit_type, hold_duration_seconds, regime, notes
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            f"btc15m_{int(time.time()*1000)}",
+            f"xrp15m_{int(time.time()*1000)}",
             engine, datetime.now(timezone.utc).isoformat(),
             datetime.now(timezone.utc).isoformat() if exit_type else None,
             "btc-15m",
@@ -285,7 +276,7 @@ def log_trade(engine, direction, size_usd, entry_price, pnl, exit_type, hold_sec
 def maker_place_order(side, shares, price, condition_id, token_id):
     cmd = [str(VENV_PY), str(WORK_DIR / "scripts" / "polymarket_executor.py"), "maker_buy", token_id, str(shares), str(price)]
     if MAKER_DRY_RUN:
-        log(f"[BTC-MAKER-DRY] {side} {shares} @{price:.4f} token={token_id}")
+        log(f"[XRP-MAKER-DRY] {side} {shares} @{price:.4f} token={token_id}")
         return {"success": True, "dry": True, "order_id": f"dry-{int(time.time())}"}
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
     payload = {"success": result.returncode == 0, "output": result.stdout, "error": result.stderr}
@@ -331,13 +322,13 @@ def check_maker_snipe(market, seconds_remaining):
     if oid and (time.time() - _state.get("maker_last_poll", 0) >= MAKER_POLL_SEC or seconds_remaining <= MAKER_CANCEL_SEC):
         _state["maker_last_poll"] = int(time.time())
         st = maker_order_status(oid)
-        log(f"[BTC-MAKER] status order_id={oid} -> {st.get('status')}")
+        log(f"[XRP-MAKER] status order_id={oid} -> {st.get('status')}")
         if st.get('status') in ('filled', 'partially_filled'):
             _state['maker_done'] = True
             _state['snipe_done'] = True
             save_state()
-            tg(f"[BTC-MAKER] FILLED order {oid}")
-            log_trade("btc15m", _state.get('maker_side', 'UP'), 
+            tg(f"[XRP-MAKER] FILLED order {oid}")
+            log_trade("xrp15m", _state.get('maker_side', 'UP'), 
                 _state.get('maker_shares', 0) * _state.get('maker_price', 0),
                 _state.get('maker_price', 0), 0, 'filled',
                 int(time.time()) - _state.get('maker_last_poll', int(time.time())),
@@ -349,10 +340,10 @@ def check_maker_snipe(market, seconds_remaining):
                 fill_key = f"{oid}:{vf.get('filled_size')}"
                 seen = set(_state.get('maker_seen_fills', []))
                 if fill_key not in seen:
-                    log(f"[BTC-MAKER] fill verified via activity/trades size={vf.get('filled_size')}")
-                    tg(f"[BTC-MAKER] FILL VERIFIED {vf.get('filled_size')} shares")
+                    log(f"[XRP-MAKER] fill verified via activity/trades size={vf.get('filled_size')}")
+                    tg(f"[XRP-MAKER] FILL VERIFIED {vf.get('filled_size')} shares")
                     # Log verified fill to journal
-                    log_trade("btc15m", _state.get('maker_side', 'UP'),
+                    log_trade("xrp15m", _state.get('maker_side', 'UP'),
                         vf.get('filled_size', 0) * _state.get('maker_price', 0),
                         _state.get('maker_price', 0), 0, 'filled',
                         int(time.time()) - _state.get('maker_last_poll', int(time.time())),
@@ -365,8 +356,8 @@ def check_maker_snipe(market, seconds_remaining):
                 return True
         if seconds_remaining <= MAKER_CANCEL_SEC and st.get('status') in ('open', 'partially_filled'):
             maker_cancel_order(oid)
-            log(f"[BTC-MAKER] cancel by deadline order_id={oid} sec_rem={seconds_remaining}")
-            tg(f"[BTC-MAKER] ORDER CANCELLED: {oid} | sec_rem={seconds_remaining}")
+            log(f"[XRP-MAKER] cancel by deadline order_id={oid} sec_rem={seconds_remaining}")
+            tg(f"[XRP-MAKER] ORDER CANCELLED: {oid} | sec_rem={seconds_remaining}")
             _state['maker_done'] = True
             save_state()
             return False
@@ -378,10 +369,10 @@ def check_maker_snipe(market, seconds_remaining):
     base_price = get_btc_price()
     if base_price is None:
         return None
-    if not _state.get('window_open_btc'):
+    if not _state.get('window_open_xrp'):
         return None
-    delta_pct = (base_price - _state['window_open_btc']) / _state['window_open_btc'] * 100
-    log(f"[BTC-MAKER] now={base_price} open={_state['window_open_btc']} delta={delta_pct:+.3f}% sec_rem={seconds_remaining}")
+    delta_pct = (base_price - _state['window_open_xrp']) / _state['window_open_xrp'] * 100
+    log(f"[XRP-MAKER] now={base_price} open={_state['window_open_xrp']} delta={delta_pct:+.3f}% sec_rem={seconds_remaining}")
     direction = 'UP' if delta_pct > SNIPE_DELTA_MIN else ('DOWN' if delta_pct < -SNIPE_DELTA_MIN else None)
     if not direction:
         return None
@@ -389,37 +380,37 @@ def check_maker_snipe(market, seconds_remaining):
     # ── Signal confirmation: require consecutive polls agreeing ──
     now_ts = int(time.time())
     cutoff_ts = now_ts - SIGNAL_CONFIRM_SEC
-    recent_prices = [(t, p) for t, p in _state.get('btc_prices', []) if t >= cutoff_ts]
+    recent_prices = [(t, p) for t, p in _state.get('xrp_prices', []) if t >= cutoff_ts]
     if len(recent_prices) < SIGNAL_CONFIRM_COUNT:
-        log(f"[BTC-MAKER] Confirm: only {len(recent_prices)}/{SIGNAL_CONFIRM_COUNT} samples, waiting")
+        log(f"[XRP-MAKER] Confirm: only {len(recent_prices)}/{SIGNAL_CONFIRM_COUNT} samples, waiting")
         return None
     confirmations = 0
     for _, p in recent_prices[-SIGNAL_CONFIRM_COUNT:]:
-        d = (p - _state['window_open_btc']) / _state['window_open_btc'] * 100
+        d = (p - _state['window_open_xrp']) / _state['window_open_xrp'] * 100
         if (direction == 'UP' and d > SNIPE_DELTA_MIN) or (direction == 'DOWN' and d < -SNIPE_DELTA_MIN):
             confirmations += 1
     if confirmations < SIGNAL_CONFIRM_COUNT:
-        log(f"[BTC-MAKER] Confirm: {confirmations}/{SIGNAL_CONFIRM_COUNT}, skipping")
+        log(f"[XRP-MAKER] Confirm: {confirmations}/{SIGNAL_CONFIRM_COUNT}, skipping")
         return None
     recent_avg = sum(p for _, p in recent_prices[-SIGNAL_CONFIRM_COUNT:]) / len(recent_prices[-SIGNAL_CONFIRM_COUNT:])
-    momentum = (recent_avg - _state['window_open_btc']) / _state['window_open_btc'] * 100
+    momentum = (recent_avg - _state['window_open_xrp']) / _state['window_open_xrp'] * 100
     # Require momentum to be meaningfully above the noise floor (1.5% = 60% of delta threshold)
     MOMENTUM_MIN = SNIPE_DELTA_MIN * 1.50
     if abs(momentum) < MOMENTUM_MIN:
-        log(f"[BTC-MAKER] momentum={momentum:+.3f}% < {MOMENTUM_MIN:.3f}%, skipping (weak)")
+        log(f"[XRP-MAKER] momentum={momentum:+.3f}% < {MOMENTUM_MIN:.3f}%, skipping (weak)")
         return None
-    log(f"[BTC-MAKER] CONFIRMED {confirmations}/{SIGNAL_CONFIRM_COUNT} | momentum={momentum:+.3f}%")
+    log(f"[XRP-MAKER] CONFIRMED {confirmations}/{SIGNAL_CONFIRM_COUNT} | momentum={momentum:+.3f}%")
     token_id = market['clob_token_id'][0] if direction == 'UP' else (market['clob_token_id'][1] if len(market['clob_token_id']) > 1 else '')
     token_price = market['yes_price'] if direction == 'UP' else market['no_price']
     if token_price < MAKER_MIN_PRICE:
-        log(f"[BTC-MAKER] token_mid={token_price:.4f} < min {MAKER_MIN_PRICE:.4f}, skipping")
+        log(f"[XRP-MAKER] token_mid={token_price:.4f} < min {MAKER_MIN_PRICE:.4f}, skipping")
         return None
     if token_price > SIGNAL_MAX_ENTRY_PRICE:
-        log(f"[BTC-MAKER] entry={token_price:.4f} > max {SIGNAL_MAX_ENTRY_PRICE:.4f}, skipping {direction} signal")
+        log(f"[XRP-MAKER] entry={token_price:.4f} > max {SIGNAL_MAX_ENTRY_PRICE:.4f}, skipping {direction} signal")
         return None
     limit_price = max(0.01, round(token_price - MAKER_OFFSET, 2))
     shares = max(5.0, math.floor((SNIPE_DEFAULT / max(limit_price, 0.01)) * 100) / 100)
-    log(f"[BTC-MAKER] {direction} signal token_mid={token_price:.4f} limit={limit_price:.4f} shares={shares:.2f} dry={MAKER_DRY_RUN}")
+    log(f"[XRP-MAKER] {direction} signal token_mid={token_price:.4f} limit={limit_price:.4f} shares={shares:.2f} dry={MAKER_DRY_RUN}")
     r = maker_place_order('BUY', shares, limit_price, market['condition_id'], token_id)
     for line in (r.get('output') or '').splitlines():
         if line.strip() and ('[MAKER' in line or '[RESULT' in line or '[ATTEMPT' in line):
@@ -437,51 +428,10 @@ def check_maker_snipe(market, seconds_remaining):
     _state['maker_done'] = False
     save_state()
     # Send Telegram notification for order placement
-    tg(f"[BTC-MAKER] ORDER PLACED: {direction} {shares:.2f} shares @ {limit_price:.4f} | Order: {r.get('order_id') or (r.get('posted') or {}).get('order_id') or ''}")
+    tg(f"[XRP-MAKER] ORDER PLACED: {direction} {shares:.2f} shares @ {limit_price:.4f} | Order: {r.get('order_id') or (r.get('posted') or {}).get('order_id') or ''}")
     return r.get('success')
 
 # ── Strategy A: Arb check ─────────────────────────────────────────────────────
-def check_gabagool(market, seconds_remaining=None):
-    if not BTC15M_GABAGOOL_ENABLED:
-        return None
-    if market.get("closed"):
-        return None
-
-    yes_price = market.get("yes_price", 1.0)
-    no_price = market.get("no_price", 1.0)
-    now_ts = int(time.time())
-
-    if yes_price < GABAGOOL_MAX_LEG:
-        prev = _state.get("gabagool_yes_low")
-        if prev is None or yes_price < prev:
-            _state["gabagool_yes_low"] = yes_price
-            _state["gabagool_yes_ts"] = now_ts
-            log(f"[GABAGOOL] YES dip ts={now_ts} price={yes_price:.4f}")
-            save_state()
-
-    if no_price < GABAGOOL_MAX_LEG:
-        prev = _state.get("gabagool_no_low")
-        if prev is None or no_price < prev:
-            _state["gabagool_no_low"] = no_price
-            _state["gabagool_no_ts"] = now_ts
-            log(f"[GABAGOOL] NO dip ts={now_ts} price={no_price:.4f}")
-            save_state()
-
-    if seconds_remaining is not None and seconds_remaining <= 5 and not _state.get("gabagool_window_logged"):
-        y = _state.get("gabagool_yes_low")
-        n = _state.get("gabagool_no_low")
-        yts = _state.get("gabagool_yes_ts", 0)
-        nts = _state.get("gabagool_no_ts", 0)
-        if y is not None and n is not None:
-            combined = y + n
-            profit = 1.00 - combined
-            log(f"[GABAGOOL SUMMARY] YES low=${y:.4f} at {yts}, NO low=${n:.4f} at {nts}, combined=${combined:.4f}, profit=${profit:.4f}")
-        else:
-            log(f"[GABAGOOL SUMMARY] incomplete yes={y} no={n}")
-        _state["gabagool_window_logged"] = True
-        save_state()
-    return None
-
 def check_arb(market):
     if _state["arb_done"]:
         return None
@@ -505,7 +455,7 @@ def check_arb(market):
     arb_profit = (1.00 - combined) * min(yes_shares, no_shares)
     notes = f"arb profit=${arb_profit:.2f} yes_shares={yes_shares:.2f} no_shares={no_shares:.2f}"
     log(f"[ARB] Result: yes={r1.get('success')}, no={r2.get('success')}. {notes}")
-    tg(f"[BTC-ARB] {notes}")
+    tg(f"[XRP-ARB] {notes}")
 
     _state["arb_done"] = True
     save_state()
@@ -522,12 +472,12 @@ def check_snipe(market, seconds_remaining):
     if btc_price is None:
         return None
 
-    if not _state["window_open_btc"]:
-        log(f"[SNIPE] No window_open_btc recorded, skipping. BTC={btc_price}")
+    if not _state["window_open_xrp"]:
+        log(f"[SNIPE] No window_open_xrp recorded, skipping. XRP={btc_price}")
         return None
 
-    delta_pct = (btc_price - _state["window_open_btc"]) / _state["window_open_btc"] * 100
-    log(f"[SNIPE] BTC now={btc_price} window_open={_state['window_open_btc']} delta={delta_pct:+.3f}%")
+    delta_pct = (btc_price - _state["window_open_xrp"]) / _state["window_open_xrp"] * 100
+    log(f"[SNIPE] BTC now={btc_price} window_open={_state['window_open_xrp']} delta={delta_pct:+.3f}%")
 
     direction = None
     if delta_pct > SNIPE_DELTA_MIN:
@@ -565,7 +515,7 @@ def check_snipe(market, seconds_remaining):
                 log(f"[EXEC-ERR] {line.strip()}")
     notes = f"snipe {direction} delta={delta_pct:+.3f}% price={price:.4f} size=${size:.2f}"
     log(f"[SNIPE] Result: {r.get('success')} filled={r.get('filled')}. {notes}")
-    if os.getenv("BTC15M_ONE_SHOT_TEST") == "1":
+    if os.getenv("XRP15M_ONE_SHOT_TEST") == "1":
         _state["snipe_done"] = True
         save_state()
         log("[SNIPE] ONE_SHOT_TEST active — stopping after first BTC attempt in this window")
@@ -587,10 +537,10 @@ def check_snipe(market, seconds_remaining):
 def setup_new_window(slug, window_ts):
     btc_price = get_btc_price()
     if btc_price is None:
-        btc_price = _state.get("window_open_btc", 0.0)
+        btc_price = _state.get("window_open_xrp", 0.0)
 
     _state["window_ts"]       = window_ts
-    _state["window_open_btc"] = btc_price
+    _state["window_open_xrp"] = btc_price
     _state["arb_done"]        = False
     _state["snipe_done"]      = False
     _state["maker_order_id"]  = ""
@@ -600,12 +550,12 @@ def setup_new_window(slug, window_ts):
     _state["maker_shares"]    = 0.0
     _state["maker_done"]      = False
     _state["maker_last_poll"] = 0
-    _state["btc_prices"]      = [(int(time.time()), btc_price)]
+    _state["xrp_prices"]      = [(int(time.time()), btc_price)]
     _state["prev_slug"]       = slug
     save_state()
     trigger_post_resolution_tasks()
 
-    log(f"[NEW WINDOW] ts={window_ts} BTC={btc_price} slug={slug}")
+    log(f"[NEW WINDOW] ts={window_ts} XRP={btc_price} slug={slug}")
     # Window start — no telegram noise
 
 # ── Daily loss check ───────────────────────────────────────────────────────────
@@ -625,9 +575,9 @@ def main():
     global _state
     load_state()
     log("=" * 60)
-    log(f"[BTC-15M] STARTING {'(DRY RUN)' if DRY_RUN else '(LIVE)'}")
-    log(f"[BTC-15M] Arb threshold=${ARB_THRESHOLD}, snipe delta>={SNIPE_DELTA_MIN}%, max daily loss=${MAX_DAILY_LOSS} | maker={MAKER_ENABLED} dry={MAKER_DRY_RUN} start=T-{MAKER_START_SEC} cancel=T-{MAKER_CANCEL_SEC} offset={MAKER_OFFSET}")
-    tg("[BTC-15M] Engine started!")
+    log(f"[XRP-15M] STARTING {'(DRY RUN)' if DRY_RUN else '(LIVE)'}")
+    log(f"[XRP-15M] Arb threshold=${ARB_THRESHOLD}, snipe delta>={SNIPE_DELTA_MIN}%, max daily loss=${MAX_DAILY_LOSS} | maker={MAKER_ENABLED} dry={MAKER_DRY_RUN} start=T-{MAKER_START_SEC} cancel=T-{MAKER_CANCEL_SEC} offset={MAKER_OFFSET}")
+    tg("[XRP-15M] Engine started!")
 
     while True:
         now      = int(time.time())
@@ -660,17 +610,14 @@ def main():
         # Record BTC price
         btc = get_btc_price()
         if btc:
-            _state["btc_prices"].append((int(time.time()), btc))
+            _state["xrp_prices"].append((int(time.time()), btc))
             # Keep last window's prices only
             cutoff = window_ts
-            _state["btc_prices"] = [(t, p) for t, p in _state["btc_prices"] if t >= cutoff]
+            _state["xrp_prices"] = [(t, p) for t, p in _state["xrp_prices"] if t >= cutoff]
 
         # Strategy A: Arb (first 14.75 min)
         if sec_rem > 15:
             check_arb(market)
-
-        # Gabagool tracking (dry-run aware, no real orders unless explicitly enabled elsewhere)
-        check_gabagool(market, sec_rem)
 
         # Strategy B: Snipe / Maker Snipe
         if MAKER_ENABLED:
@@ -685,4 +632,4 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        log("[BTC-15M] Stopped by user")
+        log("[XRP-15M] Stopped by user")

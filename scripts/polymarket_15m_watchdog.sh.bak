@@ -10,14 +10,12 @@ mkdir -p "$STATE_DIR"
 
 TELEGRAM_TOKEN=""
 CHAT_ID=""
-BTC15M_PAUSED="false"
 ETH15M_PAUSED="false"
 if [ -f "$SECRETS" ]; then
   while IFS='=' read -r k v; do
     case "$k" in
       TELEGRAM_TOKEN) TELEGRAM_TOKEN=$(printf '%s' "$v" | sed "s/^['\"]//;s/['\"]$//") ;;
       CHAT_ID) CHAT_ID=$(printf '%s' "$v" | sed "s/^['\"]//;s/['\"]$//") ;;
-      BTC15M_PAUSED) BTC15M_PAUSED=$(printf '%s' "$v" | tr '[:upper:]' '[:lower:]' | sed "s/^['\"]//;s/['\"]$//") ;;
       ETH15M_PAUSED) ETH15M_PAUSED=$(printf '%s' "$v" | tr '[:upper:]' '[:lower:]' | sed "s/^['\"]//;s/['\"]$//") ;;
     esac
   done < "$SECRETS"
@@ -93,16 +91,10 @@ check_engine() {
   fi
 }
 
-if [ "$BTC15M_PAUSED" != "true" ]; then
-  check_engine "BTC-15m" "polymarket_btc15m.py" "/tmp/polymarket_btc15m.pid" "/tmp/polymarket_btc15m.log"
-else
-  log "BTC-15m paused via BTC15M_PAUSED=true"
-fi
-
+check_engine "BTC-15m" "polymarket_btc15m.py" "/tmp/polymarket_btc15m.pid" "/tmp/polymarket_btc15m.log"
 if [ "$ETH15M_PAUSED" != "true" ]; then
   check_engine "ETH-15m" "polymarket_eth15m.py" "/tmp/polymarket_eth15m.pid" "/tmp/polymarket_eth15m.log"
 else
   log "ETH-15m paused via ETH15M_PAUSED=true"
 fi
-
 check_engine "AUTO-REDEEM" "polymarket_auto_redeem_daemon.py" "/tmp/polymarket_auto_redeem.pid" "/tmp/polymarket_auto_redeem.log"
