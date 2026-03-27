@@ -15,10 +15,14 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
+from zoneinfo import ZoneInfo
+from edge_features import build_feature_snapshot
+from edge_model import score_edge
 
 # ── Paths & creds ──────────────────────────────────────────────────────────────
 WORK_DIR      = Path("/home/abdaltm86/.openclaw/workspace/trading")
@@ -101,6 +105,7 @@ _state = {
     "maker_seen_fills": [],
 }
 _positions = []   # list of dicts for open/confirmation positions
+ET_TZ = ZoneInfo("America/New_York")
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 def log(msg):
@@ -289,6 +294,102 @@ def log_trade(engine, direction, size_usd, entry_price, pnl, exit_type, hold_sec
         log(f"Journal error: {e}")
 
 
+def _timestamp_et():
+    return datetime.now(ET_TZ).isoformat()
+
+
+def _normalize_side(side):
+    if side in ("UP", "YES"):
+        return "YES"
+    if side in ("DOWN", "NO"):
+        return "NO"
+    return None
+
+
+def build_edge_event_payload(
+    market,
+    signal_type,
+    decision,
+    side=None,
+    seconds_remaining=None,
+    skip_reason=None,
+    intended_entry_price=None,
+    actual_fill_price=None,
+    slippage=None,
+    market_slug=None,
+    now_ts=None,
+):
+    if now_ts is None:
+        now_ts = int(time.time())
+    price_points = [(int(t), float(p)) for t, p in _state.get("eth_prices", []) if p is not None]
+    snapshot = build_feature_snapshot(
+        price_points=price_points,
+        now_ts=now_ts,
+        best_bid=market.get("best_bid") if market else None,
+        best_ask=market.get("best_ask") if market else None,
+        depth_bids=market.get("bids") if market else None,
+        depth_asks=market.get("asks") if market else None,
+        seconds_remaining=seconds_remaining,
+    )
+    shadow = score_edge(snapshot, asset="ETH", engine="eth15m")
+    event_skip_reason = skip_reason if skip_reason is not None else shadow.get("shadow_skip_reason")
+    return {
+        "event_id": str(uuid.uuid4()),
+        "engine": "eth15m",
+        "asset": "ETH",
+        "timestamp_et": _timestamp_et(),
+        "market_slug": market_slug,
+        "market_id": market.get("id") if market else None,
+        "side": _normalize_side(side),
+        "signal_type": signal_type,
+        "seconds_remaining": seconds_remaining,
+        "best_bid": snapshot.get("best_bid"),
+        "best_ask": snapshot.get("best_ask"),
+        "spread": snapshot.get("spread"),
+        "midprice": snapshot.get("midprice"),
+        "microprice": snapshot.get("microprice"),
+        "price_now": snapshot.get("price_now"),
+        "price_1s_ago": snapshot.get("price_1s_ago"),
+        "price_3s_ago": snapshot.get("price_3s_ago"),
+        "price_5s_ago": snapshot.get("price_5s_ago"),
+        "price_10s_ago": snapshot.get("price_10s_ago"),
+        "price_30s_ago": snapshot.get("price_30s_ago"),
+        "ret_1s": snapshot.get("ret_1s"),
+        "ret_3s": snapshot.get("ret_3s"),
+        "ret_5s": snapshot.get("ret_5s"),
+        "ret_10s": snapshot.get("ret_10s"),
+        "ret_30s": snapshot.get("ret_30s"),
+        "vol_10s": snapshot.get("vol_10s"),
+        "vol_30s": snapshot.get("vol_30s"),
+        "vol_60s": snapshot.get("vol_60s"),
+        "imbalance_1": snapshot.get("imbalance_1"),
+        "imbalance_3": snapshot.get("imbalance_3"),
+        "model_p_yes": shadow.get("model_p_yes"),
+        "model_p_no": shadow.get("model_p_no"),
+        "edge_yes": shadow.get("edge_yes"),
+        "edge_no": shadow.get("edge_no"),
+        "net_edge": shadow.get("net_edge"),
+        "confidence": shadow.get("confidence"),
+        "regime_ok": shadow.get("regime_ok"),
+        "skip_reason": event_skip_reason,
+        "intended_entry_price": intended_entry_price,
+        "actual_fill_price": actual_fill_price,
+        "slippage": slippage,
+        "decision": decision,
+    }
+
+
+def log_edge_decision(**kwargs):
+    try:
+        from journal import log_edge_event
+    except Exception:
+        return
+    try:
+        log_edge_event(**build_edge_event_payload(**kwargs))
+    except Exception as e:
+        log(f"Edge telemetry error: {e}")
+
+
 
 def maker_place_order(side, shares, price, condition_id, token_id):
     cmd = [str(VENV_PY), str(WORK_DIR / "scripts" / "polymarket_executor.py"), "maker_buy", token_id, str(shares), str(price)]
@@ -332,7 +433,7 @@ def maker_cancel_order(order_id):
     return {"success": result.returncode == 0, "output": result.stdout, "error": result.stderr}
 
 
-def check_maker_snipe(market, seconds_remaining):
+def check_maker_snipe(market, seconds_remaining, market_slug=None):
     if not MAKER_ENABLED:
         return None
     oid = _state.get("maker_order_id")
@@ -370,25 +471,52 @@ def check_maker_snipe(market, seconds_remaining):
     if _state.get('maker_done') or oid:
         return None
     if seconds_remaining > MAKER_START_SEC or seconds_remaining <= MAKER_CANCEL_SEC:
+        log_edge_decision(
+            market=market, signal_type="maker_snipe", decision="skip_time",
+            seconds_remaining=seconds_remaining, skip_reason="outside_maker_window", market_slug=market_slug,
+        )
         return None
 
     base_price = get_eth_price()
     if base_price is None:
+        log_edge_decision(
+            market=market, signal_type="maker_snipe", decision="skip_data",
+            seconds_remaining=seconds_remaining, skip_reason="missing_eth_price", market_slug=market_slug,
+        )
         return None
     if not _state.get('window_open_eth'):
+        log_edge_decision(
+            market=market, signal_type="maker_snipe", decision="skip_data",
+            seconds_remaining=seconds_remaining, skip_reason="missing_window_open_eth", market_slug=market_slug,
+        )
         return None
     delta_pct = (base_price - _state['window_open_eth']) / _state['window_open_eth'] * 100
     log(f"[ETH-MAKER] now={base_price} open={_state['window_open_eth']} delta={delta_pct:+.3f}% sec_rem={seconds_remaining}")
     direction = 'UP' if delta_pct > SNIPE_DELTA_MIN else ('DOWN' if delta_pct < -SNIPE_DELTA_MIN else None)
     if not direction:
+        log_edge_decision(
+            market=market, signal_type="maker_snipe", decision="skip_no_edge",
+            seconds_remaining=seconds_remaining, skip_reason="delta_below_threshold", market_slug=market_slug,
+        )
         return None
     token_id = market['clob_token_id'][0] if direction == 'UP' else (market['clob_token_id'][1] if len(market['clob_token_id']) > 1 else '')
     token_price = market['yes_price'] if direction == 'UP' else market['no_price']
     if token_price < MAKER_MIN_PRICE:
         log(f"[ETH-MAKER] token_mid={token_price:.4f} < min {MAKER_MIN_PRICE:.4f}, skipping")
+        log_edge_decision(
+            market=market, signal_type="maker_snipe", decision="skip_spread",
+            side=direction, seconds_remaining=seconds_remaining, skip_reason="below_min_price",
+            intended_entry_price=token_price, market_slug=market_slug,
+        )
         return None
     limit_price = max(0.01, round(token_price - MAKER_OFFSET, 2))
     shares = max(5.0, math.floor((SNIPE_DEFAULT / max(limit_price, 0.01)) * 100) / 100)
+    log_edge_decision(
+        market=market, signal_type="maker_snipe",
+        decision="place_yes" if direction == "UP" else "place_no",
+        side=direction, seconds_remaining=seconds_remaining, intended_entry_price=limit_price,
+        market_slug=market_slug,
+    )
     log(f"[ETH-MAKER] {direction} signal token_mid={token_price:.4f} limit={limit_price:.4f} shares={shares:.2f} dry={MAKER_DRY_RUN}")
     r = maker_place_order('BUY', shares, limit_price, market['condition_id'], token_id)
     for line in (r.get('output') or '').splitlines():
@@ -411,12 +539,17 @@ def check_maker_snipe(market, seconds_remaining):
     return r.get('success')
 
 # ── Strategy A: Arb check ─────────────────────────────────────────────────────
-def check_arb(market):
+def check_arb(market, seconds_remaining=None, market_slug=None):
     if _state["arb_done"]:
         return None
     combined = market["yes_price"] + market["no_price"]
     if combined >= ARB_THRESHOLD:
         log(f"[ETH-ARB] No arb. Combined={combined:.4f} >= {ARB_THRESHOLD}")
+        log_edge_decision(
+            market=market, signal_type="arb", decision="skip_no_edge",
+            seconds_remaining=seconds_remaining, skip_reason="combined_above_threshold",
+            market_slug=market_slug,
+        )
         return None
 
     log(f"[ETH-ARB] FOUND! YES={market['yes_price']:.4f} NO={market['no_price']:.4f} COMBINED={combined:.4f}")
@@ -427,6 +560,14 @@ def check_arb(market):
     # FOK orders — buy equal dollar value of each
     yes_shares = ARB_SIZE / market["yes_price"]
     no_shares  = ARB_SIZE / market["no_price"]
+    log_edge_decision(
+        market=market, signal_type="arb", decision="place_yes", side="YES",
+        seconds_remaining=seconds_remaining, intended_entry_price=market["yes_price"], market_slug=market_slug,
+    )
+    log_edge_decision(
+        market=market, signal_type="arb", decision="place_no", side="NO",
+        seconds_remaining=seconds_remaining, intended_entry_price=market["no_price"], market_slug=market_slug,
+    )
 
     r1 = place_order("BUY", yes_shares, market["yes_price"], market["condition_id"], yes_tid)
     r2 = place_order("BUY", no_shares,  market["no_price"],  market["condition_id"], no_tid)
@@ -441,7 +582,7 @@ def check_arb(market):
     return True
 
 # ── Strategy B: Snipe check ──────────────────────────────────────────────────
-def check_snipe(market, seconds_remaining):
+def check_snipe(market, seconds_remaining, market_slug=None):
     if _state["snipe_done"]:
         return None
     if seconds_remaining > SNIPE_WINDOW or seconds_remaining < 5:
@@ -449,10 +590,18 @@ def check_snipe(market, seconds_remaining):
 
     eth_price = get_eth_price()
     if eth_price is None:
+        log_edge_decision(
+            market=market, signal_type="snipe", decision="skip_data",
+            seconds_remaining=seconds_remaining, skip_reason="missing_eth_price", market_slug=market_slug,
+        )
         return None
 
     if not _state["window_open_eth"]:
         log(f"[ETH-SNIPE] No window_open_eth recorded, skipping. ETH={eth_price}")
+        log_edge_decision(
+            market=market, signal_type="snipe", decision="skip_data",
+            seconds_remaining=seconds_remaining, skip_reason="missing_window_open_eth", market_slug=market_slug,
+        )
         return None
 
     delta_pct = (eth_price - _state["window_open_eth"]) / _state["window_open_eth"] * 100
@@ -465,6 +614,10 @@ def check_snipe(market, seconds_remaining):
         direction = "DOWN"
     else:
         log(f"[ETH-SNIPE] Delta {delta_pct:+.3f}% too small, skipping")
+        log_edge_decision(
+            market=market, signal_type="snipe", decision="skip_no_edge",
+            seconds_remaining=seconds_remaining, skip_reason="delta_below_threshold", market_slug=market_slug,
+        )
         return None
 
     # Pick token
@@ -473,6 +626,11 @@ def check_snipe(market, seconds_remaining):
 
     if price > SNIPE_MAX_PRICE:
         log(f"[ETH-SNIPE] Price {price:.4f} > max {SNIPE_MAX_PRICE}, skipping")
+        log_edge_decision(
+            market=market, signal_type="snipe", decision="skip_spread",
+            side=direction, seconds_remaining=seconds_remaining, skip_reason="above_max_entry_price",
+            intended_entry_price=price, market_slug=market_slug,
+        )
         return None
 
     size = SNIPE_STRONG if abs(delta_pct) >= SNIPE_STRONG_D * 100 else SNIPE_DEFAULT
@@ -482,6 +640,12 @@ def check_snipe(market, seconds_remaining):
         shares = 5
         size = shares * price
 
+    log_edge_decision(
+        market=market, signal_type="snipe",
+        decision="place_yes" if direction == "UP" else "place_no",
+        side=direction, seconds_remaining=seconds_remaining, intended_entry_price=price,
+        market_slug=market_slug,
+    )
     log(f"[ETH-SNIPE] {direction} signal! ETH delta={delta_pct:+.3f}% size=${size:.2f} price={price:.4f} shares={shares:.2f}")
     r = place_order("BUY", shares, price, market["condition_id"], token_id)
     # Log executor output so [ATTEMPT]/[RESULT] lines are visible
@@ -590,13 +754,13 @@ def main():
 
         # Strategy A: Arb (first 14.75 min)
         if sec_rem > 15:
-            check_arb(market)
+            check_arb(market, sec_rem, slug)
 
         # Strategy B: Snipe / Maker Snipe
         if MAKER_ENABLED:
-            check_maker_snipe(market, sec_rem)
+            check_maker_snipe(market, sec_rem, slug)
         elif sec_rem <= SNIPE_WINDOW and sec_rem > 5:
-            check_snipe(market, sec_rem)
+            check_snipe(market, sec_rem, slug)
 
         # Sleep
         time.sleep(SCAN_SEC)

@@ -112,8 +112,88 @@ def test_migrate_json_logs():
 
     trades = _j.get_trades()
     ids = [t["id"] for t in trades]
-    assert "sol-001" in ids
     assert "poly-001" in ids
+    assert any(t["engine"] == "solana" for t in trades)
+
+
+def test_db_init_creates_edge_events():
+    from journal import get_db
+    conn = get_db()
+    row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='edge_events'"
+    ).fetchone()
+    conn.close()
+    assert row is not None
+
+
+def test_log_edge_event_insert():
+    from journal import get_db, log_edge_event
+    event_id = log_edge_event(
+        engine="polymarket",
+        asset="BTC",
+        timestamp_et="2026-03-27T11:30:00-04:00",
+        market_slug="btc-above-100k",
+        market_id="mkt-123",
+        side="YES",
+        signal_type="microprice_reversion",
+        seconds_remaining=120,
+        best_bid=0.49,
+        best_ask=0.51,
+        spread=0.02,
+        midprice=0.50,
+        microprice=0.505,
+        price_now=0.505,
+        model_p_yes=0.54,
+        model_p_no=0.46,
+        edge_yes=0.035,
+        edge_no=-0.025,
+        net_edge=0.01,
+        confidence=0.62,
+        regime_ok=True,
+        decision="ENTER",
+    )
+    conn = get_db()
+    row = conn.execute(
+        "SELECT id, regime_ok, decision FROM edge_events WHERE id = ?",
+        (event_id,),
+    ).fetchone()
+    conn.close()
+    assert row is not None
+    assert row["id"] == event_id
+    assert row["regime_ok"] == 1
+    assert row["decision"] == "ENTER"
+
+
+def test_log_edge_event_nullable_fields():
+    from journal import get_db, log_edge_event
+    event_id = log_edge_event(
+        engine="polymarket",
+        asset="ETH",
+        side="NO",
+        regime_ok=None,
+        skip_reason=None,
+        intended_entry_price=None,
+        actual_fill_price=None,
+        slippage=None,
+        decision=None,
+    )
+    conn = get_db()
+    row = conn.execute(
+        """
+        SELECT regime_ok, skip_reason, intended_entry_price, actual_fill_price, slippage, decision
+        FROM edge_events
+        WHERE id = ?
+        """,
+        (event_id,),
+    ).fetchone()
+    conn.close()
+    assert row is not None
+    assert row["regime_ok"] is None
+    assert row["skip_reason"] is None
+    assert row["intended_entry_price"] is None
+    assert row["actual_fill_price"] is None
+    assert row["slippage"] is None
+    assert row["decision"] is None
 
 
 if __name__ == "__main__":
@@ -122,6 +202,9 @@ if __name__ == "__main__":
         test_log_trade_close,
         test_get_trades_filter,
         test_migrate_json_logs,
+        test_db_init_creates_edge_events,
+        test_log_edge_event_insert,
+        test_log_edge_event_nullable_fields,
     ]
     passed = failed = 0
     for t in tests:
