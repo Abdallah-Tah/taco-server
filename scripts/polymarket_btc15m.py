@@ -15,10 +15,12 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
+from zoneinfo import ZoneInfo
 
 # ── Paths & creds ──────────────────────────────────────────────────────────────
 WORK_DIR      = Path("/home/abdaltm86/.openclaw/workspace/trading")
@@ -114,6 +116,7 @@ _state = {
     "gabagool_window_logged": False,
 }
 _positions = []   # list of dicts for open/confirmation positions
+ET_TZ = ZoneInfo("America/New_York")
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 def log(msg):
@@ -281,6 +284,131 @@ def log_trade(engine, direction, size_usd, entry_price, pnl, exit_type, hold_sec
         log(f"Journal error: {e}")
 
 
+def _timestamp_et():
+    return datetime.now(ET_TZ).isoformat()
+
+
+def _normalize_side(side):
+    if side in ("UP", "YES"):
+        return "YES"
+    if side in ("DOWN", "NO"):
+        return "NO"
+    return None
+
+
+def _price_at_or_before(price_points, target_ts):
+    for ts, price in reversed(price_points):
+        if ts <= target_ts:
+            return float(price)
+    return None
+
+
+def _calc_return(now_price, prev_price):
+    if now_price is None or prev_price in (None, 0):
+        return None
+    return (now_price - prev_price) / prev_price
+
+
+def _stddev(values):
+    n = len(values)
+    if n < 2:
+        return None
+    mean = sum(values) / n
+    variance = sum((v - mean) ** 2 for v in values) / (n - 1)
+    return math.sqrt(variance)
+
+
+def _calc_vol(price_points, now_ts, window_sec):
+    window = [float(p) for t, p in price_points if t >= now_ts - window_sec]
+    if len(window) < 3:
+        return None
+    returns = []
+    for i in range(1, len(window)):
+        prev = window[i - 1]
+        if prev:
+            returns.append((window[i] - prev) / prev)
+    return _stddev(returns)
+
+
+def build_edge_event_payload(
+    market,
+    signal_type,
+    decision,
+    side=None,
+    seconds_remaining=None,
+    skip_reason=None,
+    intended_entry_price=None,
+    actual_fill_price=None,
+    slippage=None,
+    market_slug=None,
+    now_ts=None,
+):
+    if now_ts is None:
+        now_ts = int(time.time())
+    price_points = [(int(t), float(p)) for t, p in _state.get("btc_prices", []) if p is not None]
+    price_now = price_points[-1][1] if price_points else None
+    price_1s_ago = _price_at_or_before(price_points, now_ts - 1)
+    price_3s_ago = _price_at_or_before(price_points, now_ts - 3)
+    price_5s_ago = _price_at_or_before(price_points, now_ts - 5)
+    price_10s_ago = _price_at_or_before(price_points, now_ts - 10)
+    price_30s_ago = _price_at_or_before(price_points, now_ts - 30)
+    return {
+        "event_id": str(uuid.uuid4()),
+        "engine": "btc15m",
+        "asset": "BTC",
+        "timestamp_et": _timestamp_et(),
+        "market_slug": market_slug,
+        "market_id": market.get("id") if market else None,
+        "side": _normalize_side(side),
+        "signal_type": signal_type,
+        "seconds_remaining": seconds_remaining,
+        "best_bid": None,
+        "best_ask": None,
+        "spread": None,
+        "midprice": None,
+        "microprice": None,
+        "price_now": price_now,
+        "price_1s_ago": price_1s_ago,
+        "price_3s_ago": price_3s_ago,
+        "price_5s_ago": price_5s_ago,
+        "price_10s_ago": price_10s_ago,
+        "price_30s_ago": price_30s_ago,
+        "ret_1s": _calc_return(price_now, price_1s_ago),
+        "ret_3s": _calc_return(price_now, price_3s_ago),
+        "ret_5s": _calc_return(price_now, price_5s_ago),
+        "ret_10s": _calc_return(price_now, price_10s_ago),
+        "ret_30s": _calc_return(price_now, price_30s_ago),
+        "vol_10s": _calc_vol(price_points, now_ts, 10),
+        "vol_30s": _calc_vol(price_points, now_ts, 30),
+        "vol_60s": _calc_vol(price_points, now_ts, 60),
+        "imbalance_1": None,
+        "imbalance_3": None,
+        "model_p_yes": None,
+        "model_p_no": None,
+        "edge_yes": None,
+        "edge_no": None,
+        "net_edge": None,
+        "confidence": None,
+        "regime_ok": None,
+        "skip_reason": skip_reason,
+        "intended_entry_price": intended_entry_price,
+        "actual_fill_price": actual_fill_price,
+        "slippage": slippage,
+        "decision": decision,
+    }
+
+
+def log_edge_decision(**kwargs):
+    try:
+        from journal import log_edge_event
+    except Exception:
+        return
+    try:
+        log_edge_event(**build_edge_event_payload(**kwargs))
+    except Exception as e:
+        log(f"Edge telemetry error: {e}")
+
+
 
 def maker_place_order(side, shares, price, condition_id, token_id):
     cmd = [str(VENV_PY), str(WORK_DIR / "scripts" / "polymarket_executor.py"), "maker_buy", token_id, str(shares), str(price)]
@@ -324,7 +452,7 @@ def maker_cancel_order(order_id):
     return {"success": result.returncode == 0, "output": result.stdout, "error": result.stderr}
 
 
-def check_maker_snipe(market, seconds_remaining):
+def check_maker_snipe(market, seconds_remaining, market_slug=None):
     if not MAKER_ENABLED:
         return None
     oid = _state.get("maker_order_id")
@@ -373,17 +501,33 @@ def check_maker_snipe(market, seconds_remaining):
     if _state.get('maker_done') or oid:
         return None
     if seconds_remaining > MAKER_START_SEC or seconds_remaining <= MAKER_CANCEL_SEC:
+        log_edge_decision(
+            market=market, signal_type="maker_snipe", decision="skip_time",
+            seconds_remaining=seconds_remaining, skip_reason="outside_maker_window", market_slug=market_slug,
+        )
         return None
 
     base_price = get_btc_price()
     if base_price is None:
+        log_edge_decision(
+            market=market, signal_type="maker_snipe", decision="skip_data",
+            seconds_remaining=seconds_remaining, skip_reason="missing_btc_price", market_slug=market_slug,
+        )
         return None
     if not _state.get('window_open_btc'):
+        log_edge_decision(
+            market=market, signal_type="maker_snipe", decision="skip_data",
+            seconds_remaining=seconds_remaining, skip_reason="missing_window_open_btc", market_slug=market_slug,
+        )
         return None
     delta_pct = (base_price - _state['window_open_btc']) / _state['window_open_btc'] * 100
     log(f"[BTC-MAKER] now={base_price} open={_state['window_open_btc']} delta={delta_pct:+.3f}% sec_rem={seconds_remaining}")
     direction = 'UP' if delta_pct > SNIPE_DELTA_MIN else ('DOWN' if delta_pct < -SNIPE_DELTA_MIN else None)
     if not direction:
+        log_edge_decision(
+            market=market, signal_type="maker_snipe", decision="skip_no_edge",
+            seconds_remaining=seconds_remaining, skip_reason="delta_below_threshold", market_slug=market_slug,
+        )
         return None
 
     # ── Signal confirmation: require consecutive polls agreeing ──
@@ -392,6 +536,11 @@ def check_maker_snipe(market, seconds_remaining):
     recent_prices = [(t, p) for t, p in _state.get('btc_prices', []) if t >= cutoff_ts]
     if len(recent_prices) < SIGNAL_CONFIRM_COUNT:
         log(f"[BTC-MAKER] Confirm: only {len(recent_prices)}/{SIGNAL_CONFIRM_COUNT} samples, waiting")
+        log_edge_decision(
+            market=market, signal_type="maker_snipe", decision="skip_data",
+            side=direction, seconds_remaining=seconds_remaining, skip_reason="insufficient_confirm_samples",
+            market_slug=market_slug,
+        )
         return None
     confirmations = 0
     for _, p in recent_prices[-SIGNAL_CONFIRM_COUNT:]:
@@ -400,6 +549,11 @@ def check_maker_snipe(market, seconds_remaining):
             confirmations += 1
     if confirmations < SIGNAL_CONFIRM_COUNT:
         log(f"[BTC-MAKER] Confirm: {confirmations}/{SIGNAL_CONFIRM_COUNT}, skipping")
+        log_edge_decision(
+            market=market, signal_type="maker_snipe", decision="skip_no_edge",
+            side=direction, seconds_remaining=seconds_remaining, skip_reason="confirmation_not_met",
+            market_slug=market_slug,
+        )
         return None
     recent_avg = sum(p for _, p in recent_prices[-SIGNAL_CONFIRM_COUNT:]) / len(recent_prices[-SIGNAL_CONFIRM_COUNT:])
     momentum = (recent_avg - _state['window_open_btc']) / _state['window_open_btc'] * 100
@@ -407,18 +561,39 @@ def check_maker_snipe(market, seconds_remaining):
     MOMENTUM_MIN = SNIPE_DELTA_MIN * 1.50
     if abs(momentum) < MOMENTUM_MIN:
         log(f"[BTC-MAKER] momentum={momentum:+.3f}% < {MOMENTUM_MIN:.3f}%, skipping (weak)")
+        log_edge_decision(
+            market=market, signal_type="maker_snipe", decision="skip_no_edge",
+            side=direction, seconds_remaining=seconds_remaining, skip_reason="weak_momentum",
+            market_slug=market_slug,
+        )
         return None
     log(f"[BTC-MAKER] CONFIRMED {confirmations}/{SIGNAL_CONFIRM_COUNT} | momentum={momentum:+.3f}%")
     token_id = market['clob_token_id'][0] if direction == 'UP' else (market['clob_token_id'][1] if len(market['clob_token_id']) > 1 else '')
     token_price = market['yes_price'] if direction == 'UP' else market['no_price']
     if token_price < MAKER_MIN_PRICE:
         log(f"[BTC-MAKER] token_mid={token_price:.4f} < min {MAKER_MIN_PRICE:.4f}, skipping")
+        log_edge_decision(
+            market=market, signal_type="maker_snipe", decision="skip_spread",
+            side=direction, seconds_remaining=seconds_remaining, skip_reason="below_min_price",
+            intended_entry_price=token_price, market_slug=market_slug,
+        )
         return None
     if token_price > SIGNAL_MAX_ENTRY_PRICE:
         log(f"[BTC-MAKER] entry={token_price:.4f} > max {SIGNAL_MAX_ENTRY_PRICE:.4f}, skipping {direction} signal")
+        log_edge_decision(
+            market=market, signal_type="maker_snipe", decision="skip_spread",
+            side=direction, seconds_remaining=seconds_remaining, skip_reason="above_max_entry_price",
+            intended_entry_price=token_price, market_slug=market_slug,
+        )
         return None
     limit_price = max(0.01, round(token_price - MAKER_OFFSET, 2))
     shares = max(5.0, math.floor((SNIPE_DEFAULT / max(limit_price, 0.01)) * 100) / 100)
+    log_edge_decision(
+        market=market, signal_type="maker_snipe",
+        decision="place_yes" if direction == "UP" else "place_no",
+        side=direction, seconds_remaining=seconds_remaining, intended_entry_price=limit_price,
+        market_slug=market_slug,
+    )
     log(f"[BTC-MAKER] {direction} signal token_mid={token_price:.4f} limit={limit_price:.4f} shares={shares:.2f} dry={MAKER_DRY_RUN}")
     r = maker_place_order('BUY', shares, limit_price, market['condition_id'], token_id)
     for line in (r.get('output') or '').splitlines():
@@ -482,12 +657,17 @@ def check_gabagool(market, seconds_remaining=None):
         save_state()
     return None
 
-def check_arb(market):
+def check_arb(market, seconds_remaining=None, market_slug=None):
     if _state["arb_done"]:
         return None
     combined = market["yes_price"] + market["no_price"]
     if combined >= ARB_THRESHOLD:
         log(f"[ARB] No arb. Combined={combined:.4f} >= {ARB_THRESHOLD}")
+        log_edge_decision(
+            market=market, signal_type="arb", decision="skip_no_edge",
+            seconds_remaining=seconds_remaining, skip_reason="combined_above_threshold",
+            market_slug=market_slug,
+        )
         return None
 
     log(f"[ARB] FOUND! YES={market['yes_price']:.4f} NO={market['no_price']:.4f} COMBINED={combined:.4f}")
@@ -498,6 +678,14 @@ def check_arb(market):
     # FOK orders — buy equal dollar value of each
     yes_shares = ARB_SIZE / market["yes_price"]
     no_shares  = ARB_SIZE / market["no_price"]
+    log_edge_decision(
+        market=market, signal_type="arb", decision="place_yes", side="YES",
+        seconds_remaining=seconds_remaining, intended_entry_price=market["yes_price"], market_slug=market_slug,
+    )
+    log_edge_decision(
+        market=market, signal_type="arb", decision="place_no", side="NO",
+        seconds_remaining=seconds_remaining, intended_entry_price=market["no_price"], market_slug=market_slug,
+    )
 
     r1 = place_order("BUY", yes_shares, market["yes_price"], market["condition_id"], yes_tid)
     r2 = place_order("BUY", no_shares,  market["no_price"],  market["condition_id"], no_tid)
@@ -512,7 +700,7 @@ def check_arb(market):
     return True
 
 # ── Strategy B: Snipe check ──────────────────────────────────────────────────
-def check_snipe(market, seconds_remaining):
+def check_snipe(market, seconds_remaining, market_slug=None):
     if _state["snipe_done"]:
         return None
     if seconds_remaining > SNIPE_WINDOW or seconds_remaining < 5:
@@ -520,10 +708,18 @@ def check_snipe(market, seconds_remaining):
 
     btc_price = get_btc_price()
     if btc_price is None:
+        log_edge_decision(
+            market=market, signal_type="snipe", decision="skip_data",
+            seconds_remaining=seconds_remaining, skip_reason="missing_btc_price", market_slug=market_slug,
+        )
         return None
 
     if not _state["window_open_btc"]:
         log(f"[SNIPE] No window_open_btc recorded, skipping. BTC={btc_price}")
+        log_edge_decision(
+            market=market, signal_type="snipe", decision="skip_data",
+            seconds_remaining=seconds_remaining, skip_reason="missing_window_open_btc", market_slug=market_slug,
+        )
         return None
 
     delta_pct = (btc_price - _state["window_open_btc"]) / _state["window_open_btc"] * 100
@@ -536,6 +732,10 @@ def check_snipe(market, seconds_remaining):
         direction = "DOWN"
     else:
         log(f"[SNIPE] Delta {delta_pct:+.3f}% too small, skipping")
+        log_edge_decision(
+            market=market, signal_type="snipe", decision="skip_no_edge",
+            seconds_remaining=seconds_remaining, skip_reason="delta_below_threshold", market_slug=market_slug,
+        )
         return None
 
     # Pick token
@@ -544,6 +744,11 @@ def check_snipe(market, seconds_remaining):
 
     if price > SNIPE_MAX_PRICE:
         log(f"[SNIPE] Price {price:.4f} > max {SNIPE_MAX_PRICE}, skipping")
+        log_edge_decision(
+            market=market, signal_type="snipe", decision="skip_spread",
+            side=direction, seconds_remaining=seconds_remaining, skip_reason="above_max_entry_price",
+            intended_entry_price=price, market_slug=market_slug,
+        )
         return None
 
     size = SNIPE_STRONG if abs(delta_pct) >= SNIPE_STRONG_D * 100 else SNIPE_DEFAULT
@@ -553,6 +758,12 @@ def check_snipe(market, seconds_remaining):
         shares = 5
         size = shares * price
 
+    log_edge_decision(
+        market=market, signal_type="snipe",
+        decision="place_yes" if direction == "UP" else "place_no",
+        side=direction, seconds_remaining=seconds_remaining, intended_entry_price=price,
+        market_slug=market_slug,
+    )
     log(f"[SNIPE] {direction} signal! BTC delta={delta_pct:+.3f}% size=${size:.2f} price={price:.4f} shares={shares:.2f}")
     r = place_order("BUY", shares, price, market["condition_id"], token_id)
     # Log executor output so [ATTEMPT]/[RESULT] lines are visible
@@ -667,16 +878,16 @@ def main():
 
         # Strategy A: Arb (first 14.75 min)
         if sec_rem > 15:
-            check_arb(market)
+            check_arb(market, sec_rem, slug)
 
         # Gabagool tracking (dry-run aware, no real orders unless explicitly enabled elsewhere)
         check_gabagool(market, sec_rem)
 
         # Strategy B: Snipe / Maker Snipe
         if MAKER_ENABLED:
-            check_maker_snipe(market, sec_rem)
+            check_maker_snipe(market, sec_rem, slug)
         elif sec_rem <= SNIPE_WINDOW and sec_rem > 5:
-            check_snipe(market, sec_rem)
+            check_snipe(market, sec_rem, slug)
 
         # Sleep
         time.sleep(SCAN_SEC)
