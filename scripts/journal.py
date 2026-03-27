@@ -44,6 +44,51 @@ CREATE TABLE IF NOT EXISTS trades (
     regime               TEXT,
     notes                TEXT
 );
+
+CREATE TABLE IF NOT EXISTS edge_events (
+    id                   TEXT PRIMARY KEY,
+    engine               TEXT,
+    asset                TEXT,
+    timestamp_et         TEXT,
+    market_slug          TEXT,
+    market_id            TEXT,
+    side                 TEXT,
+    signal_type          TEXT,
+    seconds_remaining    INTEGER,
+    best_bid             REAL,
+    best_ask             REAL,
+    spread               REAL,
+    midprice             REAL,
+    microprice           REAL,
+    price_now            REAL,
+    price_1s_ago         REAL,
+    price_3s_ago         REAL,
+    price_5s_ago         REAL,
+    price_10s_ago        REAL,
+    price_30s_ago        REAL,
+    ret_1s               REAL,
+    ret_3s               REAL,
+    ret_5s               REAL,
+    ret_10s              REAL,
+    ret_30s              REAL,
+    vol_10s              REAL,
+    vol_30s              REAL,
+    vol_60s              REAL,
+    imbalance_1          REAL,
+    imbalance_3          REAL,
+    model_p_yes          REAL,
+    model_p_no           REAL,
+    edge_yes             REAL,
+    edge_no              REAL,
+    net_edge             REAL,
+    confidence           REAL,
+    regime_ok            INTEGER,
+    skip_reason          TEXT,
+    intended_entry_price REAL,
+    actual_fill_price    REAL,
+    slippage             REAL,
+    decision             TEXT
+);
 """
 
 
@@ -146,6 +191,91 @@ def log_trade_close(
         return False
 
 
+def log_edge_event(
+    event_id: str = None,
+    engine: str = None,
+    asset: str = None,
+    timestamp_et: str = None,
+    market_slug: str = None,
+    market_id: str = None,
+    side: str = None,
+    signal_type: str = None,
+    seconds_remaining: int = None,
+    best_bid: float = None,
+    best_ask: float = None,
+    spread: float = None,
+    midprice: float = None,
+    microprice: float = None,
+    price_now: float = None,
+    price_1s_ago: float = None,
+    price_3s_ago: float = None,
+    price_5s_ago: float = None,
+    price_10s_ago: float = None,
+    price_30s_ago: float = None,
+    ret_1s: float = None,
+    ret_3s: float = None,
+    ret_5s: float = None,
+    ret_10s: float = None,
+    ret_30s: float = None,
+    vol_10s: float = None,
+    vol_30s: float = None,
+    vol_60s: float = None,
+    imbalance_1: float = None,
+    imbalance_3: float = None,
+    model_p_yes: float = None,
+    model_p_no: float = None,
+    edge_yes: float = None,
+    edge_no: float = None,
+    net_edge: float = None,
+    confidence: float = None,
+    regime_ok=None,
+    skip_reason: str = None,
+    intended_entry_price: float = None,
+    actual_fill_price: float = None,
+    slippage: float = None,
+    decision: str = None,
+) -> str:
+    """
+    Log one edge event row. Returns the event ID.
+    """
+    if not event_id:
+        event_id = str(uuid.uuid4())
+    if isinstance(regime_ok, bool):
+        regime_ok = int(regime_ok)
+
+    try:
+        conn = get_db()
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO edge_events
+                (id, engine, asset, timestamp_et, market_slug, market_id, side, signal_type,
+                 seconds_remaining, best_bid, best_ask, spread, midprice, microprice,
+                 price_now, price_1s_ago, price_3s_ago, price_5s_ago, price_10s_ago, price_30s_ago,
+                 ret_1s, ret_3s, ret_5s, ret_10s, ret_30s, vol_10s, vol_30s, vol_60s,
+                 imbalance_1, imbalance_3, model_p_yes, model_p_no, edge_yes, edge_no,
+                 net_edge, confidence, regime_ok, skip_reason, intended_entry_price,
+                 actual_fill_price, slippage, decision)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                event_id, engine, asset, timestamp_et, market_slug, market_id, side, signal_type,
+                seconds_remaining, best_bid, best_ask, spread, midprice, microprice,
+                price_now, price_1s_ago, price_3s_ago, price_5s_ago, price_10s_ago, price_30s_ago,
+                ret_1s, ret_3s, ret_5s, ret_10s, ret_30s, vol_10s, vol_30s, vol_60s,
+                imbalance_1, imbalance_3, model_p_yes, model_p_no, edge_yes, edge_no,
+                net_edge, confidence, regime_ok, skip_reason, intended_entry_price,
+                actual_fill_price, slippage, decision,
+            ),
+        )
+        conn.commit()
+        conn.close()
+        logger.info("Edge event logged: %s %s %s", event_id[:8], engine or "", asset or "")
+    except Exception as e:
+        logger.error("Failed to log edge event: %s", e)
+
+    return event_id
+
+
 def get_trades(
     engine: str = None,
     days: int = None,
@@ -231,7 +361,7 @@ def migrate_json_logs() -> int:
                             (id, engine, timestamp_open, timestamp_close, asset, direction,
                              entry_price, exit_price, pnl_absolute, pnl_percent, exit_type,
                              hold_duration_seconds, momentum_score, regime)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
                         """,
                         (trade_id, "solana", ts_open, ts_close or None, asset, direction,
                          entry_price, exit_price or None, pnl_absolute, pnl_percent, exit_type or None,
