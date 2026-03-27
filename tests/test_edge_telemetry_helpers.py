@@ -43,7 +43,9 @@ def test_btc_build_edge_event_payload_with_price_history():
     assert payload["vol_10s"] is None
     assert payload["vol_30s"] is not None
     assert payload["best_bid"] is None
-    assert payload["model_p_yes"] is None
+    assert payload["model_p_yes"] is not None
+    assert payload["model_p_no"] is not None
+    assert payload["regime_ok"] in (0, 1)
 
 
 def test_eth_build_edge_event_payload_skip_with_nulls():

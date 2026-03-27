@@ -21,6 +21,8 @@ from pathlib import Path
 
 import requests
 from zoneinfo import ZoneInfo
+from edge_features import build_feature_snapshot
+from edge_model import score_edge
 
 # ── Paths & creds ──────────────────────────────────────────────────────────────
 WORK_DIR      = Path("/home/abdaltm86/.openclaw/workspace/trading")
@@ -296,40 +298,6 @@ def _normalize_side(side):
     return None
 
 
-def _price_at_or_before(price_points, target_ts):
-    for ts, price in reversed(price_points):
-        if ts <= target_ts:
-            return float(price)
-    return None
-
-
-def _calc_return(now_price, prev_price):
-    if now_price is None or prev_price in (None, 0):
-        return None
-    return (now_price - prev_price) / prev_price
-
-
-def _stddev(values):
-    n = len(values)
-    if n < 2:
-        return None
-    mean = sum(values) / n
-    variance = sum((v - mean) ** 2 for v in values) / (n - 1)
-    return math.sqrt(variance)
-
-
-def _calc_vol(price_points, now_ts, window_sec):
-    window = [float(p) for t, p in price_points if t >= now_ts - window_sec]
-    if len(window) < 3:
-        return None
-    returns = []
-    for i in range(1, len(window)):
-        prev = window[i - 1]
-        if prev:
-            returns.append((window[i] - prev) / prev)
-    return _stddev(returns)
-
-
 def build_edge_event_payload(
     market,
     signal_type,
@@ -346,12 +314,17 @@ def build_edge_event_payload(
     if now_ts is None:
         now_ts = int(time.time())
     price_points = [(int(t), float(p)) for t, p in _state.get("btc_prices", []) if p is not None]
-    price_now = price_points[-1][1] if price_points else None
-    price_1s_ago = _price_at_or_before(price_points, now_ts - 1)
-    price_3s_ago = _price_at_or_before(price_points, now_ts - 3)
-    price_5s_ago = _price_at_or_before(price_points, now_ts - 5)
-    price_10s_ago = _price_at_or_before(price_points, now_ts - 10)
-    price_30s_ago = _price_at_or_before(price_points, now_ts - 30)
+    snapshot = build_feature_snapshot(
+        price_points=price_points,
+        now_ts=now_ts,
+        best_bid=market.get("best_bid") if market else None,
+        best_ask=market.get("best_ask") if market else None,
+        depth_bids=market.get("bids") if market else None,
+        depth_asks=market.get("asks") if market else None,
+        seconds_remaining=seconds_remaining,
+    )
+    shadow = score_edge(snapshot, asset="BTC", engine="btc15m")
+    event_skip_reason = skip_reason if skip_reason is not None else shadow.get("shadow_skip_reason")
     return {
         "event_id": str(uuid.uuid4()),
         "engine": "btc15m",
@@ -362,35 +335,35 @@ def build_edge_event_payload(
         "side": _normalize_side(side),
         "signal_type": signal_type,
         "seconds_remaining": seconds_remaining,
-        "best_bid": None,
-        "best_ask": None,
-        "spread": None,
-        "midprice": None,
-        "microprice": None,
-        "price_now": price_now,
-        "price_1s_ago": price_1s_ago,
-        "price_3s_ago": price_3s_ago,
-        "price_5s_ago": price_5s_ago,
-        "price_10s_ago": price_10s_ago,
-        "price_30s_ago": price_30s_ago,
-        "ret_1s": _calc_return(price_now, price_1s_ago),
-        "ret_3s": _calc_return(price_now, price_3s_ago),
-        "ret_5s": _calc_return(price_now, price_5s_ago),
-        "ret_10s": _calc_return(price_now, price_10s_ago),
-        "ret_30s": _calc_return(price_now, price_30s_ago),
-        "vol_10s": _calc_vol(price_points, now_ts, 10),
-        "vol_30s": _calc_vol(price_points, now_ts, 30),
-        "vol_60s": _calc_vol(price_points, now_ts, 60),
-        "imbalance_1": None,
-        "imbalance_3": None,
-        "model_p_yes": None,
-        "model_p_no": None,
-        "edge_yes": None,
-        "edge_no": None,
-        "net_edge": None,
-        "confidence": None,
-        "regime_ok": None,
-        "skip_reason": skip_reason,
+        "best_bid": snapshot.get("best_bid"),
+        "best_ask": snapshot.get("best_ask"),
+        "spread": snapshot.get("spread"),
+        "midprice": snapshot.get("midprice"),
+        "microprice": snapshot.get("microprice"),
+        "price_now": snapshot.get("price_now"),
+        "price_1s_ago": snapshot.get("price_1s_ago"),
+        "price_3s_ago": snapshot.get("price_3s_ago"),
+        "price_5s_ago": snapshot.get("price_5s_ago"),
+        "price_10s_ago": snapshot.get("price_10s_ago"),
+        "price_30s_ago": snapshot.get("price_30s_ago"),
+        "ret_1s": snapshot.get("ret_1s"),
+        "ret_3s": snapshot.get("ret_3s"),
+        "ret_5s": snapshot.get("ret_5s"),
+        "ret_10s": snapshot.get("ret_10s"),
+        "ret_30s": snapshot.get("ret_30s"),
+        "vol_10s": snapshot.get("vol_10s"),
+        "vol_30s": snapshot.get("vol_30s"),
+        "vol_60s": snapshot.get("vol_60s"),
+        "imbalance_1": snapshot.get("imbalance_1"),
+        "imbalance_3": snapshot.get("imbalance_3"),
+        "model_p_yes": shadow.get("model_p_yes"),
+        "model_p_no": shadow.get("model_p_no"),
+        "edge_yes": shadow.get("edge_yes"),
+        "edge_no": shadow.get("edge_no"),
+        "net_edge": shadow.get("net_edge"),
+        "confidence": shadow.get("confidence"),
+        "regime_ok": shadow.get("regime_ok"),
+        "skip_reason": event_skip_reason,
         "intended_entry_price": intended_entry_price,
         "actual_fill_price": actual_fill_price,
         "slippage": slippage,
