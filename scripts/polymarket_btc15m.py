@@ -37,6 +37,10 @@ LOG_F = WORK_DIR / ".poly_btc15m.log"
 REPORTS_DIR = WORK_DIR / "reports"
 BTC_PLACE_YES_EVENTS_F = REPORTS_DIR / "btc_place_yes_events.jsonl"
 BTC_PLACE_YES_SUMMARY_F = REPORTS_DIR / "btc_place_yes_summary.json"
+SHADOW_EARLY_TRADES_F = REPORTS_DIR / "shadow_early_trades.jsonl"
+SHADOW_EARLY_SUMMARY_F = REPORTS_DIR / "shadow_early_summary.json"
+EARLY_LIVE_TRADES_F = REPORTS_DIR / "early_live_trades.jsonl"
+EARLY_LIVE_SUMMARY_F = REPORTS_DIR / "early_live_summary.json"
 
 # ── Load credentials ──────────────────────────────────────────────────────────
 def _load_env():
@@ -117,6 +121,16 @@ MAX_DAILY_LOSS = _float("BTC15M_MAX_DAILY_LOSS", 15.00)
 SERIES_ID = "10192"
 SERIES_SLUG = "btc-up-or-down-15m"
 
+# Early trend live execution (regime=trend, sec>300)
+EARLY_LIVE_ENABLED = os.environ.get(
+    "BTC15M_EARLY_LIVE_ENABLED", ENV.get("BTC15M_EARLY_LIVE_ENABLED", "false")
+).lower() == "true"
+EARLY_LIVE_DRY_RUN = os.environ.get(
+    "BTC15M_EARLY_LIVE_DRY_RUN", ENV.get("BTC15M_EARLY_LIVE_DRY_RUN", "true")
+).lower() != "false"
+EARLY_LIVE_SIZE_PCT = _float("BTC15M_EARLY_LIVE_SIZE_PCT", 0.25)  # 25% of normal
+EARLY_LIVE_DISABLED = False  # Runtime kill-switch if failures detected
+
 # ── State ─────────────────────────────────────────────────────────────────────
 _state = {
     "window_ts": 0,
@@ -141,6 +155,9 @@ _state = {
     "gabagool_no_low": None,
     "gabagool_no_ts": 0,
     "gabagool_window_logged": False,
+    "early_live_first_trade_notified": False,  # Track if first trade full lifecycle sent
+    "early_live_first_order_id": None,  # Track first trade order_id for resolution notification
+    "early_live_done": False,  # One early_live trade per window max
 }
 _positions = []
 ET_TZ = ZoneInfo("America/New_York")
@@ -714,6 +731,409 @@ def _write_place_yes_analytics(payload):
         log(f"[BTC-ANALYTICS] {e}")
 
 
+def _write_shadow_early_trade(payload, resolved_outcome=None):
+    """Write or update a shadow early trade record (regime=trend, sec_remaining > 300).
+    
+    resolved_outcome: 'win', 'loss', or None (if market not yet resolved)
+    When resolved_outcome is set, also computes PnL based on entry_price.
+    """
+    try:
+        REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+        events = []
+        if SHADOW_EARLY_TRADES_F.exists():
+            for line in SHADOW_EARLY_TRADES_F.read_text().splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    events.append(json.loads(line))
+                except Exception:
+                    continue
+
+        entry_price = payload.get("market_price") or payload.get("intended_entry_price")
+        net_edge = payload.get("net_edge")
+        market_slug = payload.get("market_slug")
+        regime = payload.get("regime")
+        confidence = payload.get("confidence")
+        seconds_remaining = payload.get("seconds_remaining")
+        timestamp_et = payload.get("timestamp_et")
+
+        # Build record
+        record = {
+            "timestamp": timestamp_et,
+            "market_slug": market_slug,
+            "regime": regime,
+            "confidence": confidence,
+            "seconds_remaining": seconds_remaining,
+            "net_edge": net_edge,
+            "entry_price": entry_price,
+            "market_price_at_decision": payload.get("market_price"),
+            "shadow_decision": payload.get("shadow_decision"),
+            "live_decision": payload.get("decision"),
+            "live_skip_reason": payload.get("skip_reason"),  # why real trade didn't happen
+            "resolved": resolved_outcome is not None,
+            "outcome": resolved_outcome,
+        }
+
+        # Compute PnL if resolved
+        if resolved_outcome in ("win", "loss") and entry_price is not None:
+            # Assume $1 notional: win pays (1/entry_price - 1), loss pays -(1 - entry_price)
+            if resolved_outcome == "win":
+                # paid entry_price to buy YES, received $1 on resolve
+                pnl = 1.0 - float(entry_price)
+            else:
+                pnl = -float(entry_price)
+            record["pnl_absolute"] = round(pnl, 4)
+            record["pnl_percent"] = round(pnl / 1.0 * 100, 2) if entry_price else 0.0
+        else:
+            record["pnl_absolute"] = None
+            record["pnl_percent"] = None
+
+        # Merge if same market_slug already exists (don't double-count)
+        replaced = False
+        for i, existing in enumerate(events):
+            if existing.get("market_slug") == market_slug and existing.get("timestamp") == timestamp_et:
+                merged = dict(existing)
+                merged.update({k: v for k, v in record.items() if v is not None})
+                events[i] = merged
+                replaced = True
+                break
+        if not replaced:
+            events.append(record)
+
+        with SHADOW_EARLY_TRADES_F.open("w") as f:
+            for row in events:
+                f.write(json.dumps(row) + "\n")
+
+        # Build summary
+        total = len(events)
+        resolved = [e for e in events if e.get("resolved")]
+        wins = [e for e in resolved if e.get("outcome") == "win"]
+        losses = [e for e in resolved if e.get("outcome") == "loss"]
+        pending = [e for e in events if not e.get("resolved")]
+        win_rate = len(wins) / len(resolved) if resolved else None
+        avg_net_edge = sum(e["net_edge"] for e in events if e.get("net_edge")) / max(1, len([e for e in events if e.get("net_edge")]))
+        avg_pnl = sum(e["pnl_absolute"] for e in resolved if e.get("pnl_absolute") is not None) / max(1, len(resolved))
+        avg_pnl_pct = sum(e["pnl_percent"] for e in resolved if e.get("pnl_percent") is not None) / max(1, len(resolved))
+
+        summary = {
+            "total_shadow_trades": total,
+            "resolved": len(resolved),
+            "wins": len(wins),
+            "losses": len(losses),
+            "pending": len(pending),
+            "win_rate": round(win_rate, 4) if win_rate else None,
+            "win_rate_pct": f"{win_rate:.1%}" if win_rate else "N/A",
+            "average_net_edge": round(avg_net_edge, 6) if avg_net_edge else None,
+            "average_pnl": round(avg_pnl, 4) if avg_pnl else None,
+            "average_pnl_percent": round(avg_pnl_pct, 2) if avg_pnl_pct else None,
+            "ev_per_trade": round(avg_net_edge, 6) if avg_net_edge else None,  # net_edge ≈ expected value
+            "live_skip_reasons": {
+                sr: sum(1 for e in events if e.get("live_skip_reason") == sr)
+                for sr in set(e.get("live_skip_reason") for e in events if e.get("live_skip_reason"))
+            },
+        }
+        SHADOW_EARLY_SUMMARY_F.write_text(json.dumps(summary, indent=2))
+        log(f"[BTC-SHADOW-EARLY] recorded slug={market_slug} sec={seconds_remaining} regime={regime} outcome={resolved_outcome}")
+    except Exception as e:
+        log(f"[BTC-SHADOW-ANALYTICS] {e}")
+
+
+def _write_early_live_trade(payload, execution_result=None, resolved_outcome=None):
+    """Write or update an early live trade record (regime=trend, sec_remaining > 300, LIVE EXECUTION).
+    
+    This is the LIVE execution path — records actual orders placed, not shadow.
+    execution_result: dict from executor with order_id, filled, shares, etc.
+    resolved_outcome: 'win', 'loss', or None (if market not yet resolved)
+    """
+    try:
+        REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+        events = []
+        if EARLY_LIVE_TRADES_F.exists():
+            for line in EARLY_LIVE_TRADES_F.read_text().splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    events.append(json.loads(line))
+                except Exception:
+                    continue
+
+        entry_price = payload.get("market_price") or payload.get("intended_entry_price")
+        net_edge = payload.get("net_edge")
+        market_slug = payload.get("market_slug")
+        regime = payload.get("regime")
+        confidence = payload.get("confidence")
+        seconds_remaining = payload.get("seconds_remaining")
+        timestamp_et = payload.get("timestamp_et")
+        yes_price = payload.get("yes_price")
+        no_price = payload.get("no_price")
+        
+        # Execution results
+        exec_result = execution_result or {}
+        order_id = exec_result.get("order_id")
+        filled = exec_result.get("filled", False)
+        shares = exec_result.get("shares")
+        size_usd = exec_result.get("size_usd")
+        actual_fill_price = exec_result.get("actual_fill_price") or entry_price
+        execution_outcome = "filled" if filled else ("cancelled" if exec_result.get("cancelled") else "failed")
+
+        # Build record
+        record = {
+            "timestamp": timestamp_et,
+            "market_slug": market_slug,
+            "regime": regime,
+            "confidence": round(confidence, 4) if confidence else None,
+            "seconds_remaining": seconds_remaining,
+            "net_edge": round(net_edge, 6) if net_edge else None,
+            "yes_price": round(yes_price, 4) if yes_price else None,
+            "no_price": round(no_price, 4) if no_price else None,
+            "entry_price": round(entry_price, 4) if entry_price else None,
+            "size_usd": round(size_usd, 2) if size_usd else None,
+            "shares": shares,
+            "order_id": order_id,
+            "execution_outcome": execution_outcome,
+            "resolved": resolved_outcome is not None,
+            "outcome": resolved_outcome,
+        }
+
+        # Compute PnL if resolved
+        if resolved_outcome in ("win", "loss") and actual_fill_price is not None and size_usd is not None:
+            # PnL = size_usd * (1/entry_price - 1) for win, -size_usd for loss
+            if resolved_outcome == "win":
+                pnl = size_usd * (1.0 / float(actual_fill_price) - 1.0)
+            else:
+                pnl = -size_usd
+            record["pnl_absolute"] = round(pnl, 4)
+            record["pnl_percent"] = round(pnl / size_usd * 100, 2) if size_usd else 0.0
+        else:
+            record["pnl_absolute"] = None
+            record["pnl_percent"] = None
+
+        # Merge if same market_slug + timestamp already exists
+        replaced = False
+        for i, existing in enumerate(events):
+            if existing.get("market_slug") == market_slug and existing.get("timestamp") == timestamp_et:
+                merged = dict(existing)
+                merged.update({k: v for k, v in record.items() if v is not None})
+                events[i] = merged
+                replaced = True
+                break
+        if not replaced:
+            events.append(record)
+
+        with EARLY_LIVE_TRADES_F.open("w") as f:
+            for row in events:
+                f.write(json.dumps(row) + "\n")
+
+        # FIRST TRADE FULL LIFECYCLE NOTIFICATION
+        # Send complete lifecycle for the very first early_live trade only
+        if (not _state.get("early_live_first_trade_notified") and 
+            order_id and 
+            execution_outcome == "filled" and
+            regime == "trend"):
+            
+            _state["early_live_first_trade_notified"] = True
+            _state["early_live_first_order_id"] = order_id
+            
+            # Build full lifecycle message
+            lifecycle_msg = (
+                f"🌮 [EARLY_LIVE] FIRST TRADE — FULL LIFECYCLE\n\n"
+                f"• timestamp: {timestamp_et}\n"
+                f"• sec_remaining: {seconds_remaining}\n"
+                f"• regime: {regime}\n"
+                f"• net_edge: {round(net_edge, 6) if net_edge else 'N/A'}\n"
+                f"• confidence: {round(confidence, 4) if confidence else 'N/A'}\n"
+                f"• yes_price: {round(yes_price, 4) if yes_price else 'N/A'}\n"
+                f"• no_price: {round(no_price, 4) if no_price else 'N/A'}\n"
+                f"• entry_price: {round(entry_price, 4) if entry_price else 'N/A'}\n"
+                f"• size_usd: ${round(size_usd, 2) if size_usd else 'N/A'}\n"
+                f"• shares: {shares:.2f}\n"
+                f"• order_id: {order_id}\n"
+                f"• status: posted → filled\n"
+                f"• final_outcome: PENDING (will update on resolution)\n\n"
+                f"PATH: early_live (NOT normal BTC-MAKER)"
+            )
+            tg(lifecycle_msg)
+            log(f"[BTC-EARLY-LIVE] First trade full lifecycle notification sent for order_id={order_id}")
+
+        # Build summary
+        total = len(events)
+        resolved = [e for e in events if e.get("resolved")]
+        wins = [e for e in resolved if e.get("outcome") == "win"]
+        losses = [e for e in resolved if e.get("outcome") == "loss"]
+        pending = [e for e in events if not e.get("resolved")]
+        filled_count = sum(1 for e in events if e.get("execution_outcome") == "filled")
+        win_rate = len(wins) / len(resolved) if resolved else None
+        avg_net_edge = sum(e["net_edge"] for e in events if e.get("net_edge")) / max(1, len([e for e in events if e.get("net_edge")]))
+        avg_pnl = sum(e["pnl_absolute"] for e in resolved if e.get("pnl_absolute") is not None) / max(1, len(resolved))
+        avg_pnl_pct = sum(e["pnl_percent"] for e in resolved if e.get("pnl_percent") is not None) / max(1, len(resolved))
+
+        summary = {
+            "total_early_live_trades": total,
+            "filled": filled_count,
+            "resolved": len(resolved),
+            "wins": len(wins),
+            "losses": len(losses),
+            "pending": len(pending),
+            "win_rate": round(win_rate, 4) if win_rate else None,
+            "win_rate_pct": f"{win_rate:.1%}" if win_rate else "N/A",
+            "average_net_edge": round(avg_net_edge, 6) if avg_net_edge else None,
+            "average_pnl": round(avg_pnl, 4) if avg_pnl else None,
+            "average_pnl_percent": round(avg_pnl_pct, 2) if avg_pnl_pct else None,
+            "ev_per_trade": round(avg_net_edge, 6) if avg_net_edge else None,
+        }
+        EARLY_LIVE_SUMMARY_F.write_text(json.dumps(summary, indent=2))
+        log(f"[BTC-EARLY-LIVE] recorded slug={market_slug} sec={seconds_remaining} regime={regime} outcome={resolved_outcome} pnl={record['pnl_absolute']}")
+    except Exception as e:
+        log(f"[BTC-EARLY-LIVE-ANALYTICS] {e}")
+
+
+def _resolve_early_live_trades():
+    """Resolve pending early live trades against market resolutions."""
+    try:
+        if not EARLY_LIVE_TRADES_F.exists():
+            return
+        import sqlite3
+        conn = sqlite3.connect(str(JOURNAL_DB))
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT DISTINCT market_slug FROM edge_events WHERE engine='btc15m' AND regime='trend' AND seconds_remaining > 300").fetchall()
+        conn.close()
+        slug_set = {r["market_slug"] for r in rows}
+        if not slug_set:
+            return
+        # Load resolutions
+        res_file = Path("/tmp/market_resolutions.json")
+        if not res_file.exists():
+            return
+        resolutions = json.loads(res_file.read_text())
+        updated = False
+        events = []
+        for line in EARLY_LIVE_TRADES_F.read_text().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                events.append(json.loads(line))
+            except Exception:
+                continue
+        
+        # Resolve each event
+        for e in events:
+            slug = e.get("market_slug")
+            if not slug or slug not in resolutions:
+                continue
+            if e.get("resolved"):
+                continue
+            res = resolutions[slug]
+            if not res.get("closed"):
+                continue
+            yes_r = res.get("yes_resolved")
+            if yes_r is None:
+                continue
+            # Determine outcome
+            outcome = "win" if yes_r == "1" else "loss"
+            e["resolved"] = True
+            e["outcome"] = outcome
+            # Recompute PnL
+            entry_price = e.get("entry_price")
+            size_usd = e.get("size_usd")
+            if entry_price is not None and size_usd is not None:
+                if outcome == "win":
+                    pnl = size_usd * (1.0 / float(entry_price) - 1.0)
+                else:
+                    pnl = -size_usd
+                e["pnl_absolute"] = round(pnl, 4)
+                e["pnl_percent"] = round(pnl / size_usd * 100, 2) if size_usd else 0.0
+            updated = True
+        
+        if updated:
+            with EARLY_LIVE_TRADES_F.open("w") as f:
+                for row in events:
+                    f.write(json.dumps(row) + "\n")
+            
+            # FIRST TRADE FINAL OUTCOME NOTIFICATION
+            # Check if the first tracked trade just resolved
+            first_order_id = _state.get("early_live_first_order_id")
+            if first_order_id:
+                for e in events:
+                    if e.get("order_id") == first_order_id and e.get("resolved") and e.get("outcome"):
+                        outcome = e.get("outcome")
+                        pnl_abs = e.get("pnl_absolute")
+                        pnl_pct = e.get("pnl_percent")
+                        
+                        final_msg = (
+                            f"🌮 [EARLY_LIVE] FIRST TRADE — FINAL OUTCOME\n\n"
+                            f"• order_id: {first_order_id}\n"
+                            f"• final_outcome: {outcome.upper()}\n"
+                            f"• pnl_absolute: ${pnl_abs:.4f}\n"
+                            f"• pnl_percent: {pnl_pct:+.2f}%\n\n"
+                            f"PATH: early_live (NOT normal BTC-MAKER)\n\n"
+                            f"✅ Full lifecycle complete!"
+                        )
+                        tg(final_msg)
+                        log(f"[BTC-EARLY-LIVE] First trade final outcome notification sent: {outcome} pnl={pnl_abs}")
+                        break
+            
+            # Regenerate summary
+            _write_early_live_trade({"market_slug": "refresh"}, resolved_outcome=None)
+            log(f"[BTC-EARLY-LIVE-RESOLVE] resolved {sum(1 for e in events if e.get('resolved'))}/{len(events)} early live trades")
+    except Exception as e:
+        log(f"[BTC-EARLY-LIVE-RESOLVE] error: {e}")
+
+
+def _resolve_shadow_early_trades():
+    """Resolve pending shadow early trades against market resolutions."""
+    try:
+        if not SHADOW_EARLY_TRADES_F.exists():
+            return
+        import sqlite3
+        conn = sqlite3.connect(str(JOURNAL_DB))
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT DISTINCT market_slug FROM edge_events WHERE engine='btc15m' AND regime='trend' AND seconds_remaining > 300").fetchall()
+        conn.close()
+        slug_set = {r["market_slug"] for r in rows}
+        if not slug_set:
+            return
+        # Load resolutions
+        res_file = Path("/tmp/market_resolutions.json")
+        if not res_file.exists():
+            return
+        resolutions = json.loads(res_file.read_text())
+        updated = False
+        events = []
+        for line in SHADOW_EARLY_TRADES_F.read_text().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                events.append(json.loads(line))
+            except Exception:
+                continue
+        for i, e in enumerate(events):
+            if e.get("resolved"):
+                continue
+            slug = e.get("market_slug")
+            m = resolutions.get(slug, {})
+            yr = m.get("yes_resolved")
+            if yr is not None:
+                outcome = "win" if yr == 1.0 else "loss"
+                events[i]["resolved"] = True
+                events[i]["outcome"] = outcome
+                entry_price = e.get("entry_price")
+                if entry_price:
+                    events[i]["pnl_absolute"] = round(1.0 - float(entry_price), 4) if outcome == "win" else round(-float(entry_price), 4)
+                    events[i]["pnl_percent"] = round(events[i]["pnl_absolute"] / 1.0 * 100, 2)
+                updated = True
+        if updated:
+            with SHADOW_EARLY_TRADES_F.open("w") as f:
+                for row in events:
+                    f.write(json.dumps(row) + "\n")
+            log(f"[BTC-SHADOW-RESOLVE] resolved {sum(1 for e in events if e.get('resolved'))}/{len(events)} shadow early trades")
+    except Exception as e:
+        log(f"[BTC-SHADOW-RESOLVE] error: {e}")
+
+
 def log_btc_trade_decision(
     market,
     signal_type,
@@ -780,6 +1200,12 @@ def log_btc_trade_decision(
             )
         )
         _write_place_yes_analytics(payload)
+        # Shadow early trades: regime=trend AND sec_remaining > 300 AND shadow=place_yes
+        regime = payload.get("regime")
+        sec_rem = payload.get("seconds_remaining")
+        shadow = payload.get("shadow_decision")
+        if regime == "trend" and sec_rem is not None and sec_rem > 300 and shadow == "place_yes":
+            _write_shadow_early_trade(payload)
     except Exception as e:
         log(f"Edge telemetry error: {e}")
     return payload
@@ -890,6 +1316,148 @@ def maker_cancel_order(order_id):
     return {"success": result.returncode == 0, "output": result.stdout, "error": result.stderr}
 
 
+def check_early_trend_live(market, seconds_remaining, market_slug=None):
+    """Early trend live execution path (regime=trend, sec_remaining > 300).
+    
+    This is an ADDITIVE path — does NOT replace the maker window logic.
+    Executes at 25% of normal size for highest-quality early signals.
+    
+    Returns:
+        True if early live trade executed
+        False if evaluated but skipped
+        None if conditions not met (continue to normal maker path)
+    """
+    global EARLY_LIVE_DISABLED
+    
+    if not EARLY_LIVE_ENABLED or EARLY_LIVE_DISABLED:
+        return None
+    if seconds_remaining <= 300:
+        return None  # Not an early signal — let normal maker path handle it
+    
+    # One early_live trade per window max
+    if _state.get("early_live_done", False):
+        log(f"[BTC-EARLY-LIVE] early_live_done=True for this window — skipping")
+        return False
+    
+    # Build feature snapshot and score
+    try:
+        now_ts = int(time.time())
+        price_points = [(int(t), float(p)) for t, p in _state.get("btc_prices", []) if p is not None]
+        features = build_feature_snapshot(
+            price_points=price_points,
+            now_ts=now_ts,
+            best_bid=market.get("best_bid"),
+            best_ask=market.get("best_ask"),
+            depth_bids=market.get("bids"),
+            depth_asks=market.get("asks"),
+            seconds_remaining=seconds_remaining,
+        )
+        result = score_edge(features, asset="BTC", engine="btc15m")
+    except Exception as e:
+        log(f"[BTC-EARLY-LIVE] feature/score error: {e}")
+        return False
+    
+    regime = result.get("regime")
+    shadow_decision = result.get("shadow_decision")
+    net_edge = result.get("net_edge")
+    confidence = result.get("confidence")
+    yes_price = market.get("yes_price")
+    no_price = market.get("no_price")
+    
+    # Check early live conditions
+    if regime != "trend" or shadow_decision != "place_yes":
+        return False  # Evaluated but doesn't meet criteria
+    
+    # EARLY_LIVE CONFIDENCE OVERRIDE (trend regime only)
+    # Lower confidence floor from 0.20 to 0.18 for early_live path
+    EARLY_LIVE_CONF_FLOOR = 0.18
+    if confidence is not None and confidence < EARLY_LIVE_CONF_FLOOR:
+        log(f"[BTC-EARLY-LIVE] confidence {confidence:.4f} < {EARLY_LIVE_CONF_FLOOR} — skipping")
+        return False
+    
+    # Safety checks — same as maker path
+    token_price = yes_price
+    if token_price is None or token_price < 0.01:
+        log(f"[BTC-EARLY-LIVE] invalid price {token_price}, skipping")
+        return False
+    
+    if token_price > SIGNAL_MAX_ENTRY_PRICE:
+        log(f"[BTC-EARLY-LIVE] price {token_price:.4f} > max {SIGNAL_MAX_ENTRY_PRICE}, skipping")
+        return False
+    
+    # Calculate size (25% of normal snipe size)
+    # Polymarket API precision: maker=2 decimals, taker=4 decimals
+    # Round shares to 4 decimals (taker precision), size_usd to 2 decimals
+    base_size = SNIPE_DEFAULT if net_edge >= 0.02 else SNIPE_DEFAULT * 0.5
+    size_usd = round(base_size * EARLY_LIVE_SIZE_PCT, 2)
+    shares = round(size_usd / token_price, 4)  # 4 decimals for taker amount
+    
+    log(f"[BTC-EARLY-LIVE] regime={regime} sec={seconds_remaining} edge={net_edge:.4f} conf={confidence:.4f} price={token_price:.4f} size=${size_usd:.2f} shares={shares:.4f} dry={EARLY_LIVE_DRY_RUN}")
+    
+    # Gate decision
+    gate_payload = log_btc_trade_decision(
+        market=market,
+        signal_type="early_trend",
+        requested_live_decision="place_yes",
+        side="UP",
+        seconds_remaining=seconds_remaining,
+        intended_entry_price=token_price,
+        market_slug=market_slug,
+    )
+    
+    if gate_payload.get("execution_status") != "pending":
+        log(f"[BTC-EARLY-LIVE] shadow gate blocked — shadow={gate_payload.get('shadow_decision')}")
+        _state["early_live_done"] = True  # Count as attempt
+        save_state()
+        return False
+    
+    # Execute order
+    token_id = market["clob_token_id"][0] if len(market["clob_token_id"]) > 0 else ""
+    
+    if EARLY_LIVE_DRY_RUN:
+        r = {"success": True, "filled": True, "order_id": f"early_dry_{int(time.time())}", "shares": shares, "size_usd": size_usd, "actual_fill_price": token_price}
+        log(f"[BTC-EARLY-LIVE] DRY RUN — would buy {shares:.4f} shares @ {token_price:.4f}")
+    else:
+        r = place_order("BUY", shares, token_price, market["condition_id"], token_id)
+    
+    # Mark window as done after execution attempt (regardless of outcome)
+    _state["early_live_done"] = True
+    save_state()
+    
+    # Finalize
+    gate_payload = finalize_btc_trade_decision(gate_payload, r, fill_required=True, success_status="executed")
+    
+    if not r.get("success"):
+        log(f"[BTC-EARLY-LIVE] execution FAILED: {r.get('error')}")
+        # Record failure
+        gate_payload["yes_price"] = yes_price
+        gate_payload["no_price"] = no_price
+        _write_early_live_trade(gate_payload, execution_result=r, resolved_outcome=None)
+        tg(f"[BTC-EARLY-LIVE] ❌ FAILED | {shares:.4f} shares @ {token_price:.4f} | error={r.get('error', 'unknown')[:100]}")
+        # Safety: disable early path on failure, keep maker path running
+        EARLY_LIVE_DISABLED = True
+        log("[BTC-EARLY-LIVE] DISABLED due to execution failure — maker path still active")
+        return False
+    
+    # Record to early live analytics
+    gate_payload["yes_price"] = yes_price
+    gate_payload["no_price"] = no_price
+    _write_early_live_trade(gate_payload, execution_result=r, resolved_outcome=None)
+    
+    # Telegram notification — only announce FILLED if order_id present and success confirmed
+    order_id = r.get("order_id")
+    if order_id and r.get("filled"):
+        tg(f"[BTC-EARLY-LIVE] ✅ FILLED: {shares:.4f} shares @ {token_price:.4f} (${size_usd:.2f}) | order={order_id} | sec={seconds_remaining}s | edge={net_edge:.4f}")
+        log(f"[BTC-EARLY-LIVE] FILLED order_id={order_id} shares={shares:.4f} price={token_price:.4f} size=${size_usd:.2f}")
+    elif order_id:
+        tg(f"[BTC-EARLY-LIVE] 📋 POSTED (pending fill): {shares:.4f} shares @ {token_price:.4f} | order={order_id}")
+        log(f"[BTC-EARLY-LIVE] POSTED order_id={order_id} shares={shares:.4f} price={token_price:.4f} size=${size_usd:.2f}")
+    else:
+        log(f"[BTC-EARLY-LIVE] SUCCESS but no order_id returned")
+    
+    return True
+
+
 def check_maker_snipe(market, seconds_remaining, market_slug=None):
     if not MAKER_ENABLED:
         return None
@@ -958,6 +1526,11 @@ def check_maker_snipe(market, seconds_remaining, market_slug=None):
 
     if _state.get("maker_done") or oid:
         return None
+
+    # Early trend live execution path (regime=trend, sec>300)
+    early_result = check_early_trend_live(market, seconds_remaining, market_slug)
+    if early_result is not None:
+        return early_result
 
     if seconds_remaining > MAKER_START_SEC or seconds_remaining <= MAKER_CANCEL_SEC:
         log_btc_trade_decision(
@@ -1363,6 +1936,7 @@ def setup_new_window(slug, window_ts):
     _state["gabagool_no_low"] = None
     _state["gabagool_no_ts"] = 0
     _state["gabagool_window_logged"] = False
+    _state["early_live_done"] = False
     save_state()
 
     trigger_post_resolution_tasks()
@@ -1434,10 +2008,20 @@ def main():
 
         check_gabagool(market, sec_rem)
 
+        # Early trend live execution (checked first, before maker window)
+        if EARLY_LIVE_ENABLED and not EARLY_LIVE_DISABLED and sec_rem > 300:
+            check_early_trend_live(market, sec_rem, slug)
+
         if MAKER_ENABLED:
             check_maker_snipe(market, sec_rem, slug)
         elif sec_rem <= SNIPE_WINDOW and sec_rem > 5:
             check_snipe(market, sec_rem, slug)
+
+        # Resolve pending shadow early trades every ~5 min
+        _state["_shadow_resolve_counter"] = _state.get("_shadow_resolve_counter", 0) + 1
+        if _state["_shadow_resolve_counter"] % 30 == 0:
+            _resolve_shadow_early_trades()
+            _resolve_early_live_trades()
 
         time.sleep(SCAN_SEC)
 
