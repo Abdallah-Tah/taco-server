@@ -9,6 +9,7 @@ from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
 
+from edge_model import canonical_shadow_decision, decide_shadow_outcome, shadow_is_skip, shadow_is_trade
 from journal import DB_PATH
 
 
@@ -40,34 +41,32 @@ def _as_int(value):
 
 def infer_shadow_decision(row, has_shadow_decision=False):
     if has_shadow_decision:
-        decision = row.get("shadow_decision")
-        if isinstance(decision, str) and (decision.startswith("place_") or decision.startswith("skip_")):
-            return decision, row.get("shadow_skip_reason")
+        canonical = canonical_shadow_decision(row.get("shadow_decision"))
+        if canonical is not None:
+            stored_reason = row.get("shadow_skip_reason")
+            if stored_reason is not None or shadow_is_trade(canonical):
+                return canonical, stored_reason
+            inferred_decision, inferred_reason = decide_shadow_outcome(
+                net_edge=_as_float(row.get("net_edge")),
+                confidence=_as_float(row.get("confidence")),
+                regime_ok=_as_int(row.get("regime_ok")),
+                shadow_skip_reason=stored_reason,
+                spread=_as_float(row.get("spread")),
+            )
+            if shadow_is_skip(canonical):
+                return canonical, inferred_reason
+            return inferred_decision, inferred_reason
 
-    regime_ok = _as_int(row.get("regime_ok"))
     net_edge = _as_float(row.get("net_edge"))
-    if regime_ok == 0:
-        spread = _as_float(row.get("spread"))
-        if spread is not None and spread > 0.20:
-            return "skip_spread", "spread_too_wide"
-        return "skip_regime", "regime_not_ok"
-    if net_edge is None:
-        if _as_float(row.get("model_p_yes")) is not None or _as_float(row.get("model_p_no")) is not None:
-            return "skip_data", "insufficient_features"
+    if net_edge is None and _as_float(row.get("model_p_yes")) is None and _as_float(row.get("model_p_no")) is None:
         return None, None
-    if abs(net_edge) < 0.01:
-        return "skip_no_edge", "net_edge_below_floor"
-    if net_edge > 0:
-        return "place_yes", None
-    return "place_no", None
-
-
-def shadow_is_trade(shadow_decision):
-    return isinstance(shadow_decision, str) and shadow_decision.startswith("place_")
-
-
-def shadow_is_skip(shadow_decision):
-    return isinstance(shadow_decision, str) and shadow_decision.startswith("skip_")
+    return decide_shadow_outcome(
+        net_edge=net_edge,
+        confidence=_as_float(row.get("confidence")),
+        regime_ok=_as_int(row.get("regime_ok")),
+        shadow_skip_reason=row.get("shadow_skip_reason"),
+        spread=_as_float(row.get("spread")),
+    )
 
 
 def disagreement_bucket(live_decision, shadow_decision):
@@ -142,6 +141,7 @@ def load_edge_events(asset=None, limit=None, db_path=None):
         "skip_reason",
         "spread",
         "net_edge",
+        "confidence",
         "model_p_yes",
         "model_p_no",
         "regime_ok",
@@ -177,6 +177,7 @@ def build_report(rows, has_shadow_decision=False):
     shadow_skip_reasons = Counter()
     live_skip_reasons = Counter()
     quality = {k: Counter() for k in ("<0", "0_to_0.01", "0.01_to_0.02", "0.02_to_0.05", ">0.05", "null")}
+    negative_edge = Counter()
 
     for row in rows:
         asset = (row.get("asset") or "").upper()
@@ -189,6 +190,7 @@ def build_report(rows, has_shadow_decision=False):
         shadow_trade = shadow_is_trade(shadow_decision)
         shadow_skip = shadow_is_skip(shadow_decision)
         bucket = disagreement_bucket(live_decision, shadow_decision)
+        net_edge = _as_float(row.get("net_edge"))
 
         totals["events"] += 1
         if live_place:
@@ -200,6 +202,12 @@ def build_report(rows, has_shadow_decision=False):
         if shadow_skip:
             totals["shadow_skip"] += 1
         disagreement[bucket] += 1
+        if net_edge is not None and net_edge < 0:
+            negative_edge["events"] += 1
+            if shadow_trade:
+                negative_edge["shadow_trade"] += 1
+            if shadow_skip:
+                negative_edge["shadow_skip"] += 1
 
         if asset in by_asset:
             by_asset[asset]["events"] += 1
@@ -228,7 +236,7 @@ def build_report(rows, has_shadow_decision=False):
                 shadow_reason = "unknown"
             shadow_skip_reasons[shadow_reason] += 1
 
-        q = net_edge_bucket(row.get("net_edge"))
+        q = net_edge_bucket(net_edge)
         quality[q]["events"] += 1
         if live_place:
             quality[q]["live_place"] += 1
@@ -290,6 +298,11 @@ def build_report(rows, has_shadow_decision=False):
             f"live_place={quality[key]['live_place']} "
             f"shadow_trade={quality[key]['shadow_trade']}"
         )
+
+    _print_section("H. Negative Edge Guardrail")
+    print(f"negative-edge events: {negative_edge['events']}")
+    print(f"negative-edge shadow trades: {negative_edge['shadow_trade']}")
+    print(f"negative-edge shadow skips: {negative_edge['shadow_skip']}")
 
 
 def main():

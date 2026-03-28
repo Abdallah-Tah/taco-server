@@ -34,6 +34,9 @@ CREDS_FILE = Path("/home/abdaltm86/.config/openclaw/secrets.env")
 POSITIONS_F = WORK_DIR / ".poly_btc15m_positions.json"
 STATE_F = WORK_DIR / ".poly_btc15m_state.json"
 LOG_F = WORK_DIR / ".poly_btc15m.log"
+REPORTS_DIR = WORK_DIR / "reports"
+BTC_PLACE_YES_EVENTS_F = REPORTS_DIR / "btc_place_yes_events.jsonl"
+BTC_PLACE_YES_SUMMARY_F = REPORTS_DIR / "btc_place_yes_summary.json"
 
 # ── Load credentials ──────────────────────────────────────────────────────────
 def _load_env():
@@ -152,18 +155,31 @@ def log(msg):
 
 
 def tg(msg):
-    if DRY_RUN or not TELEGRAM_TOKEN or not CHAT_ID:
+    if DRY_RUN:
         return
 
     def _send():
         try:
-            requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                json={"chat_id": CHAT_ID, "text": msg},
-                timeout=10,
+            cp = subprocess.run(
+                [
+                    "openclaw",
+                    "message",
+                    "send",
+                    "--channel",
+                    "telegram",
+                    "--target",
+                    str(CHAT_ID or "7520899464"),
+                    "--message",
+                    str(msg),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
             )
-        except Exception:
-            pass
+            if cp.returncode != 0:
+                log(f"[TG-ERR] rc={cp.returncode} stderr={cp.stderr.strip()[:300]}")
+        except Exception as e:
+            log(f"[TG-ERR] {e}")
 
     threading.Thread(target=_send, daemon=True).start()
 
@@ -305,35 +321,42 @@ def log_trade(engine, direction, size_usd, entry_price, pnl, exit_type, hold_sec
     import sqlite3
 
     try:
+        timestamp_open = datetime.now(timezone.utc).isoformat()
+        timestamp_close = timestamp_open if exit_type else None
+        exit_price = entry_price if exit_type else 0.0
+        position_size = (size_usd / entry_price) if entry_price else 0.0
+        pnl_absolute = float(pnl or 0.0)
+        pnl_percent = (pnl_absolute / size_usd * 100) if size_usd else 0.0
+        hold_duration_seconds = int(hold_sec or 0)
+
         conn = sqlite3.connect(str(JOURNAL_DB))
         c = conn.cursor()
         c.execute(
             """
             INSERT INTO trades (
-                id, engine, timestamp_open, timestamp_close, asset,
+                engine, timestamp_open, timestamp_close, asset,
                 category, direction, entry_price, exit_price,
                 position_size, position_size_usd, pnl_absolute, pnl_percent,
                 exit_type, hold_duration_seconds, regime, notes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                f"btc15m_{int(time.time()*1000)}",
                 engine,
-                datetime.now(timezone.utc).isoformat(),
-                datetime.now(timezone.utc).isoformat() if exit_type else None,
+                timestamp_open,
+                timestamp_close,
                 "btc-15m",
                 "btc-updown",
                 direction,
-                entry_price,
-                entry_price if not exit_type else entry_price,
-                size_usd / entry_price if entry_price else 0,
-                size_usd,
-                pnl or 0.0,
-                (pnl / size_usd * 100) if size_usd else 0,
+                float(entry_price or 0.0),
+                float(exit_price or 0.0),
+                float(position_size),
+                float(size_usd or 0.0),
+                pnl_absolute,
+                float(pnl_percent),
                 exit_type or "open",
-                hold_sec or 0,
+                hold_duration_seconds,
                 "normal",
-                notes,
+                str(notes or ""),
             ),
         )
         conn.commit()
@@ -500,6 +523,197 @@ def should_execute_btc_trade(payload, requested_live_decision):
     return requested_live_decision == "place_yes" and payload.get("shadow_decision") == "place_yes"
 
 
+def _bucket(ep):
+    if ep is None:
+        return "unknown"
+    if ep < 0.30:
+        return "<0.30"
+    if ep < 0.50:
+        return "0.30-0.50"
+    if ep < 0.70:
+        return "0.50-0.70"
+    return "0.70+"
+
+
+def _classify_place_yes_result(payload):
+    execution_status = payload.get("execution_status")
+    skip_reason = payload.get("skip_reason")
+    if execution_status in ("filled", "executed"):
+        return "filled"
+    if execution_status in ("pending", "posted"):
+        return "posted"
+    if execution_status == "cancelled" or skip_reason == "maker_cancelled_by_deadline":
+        return "cancelled"
+    if skip_reason == "below_min_price":
+        return "below_min_price"
+    if skip_reason == "above_max_entry_price":
+        return "above_max_entry_price"
+    if execution_status == "failed":
+        return "other_failure"
+    return "blocked"
+
+
+def _compute_bucket_stats(events):
+    from collections import defaultdict
+    buckets = defaultdict(list)
+    for e in events:
+        buckets[_bucket(e.get("entry_price"))].append(e)
+
+    def make_bucket(bucket_name, evts):
+        n = len(evts)
+        if n == 0:
+            return None
+        net_edges = [e.get("net_edge") for e in evts if e.get("net_edge") is not None]
+        avg_net_edge = sum(net_edges) / len(net_edges) if net_edges else None
+        posted = sum(1 for e in evts if e.get("execution_status") in ("posted",))
+        filled = sum(1 for e in evts if e.get("execution_status") in ("filled", "executed"))
+        cancelled = sum(1 for e in evts if e.get("execution_status") == "cancelled")
+        below_min = sum(1 for e in evts if e.get("execution_status") == "below_min_price")
+        above_max = sum(1 for e in evts if e.get("execution_status") == "above_max_entry_price")
+        blocked = sum(1 for e in evts if e.get("execution_status") == "blocked")
+        other_fail = sum(1 for e in evts if e.get("execution_status") in ("failed", "other_failure"))
+        # blocked_reason breakdown
+        blocked_reasons = defaultdict(int)
+        for e in evts:
+            if e.get("execution_status") == "blocked":
+                br = e.get("blocked_reason") or "unknown"
+                blocked_reasons[br] += 1
+        return {
+            "count": n,
+            "avg_net_edge": avg_net_edge,
+            "status_breakdown": {
+                "posted": posted,
+                "filled": filled,
+                "cancelled": cancelled,
+                "below_min_price": below_min,
+                "above_max_entry_price": above_max,
+                "blocked": blocked,
+                "other_failure": other_fail,
+            },
+            "blocked_reason_breakdown": dict(blocked_reasons),
+            "execution_rate": posted / n if n else None,
+            "fill_rate": filled / posted if posted else None,
+        }
+
+    report = {}
+    for bucket_name in ["<0.30", "0.30-0.50", "0.50-0.70", "0.70+", "unknown"]:
+        bv = make_bucket(bucket_name, buckets.get(bucket_name, []))
+        if bv:
+            report[bucket_name] = bv
+    return report
+
+
+def _load_edge_event_payload(event_id):
+    if not event_id:
+        return None
+    try:
+        import sqlite3
+        conn = sqlite3.connect(str(JOURNAL_DB))
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM edge_events WHERE id = ?", (event_id,)).fetchone()
+        conn.close()
+        return dict(row) if row else None
+    except Exception:
+        return None
+
+
+def _write_place_yes_analytics(payload):
+    payload = dict(payload or {})
+    event_id = payload.get("id") or payload.get("event_id")
+    if payload.get("shadow_decision") != "place_yes":
+        hydrated = _load_edge_event_payload(event_id)
+        if hydrated and hydrated.get("shadow_decision") == "place_yes":
+            merged_payload = dict(hydrated)
+            merged_payload.update({k: v for k, v in payload.items() if v is not None})
+            payload = merged_payload
+        else:
+            return
+    try:
+        REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+        events = []
+        if BTC_PLACE_YES_EVENTS_F.exists():
+            for line in BTC_PLACE_YES_EVENTS_F.read_text().splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    events.append(json.loads(line))
+                except Exception:
+                    continue
+
+        entry_price = payload.get("intended_entry_price")
+        net_edge = payload.get("net_edge")
+        estimated_probability = None
+        expected_value = None
+        if entry_price is not None and net_edge is not None:
+            estimated_probability = float(entry_price) + float(net_edge)
+            expected_value = estimated_probability - float(entry_price)
+
+        market_price = payload.get("market_price_at_decision")
+        side = payload.get("side")
+        execution_status = _classify_place_yes_result(payload)
+        # Capture actual DB skip_reason as blocked_reason for non-executed events
+        if execution_status in ("blocked", "other_failure", None):
+            blocked_reason = payload.get("skip_reason")
+        else:
+            blocked_reason = None
+
+        record = {
+            "event_id": event_id,
+            "timestamp": payload.get("timestamp_et"),
+            "entry_price": entry_price,
+            "net_edge": net_edge,
+            "estimated_probability": estimated_probability,
+            "expected_value": expected_value,
+            "confidence": payload.get("confidence"),
+            "regime": payload.get("regime"),
+            "yes_price": market_price if side == "YES" else payload.get("yes_price"),
+            "no_price": market_price if side == "NO" else payload.get("no_price"),
+            "seconds_remaining": payload.get("seconds_remaining"),
+            "market_slug": payload.get("market_slug"),
+            "execution_status": execution_status,
+            "blocked_reason": blocked_reason,
+            "outcome": payload.get("outcome"),
+            "pnl_absolute": payload.get("pnl_absolute"),
+            "pnl_percent": payload.get("pnl_percent"),
+            "order_id": payload.get("order_id"),
+        }
+
+        replaced = False
+        for i, existing in enumerate(events):
+            if existing.get("event_id") and existing.get("event_id") == record["event_id"]:
+                merged = dict(existing)
+                merged.update({k: v for k, v in record.items() if v is not None})
+                events[i] = merged
+                replaced = True
+                break
+        if not replaced:
+            events.append(record)
+
+        with BTC_PLACE_YES_EVENTS_F.open("w") as f:
+            for row in events:
+                f.write(json.dumps(row) + "\n")
+
+        valid_ev = [e for e in events if e.get("expected_value") is not None]
+        executed = [e for e in events if e.get("outcome") in ("win", "loss") and e.get("pnl_absolute") is not None]
+        avg_ev = sum(float(e.get("expected_value") or 0.0) for e in valid_ev) / len(valid_ev) if valid_ev else 0.0
+        avg_realized = sum(float(e.get("pnl_absolute") or 0.0) for e in executed) / len(executed) if executed else None
+        summary = {
+            "total_place_yes_count": len(events),
+            "average_expected_value": avg_ev,
+            "average_realized_pnl": avg_realized,
+            "ev_vs_realized_comparison": {
+                "average_expected_value": avg_ev,
+                "average_realized_pnl": avg_realized,
+                "realized_minus_expected": (avg_realized - avg_ev) if avg_realized is not None else None,
+            },
+            "price_bucket_breakdown": _compute_bucket_stats(events),
+        }
+        BTC_PLACE_YES_SUMMARY_F.write_text(json.dumps(summary, indent=2))
+    except Exception as e:
+        log(f"[BTC-ANALYTICS] {e}")
+
+
 def log_btc_trade_decision(
     market,
     signal_type,
@@ -565,6 +779,7 @@ def log_btc_trade_decision(
                 skip_reason=payload.get("skip_reason"),
             )
         )
+        _write_place_yes_analytics(payload)
     except Exception as e:
         log(f"Edge telemetry error: {e}")
     return payload
@@ -603,6 +818,7 @@ def finalize_btc_trade_decision(payload, result=None, *, fill_required=False, su
                 skip_reason=payload.get("skip_reason"),
             )
         )
+        _write_place_yes_analytics(payload)
     except Exception as e:
         log(f"Edge telemetry finalize error: {e}")
     return payload
@@ -619,6 +835,12 @@ def update_btc_trade_decision_status(event_id, execution_status, skip_reason=Non
             execution_status=execution_status,
             skip_reason=skip_reason,
         )
+        _write_place_yes_analytics({
+            "id": event_id,
+            "shadow_decision": "place_yes",
+            "execution_status": execution_status,
+            "skip_reason": skip_reason,
+        })
         log(f"[BTC-EXEC] event_id={event_id} execution_status={execution_status} skip_reason={skip_reason}")
     except Exception as e:
         log(f"Edge telemetry status update error: {e}")
@@ -852,6 +1074,7 @@ def check_maker_snipe(market, seconds_remaining, market_slug=None):
 
     log(f"[BTC-MAKER] {direction} signal token_mid={token_price:.4f} limit={limit_price:.4f} shares={shares:.2f} dry={MAKER_DRY_RUN}")
     r = maker_place_order("BUY", shares, limit_price, market["condition_id"], token_id)
+    gate_payload["order_id"] = r.get("order_id")
 
     for line in (r.get("output") or "").splitlines():
         if line.strip() and ("[MAKER" in line or "[RESULT" in line or "[ATTEMPT" in line):

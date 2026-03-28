@@ -65,18 +65,17 @@ def fetch_redeemables():
 def log_redeem_to_journal(title, condition_id, value, tx_hash, status):
     conn = sqlite3.connect(str(JOURNAL_DB))
     c = conn.cursor()
-    tid = f"redeem_{condition_id}_{int(time.time())}"
     now = datetime.now(timezone.utc).isoformat()
     c.execute(
         """
         INSERT INTO trades (
-            id, engine, timestamp_open, timestamp_close, asset, category, direction,
+            engine, timestamp_open, timestamp_close, asset, category, direction,
             entry_price, exit_price, position_size, position_size_usd, pnl_absolute,
             pnl_percent, exit_type, hold_duration_seconds, regime, notes
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            tid, 'polymarket_redeem', now, now, title[:200], 'redeem', 'REDEEM',
+            'polymarket_redeem', now, now, title[:200], 'redeem', 'REDEEM',
             0.0, 0.0, 0.0, 0.0, float(value or 0.0), 0.0,
             status, 0, 'normal', f'condition={condition_id} tx={tx_hash}'
         )

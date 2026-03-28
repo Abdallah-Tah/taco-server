@@ -82,14 +82,36 @@ CREATE TABLE IF NOT EXISTS edge_events (
     edge_no              REAL,
     net_edge             REAL,
     confidence           REAL,
+    regime               TEXT,
     regime_ok            INTEGER,
+    adaptive_net_edge_floor REAL,
+    adaptive_confidence_floor REAL,
     skip_reason          TEXT,
     intended_entry_price REAL,
     actual_fill_price    REAL,
     slippage             REAL,
+    shadow_decision      TEXT,
+    shadow_skip_reason   TEXT,
+    execution_status     TEXT,
     decision             TEXT
 );
 """
+
+EDGE_EVENT_COLUMNS = [
+    "id", "engine", "asset", "timestamp_et", "market_slug", "market_id", "side", "signal_type",
+    "seconds_remaining", "best_bid", "best_ask", "spread", "midprice", "microprice",
+    "price_now", "price_1s_ago", "price_3s_ago", "price_5s_ago", "price_10s_ago", "price_30s_ago",
+    "ret_1s", "ret_3s", "ret_5s", "ret_10s", "ret_30s", "vol_10s", "vol_30s", "vol_60s",
+    "imbalance_1", "imbalance_3", "model_p_yes", "model_p_no", "edge_yes", "edge_no",
+    "net_edge", "confidence", "regime", "regime_ok", "adaptive_net_edge_floor", "adaptive_confidence_floor", "skip_reason", "intended_entry_price",
+    "actual_fill_price", "slippage", "shadow_decision", "shadow_skip_reason", "execution_status", "decision",
+]
+
+SOLANA_MIGRATION_COLUMNS = [
+    "id", "engine", "timestamp_open", "timestamp_close", "asset", "direction",
+    "entry_price", "exit_price", "pnl_absolute", "pnl_percent", "exit_type",
+    "hold_duration_seconds", "momentum_score", "regime",
+]
 
 
 def get_db() -> sqlite3.Connection:
@@ -99,6 +121,22 @@ def get_db() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(SCHEMA)
+
+    # Backward-compatible migrations for previously created edge_events tables.
+    edge_cols = {row["name"] for row in conn.execute("PRAGMA table_info(edge_events)").fetchall()}
+    if "regime" not in edge_cols:
+        conn.execute("ALTER TABLE edge_events ADD COLUMN regime TEXT")
+    if "adaptive_net_edge_floor" not in edge_cols:
+        conn.execute("ALTER TABLE edge_events ADD COLUMN adaptive_net_edge_floor REAL")
+    if "adaptive_confidence_floor" not in edge_cols:
+        conn.execute("ALTER TABLE edge_events ADD COLUMN adaptive_confidence_floor REAL")
+    if "shadow_decision" not in edge_cols:
+        conn.execute("ALTER TABLE edge_events ADD COLUMN shadow_decision TEXT")
+    if "shadow_skip_reason" not in edge_cols:
+        conn.execute("ALTER TABLE edge_events ADD COLUMN shadow_skip_reason TEXT")
+    if "execution_status" not in edge_cols:
+        conn.execute("ALTER TABLE edge_events ADD COLUMN execution_status TEXT")
+
     conn.commit()
     return conn
 
@@ -233,39 +271,76 @@ def log_edge_event(
     intended_entry_price: float = None,
     actual_fill_price: float = None,
     slippage: float = None,
+    execution_status: str = None,
     decision: str = None,
+    **extra_fields,
 ) -> str:
     """
     Log one edge event row. Returns the event ID.
+    Extra keys are safely ignored.
     """
     if not event_id:
         event_id = str(uuid.uuid4())
     if isinstance(regime_ok, bool):
         regime_ok = int(regime_ok)
 
+    raw_payload = {
+        "id": event_id,
+        "engine": engine,
+        "asset": asset,
+        "timestamp_et": timestamp_et,
+        "market_slug": market_slug,
+        "market_id": market_id,
+        "side": side,
+        "signal_type": signal_type,
+        "seconds_remaining": seconds_remaining,
+        "best_bid": best_bid,
+        "best_ask": best_ask,
+        "spread": spread,
+        "midprice": midprice,
+        "microprice": microprice,
+        "price_now": price_now,
+        "price_1s_ago": price_1s_ago,
+        "price_3s_ago": price_3s_ago,
+        "price_5s_ago": price_5s_ago,
+        "price_10s_ago": price_10s_ago,
+        "price_30s_ago": price_30s_ago,
+        "ret_1s": ret_1s,
+        "ret_3s": ret_3s,
+        "ret_5s": ret_5s,
+        "ret_10s": ret_10s,
+        "ret_30s": ret_30s,
+        "vol_10s": vol_10s,
+        "vol_30s": vol_30s,
+        "vol_60s": vol_60s,
+        "imbalance_1": imbalance_1,
+        "imbalance_3": imbalance_3,
+        "model_p_yes": model_p_yes,
+        "model_p_no": model_p_no,
+        "edge_yes": edge_yes,
+        "edge_no": edge_no,
+        "net_edge": net_edge,
+        "confidence": confidence,
+        "regime_ok": regime_ok,
+        "skip_reason": skip_reason,
+        "intended_entry_price": intended_entry_price,
+        "actual_fill_price": actual_fill_price,
+        "slippage": slippage,
+        "execution_status": execution_status,
+        "decision": decision,
+    }
+    raw_payload.update(extra_fields or {})
+
+    filtered_payload = {col: raw_payload.get(col) for col in EDGE_EVENT_COLUMNS}
+    placeholders = ", ".join("?" for _ in EDGE_EVENT_COLUMNS)
+    columns_csv = ", ".join(EDGE_EVENT_COLUMNS)
+    values = [filtered_payload[col] for col in EDGE_EVENT_COLUMNS]
+
     try:
         conn = get_db()
         conn.execute(
-            """
-            INSERT OR REPLACE INTO edge_events
-                (id, engine, asset, timestamp_et, market_slug, market_id, side, signal_type,
-                 seconds_remaining, best_bid, best_ask, spread, midprice, microprice,
-                 price_now, price_1s_ago, price_3s_ago, price_5s_ago, price_10s_ago, price_30s_ago,
-                 ret_1s, ret_3s, ret_5s, ret_10s, ret_30s, vol_10s, vol_30s, vol_60s,
-                 imbalance_1, imbalance_3, model_p_yes, model_p_no, edge_yes, edge_no,
-                 net_edge, confidence, regime_ok, skip_reason, intended_entry_price,
-                 actual_fill_price, slippage, decision)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """,
-            (
-                event_id, engine, asset, timestamp_et, market_slug, market_id, side, signal_type,
-                seconds_remaining, best_bid, best_ask, spread, midprice, microprice,
-                price_now, price_1s_ago, price_3s_ago, price_5s_ago, price_10s_ago, price_30s_ago,
-                ret_1s, ret_3s, ret_5s, ret_10s, ret_30s, vol_10s, vol_30s, vol_60s,
-                imbalance_1, imbalance_3, model_p_yes, model_p_no, edge_yes, edge_no,
-                net_edge, confidence, regime_ok, skip_reason, intended_entry_price,
-                actual_fill_price, slippage, decision,
-            ),
+            f"INSERT OR REPLACE INTO edge_events ({columns_csv}) VALUES ({placeholders})",
+            values,
         )
         conn.commit()
         conn.close()
@@ -274,6 +349,56 @@ def log_edge_event(
         logger.error("Failed to log edge event: %s", e)
 
     return event_id
+
+
+def update_edge_event_status(
+    event_id: str,
+    execution_status: str = None,
+    skip_reason: str = None,
+    actual_fill_price: float = None,
+    slippage: float = None,
+    decision: str = None,
+) -> bool:
+    """
+    Update execution-related fields for an existing edge event.
+    Returns True when a row was updated.
+    """
+    updates = []
+    values = []
+
+    if execution_status is not None:
+        updates.append("execution_status = ?")
+        values.append(execution_status)
+    if skip_reason is not None:
+        updates.append("skip_reason = ?")
+        values.append(skip_reason)
+    if actual_fill_price is not None:
+        updates.append("actual_fill_price = ?")
+        values.append(actual_fill_price)
+    if slippage is not None:
+        updates.append("slippage = ?")
+        values.append(slippage)
+    if decision is not None:
+        updates.append("decision = ?")
+        values.append(decision)
+
+    if not updates or not event_id:
+        return False
+
+    values.append(event_id)
+    try:
+        conn = get_db()
+        cur = conn.execute(
+            f"UPDATE edge_events SET {', '.join(updates)} WHERE id = ?",
+            values,
+        )
+        conn.commit()
+        updated = cur.rowcount > 0
+        conn.close()
+        return updated
+    except Exception as e:
+        logger.error("Failed to update edge event status: %s", e)
+        return False
 
 
 def get_trades(
@@ -355,17 +480,28 @@ def migrate_json_logs() -> int:
                 score = float(entry.get("momentum_score") or entry.get("score") or 0)
 
                 try:
+                    solana_values = {
+                        "id": trade_id,
+                        "engine": "solana",
+                        "timestamp_open": ts_open,
+                        "timestamp_close": ts_close or None,
+                        "asset": asset,
+                        "direction": direction,
+                        "entry_price": entry_price,
+                        "exit_price": exit_price or None,
+                        "pnl_absolute": pnl_absolute,
+                        "pnl_percent": pnl_percent,
+                        "exit_type": exit_type or None,
+                        "hold_duration_seconds": hold_s,
+                        "momentum_score": score,
+                        "regime": regime,
+                    }
+                    cols = ", ".join(SOLANA_MIGRATION_COLUMNS)
+                    placeholders = ", ".join("?" for _ in SOLANA_MIGRATION_COLUMNS)
+                    values = [solana_values.get(c) for c in SOLANA_MIGRATION_COLUMNS]
                     conn.execute(
-                        """
-                        INSERT OR IGNORE INTO trades
-                            (id, engine, timestamp_open, timestamp_close, asset, direction,
-                             entry_price, exit_price, pnl_absolute, pnl_percent, exit_type,
-                             hold_duration_seconds, momentum_score, regime)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-                        """,
-                        (trade_id, "solana", ts_open, ts_close or None, asset, direction,
-                         entry_price, exit_price or None, pnl_absolute, pnl_percent, exit_type or None,
-                         hold_s, score, regime),
+                        f"INSERT OR IGNORE INTO trades ({cols}) VALUES ({placeholders})",
+                        values,
                     )
                     inserted += 1
                 except sqlite3.IntegrityError:

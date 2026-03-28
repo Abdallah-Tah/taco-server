@@ -20,10 +20,11 @@ try:
     from openclaw_runtime import channel_output
 except Exception:
     channel_output = None
+from runtime_paths import SCRIPT_ROOT, TRADING_ROOT, resolve_runtime_python
 
-ROOT = Path.home() / '.openclaw' / 'workspace' / 'trading'
-VENV = ROOT / '.polymarket-venv' / 'bin' / 'python3'
-REDEEM = ROOT / 'scripts' / 'polymarket_redeem.py'
+ROOT = TRADING_ROOT
+VENV = resolve_runtime_python()
+REDEEM = SCRIPT_ROOT / 'polymarket_redeem.py'
 LOG_FILE = Path('/tmp/polymarket_auto_redeem.log')
 PID_FILE = Path('/tmp/polymarket_auto_redeem.pid')
 LOCK_FILE = Path('/tmp/polymarket_auto_redeem.lock')
@@ -119,7 +120,7 @@ def send_telegram_cha_ching(item):
         return
     title = item.get('title') or 'Polymarket redeem'
     value = float(item.get('value') or 0)
-    caption = f"💰 Redeemed ${value:.2f} back to USDC.e\n{title}"
+    caption = f"💰✅ Redeemed ${value:.2f} back to USDC.e 🎉\n{title}"
     try:
         subprocess.run([
             'openclaw', 'message', 'send',
@@ -135,7 +136,7 @@ def send_telegram_cha_ching(item):
 def send_pushcut_notification(item):
     title = item.get('title') or 'Polymarket redeem'
     value = float(item.get('value') or 0)
-    body = f"Redeemed ${value:.2f} back to USDC.e — {title}"
+    body = f"💰✅ Redeemed ${value:.2f} back to USDC.e 🎉 — {title}"
     try:
         subprocess.run([
             'curl', '-sS', '-X', 'POST',
