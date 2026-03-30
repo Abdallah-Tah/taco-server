@@ -145,18 +145,42 @@ def tg(msg):
 
 
 def trigger_post_resolution_tasks():
+    # This now runs *before* the new window setup.
     if DRY_RUN:
         return
     try:
-        subprocess.Popen([str(VENV_PY), str(WORK_DIR / 'scripts' / 'polymarket_reconcile.py')], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Run reconcile first to update the journal
+        reconcile_proc = subprocess.Popen([str(VENV_PY), str(WORK_DIR / 'scripts' / 'polymarket_reconcile.py')], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        
+        try:
+            # Wait for reconcile to finish.
+            reconcile_proc.wait(timeout=30)
+            
+            # If reconcile succeeds, now check for losses on fresh data.
+            check_consecutive_losses()
+
+        except subprocess.TimeoutExpired:
+            log("[POST-RESOLUTION] WARNING: Reconcile timed out. Skipping loss check for this cycle to avoid stale data.")
+        except Exception as e:
+            log(f"[POST-RESOLUTION] WARNING: Reconcile failed ({e}). Skipping loss check for this cycle.")
+
+        # Run redeem in the background, it's not critical for the loss check.
         subprocess.Popen([str(VENV_PY), str(WORK_DIR / 'scripts' / 'polymarket_redeem.py')], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        # Check for consecutive losses after reconcile
-        check_consecutive_losses()
+
     except Exception as e:
         log(f"[POST-RESOLUTION] task launch error: {e}")
 
 def check_consecutive_losses():
     """Check journal for consecutive losses and trigger cooldown if needed."""
+    
+    # Check if a cooldown was manually reset recently
+    if _state.get("cooldown_until", 0) < 0:
+        if time.time() < abs(_state.get("cooldown_until", 0)):
+             log("[LOSS-CHECK] cooldown manually reset, skipping check.")
+             return # Still in the lockout period from the manual reset
+        else:
+            _state["cooldown_until"] = 0 # Lockout over, reset to normal
+
     try:
         import sqlite3
         conn = sqlite3.connect(str(JOURNAL_DB))
@@ -173,11 +197,13 @@ def check_consecutive_losses():
         if len(rows) >= 3:
             # Check if all 3 are losses
             if all(float(row[0]) < 0 for row in rows):
-                _state["consecutive_losses"] = 3
-                _state["cooldown_until"] = time.time() + 1800  # 30 min
-                save_state()
-                log("[BTC-MAKER] 3 consecutive losses — 30 min cooldown")
-                tg("[BTC-MAKER] ⚠️ 3 losses in a row — pausing 30 min")
+                # Don't set cooldown if it was just manually reset
+                if _state.get("cooldown_until", 0) >= 0:
+                    _state["consecutive_losses"] = 3
+                    _state["cooldown_until"] = time.time() + 1800  # 30 min
+                    save_state()
+                    log("[BTC-MAKER] 3 consecutive losses — 30 min cooldown")
+                    tg("[BTC-MAKER] ⚠️ 3 losses in a row — pausing 30 min")
             else:
                 # Reset if not all losses
                 if _state.get("consecutive_losses", 0) > 0:
@@ -726,7 +752,8 @@ def setup_new_window(slug, window_ts):
     cutoff = int(time.time()) - 4200  # 70 minutes
     old_prices = _state.get("btc_prices", [])
     _state["btc_prices"] = [(t, p) for t, p in old_prices if t >= cutoff]
-    _state["btc_prices"].append((int(time.time()), btc_price))
+    if btc_price:
+        _state["btc_prices"].append((int(time.time()), btc_price))
     
     _state["window_ts"]       = window_ts
     _state["window_open_btc"] = btc_price
@@ -741,7 +768,7 @@ def setup_new_window(slug, window_ts):
     _state["maker_last_poll"] = 0
     _state["prev_slug"]       = slug
     save_state()
-    trigger_post_resolution_tasks()
+    # DO NOT trigger post-resolution here anymore
 
     log(f"[NEW WINDOW] ts={window_ts} BTC={btc_price} slug={slug}")
     # Window start — no telegram noise
@@ -779,6 +806,8 @@ def main():
         # New window?
         if window_ts != _state["window_ts"]:
             log(f"[CYCLE] New window detected: {slug}")
+            # Run post-resolution tasks from *previous* window before setting up new one
+            trigger_post_resolution_tasks()
             setup_new_window(slug, window_ts)
 
         # Safety
