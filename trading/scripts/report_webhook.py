@@ -171,15 +171,122 @@ class ReportWebhookHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def do_GET(self):
-        """Handle GET requests (health check)."""
+        """Handle GET requests (health check and direct report API)."""
         if self.path == "/health":
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
             self.wfile.write(json.dumps({"status": "ok"}).encode())
+        elif self.path == "/api/short-report":
+            self._send_report("short")
+        elif self.path == "/api/long-report":
+            self._send_report("long")
+        elif self.path == "/api/full-report":
+            self._send_report("full")
+        elif self.path == "/api/latest-sale":
+            self._send_json(self._get_latest_sale())
+        elif self.path == "/api/redeemed":
+            self._send_json(self._get_redeemed())
+        elif self.path == "/api/system":
+            self._send_json(self._get_system())
         else:
             self.send_response(404)
             self.end_headers()
+    
+    def _send_json(self, data):
+        """Send JSON response."""
+        try:
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(json.dumps(data).encode('utf-8'))
+        except Exception as e:
+            self.send_response(500)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": str(e)}).encode())
+
+    def _get_latest_sale(self):
+        """Return the most recent resolved trade from journal."""
+        try:
+            import sqlite3
+            db_path = str(ROOT / "journal.db")
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT engine, asset, direction, entry_price, exit_price,
+                       position_size_usd, pnl_absolute, exit_type, timestamp_close
+                FROM trades
+                WHERE timestamp_close IS NOT NULL
+                ORDER BY timestamp_close DESC LIMIT 1
+            """)
+            row = cur.fetchone()
+            conn.close()
+            if row:
+                return dict(row)
+            return {"message": "No resolved trades found"}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def _get_redeemed(self):
+        """Return recent redeemed trades."""
+        try:
+            import sqlite3
+            db_path = str(ROOT / "journal.db")
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT engine, asset, direction, entry_price, exit_price,
+                       position_size_usd, pnl_absolute, exit_type, timestamp_close
+                FROM trades
+                WHERE pnl_absolute > 0 AND timestamp_close IS NOT NULL
+                ORDER BY timestamp_close DESC LIMIT 10
+            """)
+            rows = cur.fetchall()
+            conn.close()
+            return [dict(r) for r in rows]
+        except Exception as e:
+            return {"error": str(e)}
+
+    def _get_system(self):
+        """Return system stats: host, uptime, disk, memory."""
+        try:
+            import socket, shutil
+            uptime_sec = float(open('/proc/uptime').read().split()[0])
+            uptime_h = int(uptime_sec // 3600)
+            uptime_m = int((uptime_sec % 3600) // 60)
+            disk = shutil.disk_usage('/')
+            mem_lines = open('/proc/meminfo').readlines()
+            mem = {l.split(':')[0]: int(l.split()[1]) for l in mem_lines if l.split(':')[0] in ('MemTotal','MemAvailable')}
+            return {
+                "host": socket.gethostname(),
+                "uptime": f"{uptime_h}h {uptime_m}m",
+                "disk_used_gb": round((disk.used / 1e9), 2),
+                "disk_total_gb": round((disk.total / 1e9), 2),
+                "disk_percent": round(disk.used / disk.total * 100, 1),
+                "mem_total_mb": round(mem.get('MemTotal', 0) / 1024, 1),
+                "mem_available_mb": round(mem.get('MemAvailable', 0) / 1024, 1),
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+    def _send_report(self, report_type):
+        """Send report directly for GET requests."""
+        try:
+            report = generate_report(report_type)
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/plain; charset=utf-8')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(report.encode('utf-8'))
+        except Exception as e:
+            self.send_response(500)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": str(e)}).encode())
 
 
 def run_server(port=18791):
