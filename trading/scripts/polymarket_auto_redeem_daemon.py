@@ -151,9 +151,16 @@ def send_redeem_email(item):
     title = item.get('title') or 'Polymarket redeem'
     value = float(item.get('value') or 0)
     body = f"💰 CHA-CHING! Redeemed ${value:.2f} from {title}\n"
+    # NOTE: When running under cron/nohup, PATH may not include /usr/sbin.
+    # Try PATH lookup first, then common absolute locations.
     sendmail = shutil.which('sendmail')
     if not sendmail:
-        log('[REDEEM] Email skipped: sendmail not available')
+        for candidate in ('/usr/sbin/sendmail', '/usr/bin/sendmail'):
+            if Path(candidate).exists():
+                sendmail = candidate
+                break
+    if not sendmail:
+        log('[REDEEM] Email skipped: sendmail not available (PATH missing /usr/sbin?)')
         return
     raw = f"To: {REDEEM_EMAIL_TO}\nSubject: {REDEEM_EMAIL_SUBJECT}\n\n{body}"
     try:
@@ -196,7 +203,7 @@ def main():
                             # Win - full celebration
                             log(f"[REDEEM] Claimed ${val:.2f} from {item.get('title')}")
                             send_telegram_cha_ching(item)
-                            send_redeem_email(item)
+                            # send_redeem_email(item)  # Disabled per user request
                             send_pushcut_notification(item)
                 else:
                     now = int(time.time())
