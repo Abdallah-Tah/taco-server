@@ -3,7 +3,7 @@ set -u
 
 WORK="/home/abdaltm86/.openclaw/workspace"
 TRADING="$WORK/trading"
-VENV="$WORK/.polymarket-venv/bin/python3"
+VENV="$TRADING/.polymarket-venv/bin/python3"
 [ -x "$VENV" ] || VENV="/usr/bin/python3"
 SECRETS="$HOME/.config/openclaw/secrets.env"
 STATE_DIR="/tmp/polymarket_15m_watchdog"
@@ -77,9 +77,9 @@ check_engine() {
 
   log "$name DOWN — restarting"
   if [ "$mode" = "shell" ]; then
-    nohup "$WORK/scripts/$script" >> "$logfile" 2>&1 &
+    nohup "$TRADING/scripts/$script" >> "$logfile" 2>&1 &
   else
-    nohup "$VENV" "$WORK/scripts/$script" >> "$logfile" 2>&1 &
+    nohup "$VENV" "$TRADING/scripts/$script" >> "$logfile" 2>&1 &
   fi
   local newpid=$!
   echo "$newpid" > "$pidfile"
