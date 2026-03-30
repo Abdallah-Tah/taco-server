@@ -196,6 +196,42 @@ def test_log_edge_event_nullable_fields():
     assert row["decision"] is None
 
 
+def test_log_edge_event_ignores_extra_fields():
+    from journal import get_db, log_edge_event
+    conn = get_db()
+    before = conn.execute("SELECT COUNT(*) AS c FROM edge_events").fetchone()["c"]
+    conn.close()
+
+    event_id = log_edge_event(
+        engine="polymarket",
+        asset="BTC",
+        timestamp_et="2026-03-27T12:00:00-04:00",
+        side="YES",
+        decision="TEST",
+        net_edge=0.02,
+        confidence=0.7,
+        extra_debug="ignored",
+        bogus_1=123,
+        bogus_2={"a": 1},
+    )
+
+    conn = get_db()
+    after = conn.execute("SELECT COUNT(*) AS c FROM edge_events").fetchone()["c"]
+    row = conn.execute(
+        "SELECT id, asset, decision, net_edge, confidence FROM edge_events WHERE id = ?",
+        (event_id,),
+    ).fetchone()
+    conn.close()
+
+    assert after == before + 1
+    assert row is not None
+    assert row["id"] == event_id
+    assert row["asset"] == "BTC"
+    assert row["decision"] == "TEST"
+    assert row["net_edge"] == 0.02
+    assert row["confidence"] == 0.7
+
+
 if __name__ == "__main__":
     tests = [
         test_log_trade_open,
@@ -205,6 +241,7 @@ if __name__ == "__main__":
         test_db_init_creates_edge_events,
         test_log_edge_event_insert,
         test_log_edge_event_nullable_fields,
+        test_log_edge_event_ignores_extra_fields,
     ]
     passed = failed = 0
     for t in tests:

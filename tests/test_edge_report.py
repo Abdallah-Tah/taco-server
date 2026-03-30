@@ -11,6 +11,7 @@ from edge_report import (  # noqa: E402
     is_live_place,
     is_live_skip,
     net_edge_bucket,
+    shadow_is_trade,
 )
 
 
@@ -45,6 +46,13 @@ def test_infer_shadow_decision_from_regime_and_edge():
     assert decision == "skip_no_edge"
     assert reason == "net_edge_below_floor"
 
+    decision, reason = infer_shadow_decision(
+        {"regime_ok": 1, "net_edge": -0.02},
+        has_shadow_decision=False,
+    )
+    assert decision == "skip_no_edge"
+    assert reason == "net_edge_non_positive"
+
 
 def test_disagreement_bucket_and_net_edge_bucket():
     assert disagreement_bucket("place_yes", "skip_no_edge") == "live_place_shadow_skip"
@@ -61,11 +69,18 @@ def test_disagreement_bucket_and_net_edge_bucket():
     assert net_edge_bucket(None) == "null"
 
 
+def test_shadow_trade_classification_matches_semantics():
+    assert shadow_is_trade("place_yes")
+    assert not shadow_is_trade("place_no")
+    assert not shadow_is_trade("skip_no_edge")
+
+
 if __name__ == "__main__":
     tests = [
         test_live_decision_classification,
         test_infer_shadow_decision_from_regime_and_edge,
         test_disagreement_bucket_and_net_edge_bucket,
+        test_shadow_trade_classification_matches_semantics,
     ]
     passed = failed = 0
     for t in tests:

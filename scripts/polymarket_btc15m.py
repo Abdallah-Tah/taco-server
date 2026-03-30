@@ -221,8 +221,11 @@ def trigger_post_resolution_tasks():
 
 # ── Persistence ───────────────────────────────────────────────────────────────
 def save_state():
-    with open(STATE_F, "w") as f:
+    # Atomic write: write to temp file then rename (prevents corruption from concurrent access)
+    tmp = STATE_F.with_suffix(".tmp")
+    with open(tmp, "w") as f:
         json.dump(_state, f, indent=2)
+    tmp.rename(STATE_F)  # Atomic on POSIX
 
 
 def load_state():
@@ -1937,6 +1940,8 @@ def setup_new_window(slug, window_ts):
     _state["gabagool_no_ts"] = 0
     _state["gabagool_window_logged"] = False
     _state["early_live_done"] = False
+    log(f"[NEW WINDOW] early_live_done reset to False (was {_state.get('_prev_early_live_done', 'unknown')})")
+    _state["_prev_early_live_done"] = False
     save_state()
 
     trigger_post_resolution_tasks()
@@ -1981,8 +1986,12 @@ def main():
 
         slug, _ = get_current_slug()
 
-        if window_ts != _state["window_ts"]:
-            log(f"[CYCLE] New window detected: {slug}")
+        # Detect new window by timestamp OR by slug change (handles API delay edge cases)
+        slug_changed = slug != _state.get("prev_slug")
+        ts_changed = window_ts != _state["window_ts"]
+        
+        if ts_changed or slug_changed:
+            log(f"[CYCLE] New window detected: slug_changed={slug_changed} ts_changed={ts_changed} slug={slug} prev={_state.get('prev_slug')}")
             setup_new_window(slug, window_ts)
 
         if not check_daily_limit():
@@ -2010,6 +2019,7 @@ def main():
 
         # Early trend live execution (checked first, before maker window)
         if EARLY_LIVE_ENABLED and not EARLY_LIVE_DISABLED and sec_rem > 300:
+            log(f"[BTC-EARLY] evaluating early_live for {slug} sec_rem={sec_rem}")
             check_early_trend_live(market, sec_rem, slug)
 
         if MAKER_ENABLED:

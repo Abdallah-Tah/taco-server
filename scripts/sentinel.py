@@ -4,9 +4,12 @@ import subprocess, time, json, sys, os
 from datetime import datetime, timezone
 from pathlib import Path
 
-ROOT = Path.home() / ".openclaw/workspace/trading"
+from runtime_paths import WORKSPACE_ROOT, resolve_runtime_python
+
+ROOT = WORKSPACE_ROOT / "trading"
 HEALTH_FILE = "/tmp/sentinel_health.json"
 PID_FILE = "/tmp/sentinel.pid"
+
 
 SCRIPTS = {
     "solana_sniper": "taco_trader.py",
@@ -20,8 +23,8 @@ SCRIPTS = {
 TOKEN = "8457917317:AAGtnuRix7Ei-rslwVAbfFIFJSK0UIwi0d4"
 CHAT_ID = "7520899464"
 
-RESTART_CWD = str(ROOT)
-RESTART_VENV = str(ROOT / ".polymarket-venv/bin/python3")
+RESTART_CWD = str(WORKSPACE_ROOT)
+RESTART_VENV = str(resolve_runtime_python())
 
 RESTART_CMD = {
     "solana_sniper": [RESTART_VENV, "scripts/taco_trader.py"],

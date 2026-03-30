@@ -1,0 +1,803 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<title>🌮 Taco Terminal</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css" />
+<style>
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0;
+    height: 100%; width: 100%;
+    background: #0d0d0d;
+    color: #fff;
+    font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+    overflow: hidden;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  /* ── Layout ── */
+  #app {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    height: 100dvh;
+  }
+
+  /* ── Top toolbar ── */
+  #toolbar {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 10px;
+    background: #141414;
+    border-bottom: 1px solid rgba(255,255,255,0.08);
+    flex-shrink: 0;
+    overflow-x: auto;
+    overflow-y: hidden;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+  #toolbar::-webkit-scrollbar { display: none; }
+
+  .tb-title {
+    font-size: 13px;
+    font-weight: 700;
+    color: #f97316;
+    white-space: nowrap;
+    margin-right: 4px;
+    flex-shrink: 0;
+  }
+  .tb-sep {
+    width: 1px;
+    height: 20px;
+    background: rgba(255,255,255,0.12);
+    flex-shrink: 0;
+  }
+
+  .tb-btn {
+    appearance: none;
+    border: 1px solid rgba(255,255,255,0.14);
+    background: rgba(255,255,255,0.07);
+    color: rgba(255,255,255,0.85);
+    padding: 5px 10px;
+    border-radius: 8px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+    flex-shrink: 0;
+    min-height: 32px;
+    touch-action: manipulation;
+    transition: background 0.12s, color 0.12s;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+  .tb-btn:hover  { background: rgba(255,255,255,0.15); color: #fff; }
+  .tb-btn:active { background: rgba(255,255,255,0.22); transform: scale(0.96); }
+  .tb-btn.danger { border-color: rgba(239,68,68,0.35); color: #f87171; }
+  .tb-btn.danger:hover { background: rgba(239,68,68,0.15); }
+  .tb-btn.accent { border-color: rgba(249,115,22,0.45); color: #fb923c; }
+  .tb-btn.accent:hover { background: rgba(249,115,22,0.15); }
+  .tb-btn svg { width: 13px; height: 13px; flex-shrink: 0; fill: currentColor; }
+
+  /* ── Terminal ── */
+  #terminal-wrap {
+    flex: 1;
+    overflow: hidden;
+    padding: 4px;
+  }
+  #terminal {
+    width: 100%;
+    height: 100%;
+  }
+  .xterm { height: 100%; }
+  .xterm-viewport { overflow-y: auto !important; }
+
+  /* ── Bottom quick-send bar ── */
+  #quickbar {
+    display: flex;
+    gap: 5px;
+    padding: 6px 8px;
+    background: #141414;
+    border-top: 1px solid rgba(255,255,255,0.08);
+    overflow-x: auto;
+    overflow-y: hidden;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+    flex-shrink: 0;
+  }
+  #quickbar::-webkit-scrollbar { display: none; }
+
+  /* ── Clipboard bar ── */
+  #clipboard-bar {
+    display: flex;
+    gap: 6px;
+    padding: 8px;
+    background: #1a1a1a;
+    border-top: 1px solid rgba(249,115,22,0.3);
+    flex-shrink: 0;
+  }
+  #clipboard-input {
+    flex: 1;
+    min-width: 0;
+    padding: 8px 12px;
+    border-radius: 8px;
+    border: 1px solid #444;
+    background: #0d0d0d;
+    color: #fff;
+    font-size: 14px;
+    font-family: ui-monospace, monospace;
+    outline: none;
+  }
+  #clipboard-input:focus {
+    border-color: #f97316;
+  }
+  #clipboard-paste-btn, #clipboard-send-btn {
+    padding: 8px 14px;
+    border-radius: 8px;
+    border: none;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  #clipboard-paste-btn {
+    background: #2a2a2a;
+    color: #eee;
+  }
+  #clipboard-send-btn {
+    background: #f97316;
+    color: white;
+  }
+  #clipboard-paste-btn:active, #clipboard-send-btn:active {
+    opacity: 0.8;
+  }
+  .q-btn {
+    appearance: none;
+    border: 1px solid rgba(255,255,255,0.12);
+    background: rgba(255,255,255,0.05);
+    color: rgba(255,255,255,0.75);
+    padding: 6px 12px;
+    border-radius: 20px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+    flex-shrink: 0;
+    min-height: 34px;
+    touch-action: manipulation;
+    transition: background 0.12s;
+  }
+  .q-btn:hover  { background: rgba(255,255,255,0.12); color: #fff; }
+  .q-btn:active { background: rgba(255,255,255,0.20); }
+
+  /* ── Font size control ── */
+  #font-size-display {
+    font-size: 11px;
+    color: rgba(255,255,255,0.45);
+    min-width: 26px;
+    text-align: center;
+    flex-shrink: 0;
+  }
+
+  /* ── Toast ── */
+  #toast {
+    position: fixed;
+    bottom: 60px;
+    left: 50%;
+    transform: translateX(-50%) translateY(20px);
+    background: rgba(30,30,30,0.95);
+    border: 1px solid rgba(255,255,255,0.15);
+    color: #d1fae5;
+    padding: 7px 16px;
+    border-radius: 20px;
+    font-size: 12px;
+    font-weight: 600;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.2s, transform 0.2s;
+    white-space: nowrap;
+    z-index: 999;
+  }
+  #toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+  /* Hidden mobile input bridge */
+  #mobile-input {
+    position: fixed;
+    left: -9999px;
+    top: 0;
+    width: 1px;
+    height: 1px;
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  /* ── Paste Helper Modal ── */
+  #paste-modal {
+    display: none;
+    position: fixed;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: rgba(0,0,0,0.75);
+    z-index: 9999;
+    align-items: center;
+    justify-content: center;
+  }
+  #paste-modal.show { display: flex; }
+  .paste-content {
+    background: #1a1a1a;
+    border: 1px solid rgba(255,255,255,0.15);
+    border-radius: 16px;
+    padding: 16px;
+    width: 90%;
+    max-width: 500px;
+    max-height: 70vh;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .paste-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .paste-header h2 {
+    margin: 0;
+    font-size: 16px;
+    color: #f97316;
+  }
+  .paste-close {
+    background: none;
+    border: none;
+    color: #999;
+    font-size: 24px;
+    cursor: pointer;
+    padding: 0;
+    line-height: 1;
+  }
+  #paste-textarea {
+    width: 100%;
+    min-height: 150px;
+    font-size: 16px;
+    font-family: ui-monospace, monospace;
+    border-radius: 10px;
+    border: 1px solid #444;
+    padding: 12px;
+    background: #0d0d0d;
+    color: #fff;
+    resize: vertical;
+  }
+  .paste-actions {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .paste-btn {
+    flex: 1;
+    min-width: 80px;
+    padding: 10px 14px;
+    border-radius: 10px;
+    border: none;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .paste-btn.primary { background: #f97316; color: white; }
+  .paste-btn.secondary { background: #2a2a2a; color: #eee; }
+  .paste-chips {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+  .paste-chip {
+    background: #232323;
+    border: 1px solid #3a3a3a;
+    border-radius: 999px;
+    padding: 6px 10px;
+    font-size: 12px;
+    color: #ddd;
+    cursor: pointer;
+  }
+  .paste-chip:active { background: #333; }
+
+  /* ── Connection badge ── */
+  #conn-badge {
+    font-size: 10px;
+    font-weight: 700;
+    padding: 2px 7px;
+    border-radius: 10px;
+    flex-shrink: 0;
+    letter-spacing: 0.3px;
+  }
+  #conn-badge.connected    { background: rgba(34,197,94,0.15); color: #4ade80; border: 1px solid rgba(34,197,94,0.3); }
+  #conn-badge.disconnected { background: rgba(239,68,68,0.15); color: #f87171; border: 1px solid rgba(239,68,68,0.3); }
+  #conn-badge.connecting   { background: rgba(234,179,8,0.15);  color: #facc15; border: 1px solid rgba(234,179,8,0.3); }
+</style>
+</head>
+<body>
+<div id="app">
+
+  <!-- Top toolbar -->
+  <div id="toolbar">
+    <span class="tb-title">🌮 Taco</span>
+    <div class="tb-sep"></div>
+
+    <!-- Copy -->
+    <button class="tb-btn" id="btn-copy" title="Copy selection">
+      <svg viewBox="0 0 16 16"><path d="M4 2a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h1v1a2 2 0 0 0 2 2h5a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-1V4a2 2 0 0 0-2-2H4zm0 1.5h4a.5.5 0 0 1 .5.5v1H7a2 2 0 0 0-2 2v5H4a.5.5 0 0 1-.5-.5V4a.5.5 0 0 1 .5-.5zm3 3H12a.5.5 0 0 1 .5.5v7a.5.5 0 0 1-.5.5H7a.5.5 0 0 1-.5-.5V7a.5.5 0 0 1 .5-.5z"/></svg>
+      Copy
+    </button>
+
+    <!-- Paste -->
+    <button class="tb-btn" id="btn-paste" title="Paste clipboard">
+      <svg viewBox="0 0 16 16"><path d="M4 1.5H3a2 2 0 0 0-2 2V14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V3.5a2 2 0 0 0-2-2h-1v1h1a1 1 0 0 1 1 1V14a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V3.5a1 1 0 0 1 1-1h1v-1z"/><path d="M9.5 1a.5.5 0 0 1 .5.5v1a.5.5 0 0 1-.5.5h-3a.5.5 0 0 1-.5-.5v-1a.5.5 0 0 1 .5-.5h3z"/></svg>
+      Paste
+    </button>
+
+    <!-- Paste Helper (modal) -->
+    <button class="tb-btn accent" id="btn-paste-helper" title="Open paste helper">
+      <svg viewBox="0 0 16 16"><path d="M14 1a1 1 0 0 1 1 1v12a1 1 0 0 1-1 1H2a1 1 0 0 1-1-1V2a1 1 0 0 1 1-1h12zM2 0a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V2a2 2 0 0 0-2-2H2z"/><path d="M8 4a.5.5 0 0 1 .5.5v3h3a.5.5 0 0 1 0 1h-3v3a.5.5 0 0 1-1 0v-3h-3a.5.5 0 0 1 0-1h3v-3A.5.5 0 0 1 8 4z"/></svg>
+      Paste+
+    </button>
+
+    <!-- Model Selector -->
+    <div class="tb-sep"></div>
+    <span class="tb-title" style="color: #94a3b8; font-size: 11px;">Model:</span>
+    <select class="tb-btn" id="model-selector" style="padding-right: 20px; appearance: auto;">
+      <option value="openclaw:main">OpenClaw Main</option>
+      <option value="openai/gpt-4o">GPT-4o</option>
+      <option value="openai/gpt-4o-mini">GPT-4o Mini</option>
+      <option value="anthropic/claude-3-5-sonnet">Claude 3.5 Sonnet</option>
+      <option value="google/gemini-pro-1.5">Gemini Pro 1.5</option>
+    </select>
+
+    <div class="tb-sep"></div>
+    <button class="tb-btn" id="btn-font-down" title="Decrease font size">A−</button>
+    <span id="font-size-display">16</span>
+    <button class="tb-btn" id="btn-font-up" title="Increase font size">A+</button>
+
+    <div class="tb-sep"></div>
+
+    <!-- Clear screen -->
+    <button class="tb-btn" id="btn-clear" title="Clear screen">
+      <svg viewBox="0 0 16 16"><path d="M1 2.5A1.5 1.5 0 0 1 2.5 1h3A1.5 1.5 0 0 1 7 2.5v3A1.5 1.5 0 0 1 5.5 7h-3A1.5 1.5 0 0 1 1 5.5v-3zm8 0A1.5 1.5 0 0 1 10.5 1h3A1.5 1.5 0 0 1 15 2.5v3A1.5 1.5 0 0 1 13.5 7h-3A1.5 1.5 0 0 1 9 5.5v-3zm-8 8A1.5 1.5 0 0 1 2.5 9h3A1.5 1.5 0 0 1 7 10.5v3A1.5 1.5 0 0 1 5.5 15h-3A1.5 1.5 0 0 1 1 13.5v-3zm8 0A1.5 1.5 0 0 1 10.5 9h3a1.5 1.5 0 0 1 1.5 1.5v3a1.5 1.5 0 0 1-1.5 1.5h-3A1.5 1.5 0 0 1 9 13.5v-3z"/></svg>
+      Clear
+    </button>
+
+    <!-- Scroll to bottom -->
+    <button class="tb-btn" id="btn-scroll-bottom" title="Scroll to bottom">
+      <svg viewBox="0 0 16 16"><path d="M7.646 13.854a.5.5 0 0 0 .708 0l3-3a.5.5 0 0 0-.708-.708L8.5 12.293V3.5a.5.5 0 0 0-1 0v8.793l-2.146-2.147a.5.5 0 0 0-.708.708l3 3z"/></svg>
+      Bottom
+    </button>
+
+    <!-- Keyboard toggle (mobile) -->
+    <button class="tb-btn accent" id="btn-keyboard" title="Show keyboard">
+      <svg viewBox="0 0 16 16"><path d="M14 5a1 1 0 0 1 1 1v5a1 1 0 0 1-1 1H2a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1h12zM2 4a2 2 0 0 0-2 2v5a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2H2zm1 5.5a.5.5 0 0 0 .5.5h.5a.5.5 0 0 0 0-1H3.5a.5.5 0 0 0-.5.5zm2 0a.5.5 0 0 0 .5.5h.5a.5.5 0 0 0 0-1H5.5a.5.5 0 0 0-.5.5zm2 0a.5.5 0 0 0 .5.5h.5a.5.5 0 0 0 0-1H7.5a.5.5 0 0 0-.5.5zm2 0a.5.5 0 0 0 .5.5h2a.5.5 0 0 0 0-1h-2a.5.5 0 0 0-.5.5zM3.5 7a.5.5 0 0 0 0 1h.5a.5.5 0 0 0 0-1H3.5zm2 0a.5.5 0 0 0 0 1h.5a.5.5 0 0 0 0-1H5.5zm2 0a.5.5 0 0 0 0 1h.5a.5.5 0 0 0 0-1H7.5zm2 0a.5.5 0 0 0 0 1h.5a.5.5 0 0 0 0-1H9.5zm2 0a.5.5 0 0 0 0 1h.5a.5.5 0 0 0 0-1H11.5z"/></svg>
+      Keys
+    </button>
+
+    <!-- Disconnect / Reconnect -->
+    <button class="tb-btn danger" id="btn-reconnect" title="Reconnect">
+      <svg viewBox="0 0 16 16"><path d="M8 3a5 5 0 1 0 4.546 2.914.5.5 0 0 1 .908-.417A6 6 0 1 1 8 2v1z"/><path d="M8 4.466V.534a.25.25 0 0 1 .41-.192l2.36 1.966c.12.1.12.284 0 .384L8.41 4.658A.25.25 0 0 1 8 4.466z"/></svg>
+      Reconnect
+    </button>
+
+    <div style="flex:1"></div>
+    <span id="conn-badge" class="connecting">connecting…</span>
+  </div>
+
+  <!-- Terminal -->
+  <div id="terminal-wrap">
+    <div id="terminal"></div>
+  </div>
+
+  <!-- Bottom quick-send bar -->
+  <div id="quickbar">
+    <button class="q-btn" data-send="1&#10;">1 Restart OC</button>
+    <button class="q-btn" data-send="2&#10;">2 OC Status</button>
+    <button class="q-btn" data-send="4&#10;">4 Trader</button>
+    <button class="q-btn" data-send="5&#10;">5 Live Log</button>
+    <button class="q-btn" data-send="6&#10;">6 Sys Info</button>
+    <button class="q-btn" data-send="7&#10;">7 Full Shell</button>
+    <button class="q-btn" data-send="8&#10;">8 Exit</button>
+    <button class="q-btn" data-send="q&#10;">↩ Back</button>
+    <button class="q-btn" data-send="&#3;">Ctrl+C</button>
+    <button class="q-btn" data-send="&#4;">Ctrl+D</button>
+    <button class="q-btn" data-send="&#12;">Ctrl+L</button>
+  </div>
+
+  <!-- Clipboard bar (for copy/paste from Telegram) -->
+  <div id="clipboard-bar">
+    <input type="text" id="clipboard-input" placeholder="Paste command here from Telegram..." />
+    <button id="clipboard-paste-btn" onclick="pasteFromClipboard()">📋 Paste</button>
+    <button id="clipboard-send-btn" onclick="sendClipboard()">⏎ Send</button>
+  </div>
+
+</div>
+
+<!-- Paste Helper Modal -->
+<div id="paste-modal">
+  <div class="paste-content">
+    <div class="paste-header">
+      <h2>📋 Paste & Send</h2>
+      <button class="paste-close" onclick="closePasteModal()">×</button>
+    </div>
+    <div class="paste-chips">
+      <span class="paste-chip" onclick="fillPaste('ls -la\n')">ls -la</span>
+      <span class="paste-chip" onclick="fillPaste('menu\n')">menu</span>
+      <span class="paste-chip" onclick="fillPaste('cd ~/.openclaw/workspace/trading && ls\n')">trading</span>
+      <span class="paste-chip" onclick="fillPaste('blinkstatus\n')">blinkstatus</span>
+      <span class="paste-chip" onclick="fillPaste('tail -f /tmp/taco_trader.log\n')">tail log</span>
+    </div>
+    <textarea id="paste-textarea" placeholder="Paste or type here, then tap Send..."></textarea>
+    <div class="paste-actions">
+      <button class="paste-btn primary" onclick="sendPaste()">Send</button>
+      <button class="paste-btn secondary" onclick="addEnter()">Add Enter</button>
+      <button class="paste-btn secondary" onclick="clearPaste()">Clear</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast"></div>
+<textarea id="mobile-input" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" aria-hidden="true"></textarea>
+
+<script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xterm-addon-web-links@0.9.0/lib/xterm-addon-web-links.min.js"></script>
+<script>
+(function () {
+  // ── xterm setup ──────────────────────────────────────────────
+  let fontSize = parseInt(localStorage.getItem('tt-fontsize') || '16', 10);
+
+  const term = new Terminal({
+    fontSize,
+    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace',
+    theme: {
+      background: '#0d0d0d',
+      foreground: '#e5e7eb',
+      cursor: '#f97316',
+      cursorAccent: '#0d0d0d',
+      selectionBackground: 'rgba(249,115,22,0.3)',
+      black: '#1f2937', red: '#ef4444', green: '#22c55e', yellow: '#eab308',
+      blue: '#3b82f6', magenta: '#a855f7', cyan: '#06b6d4', white: '#d1d5db',
+      brightBlack: '#374151', brightRed: '#f87171', brightGreen: '#4ade80',
+      brightYellow: '#fbbf24', brightBlue: '#60a5fa', brightMagenta: '#c084fc',
+      brightCyan: '#22d3ee', brightWhite: '#f9fafb',
+    },
+    cursorBlink: true,
+    allowProposedApi: true,
+    scrollback: 2000,
+  });
+
+  const fitAddon = new FitAddon.FitAddon();
+  const webLinksAddon = new WebLinksAddon.WebLinksAddon();
+  const termWrap = document.getElementById('terminal-wrap');
+  const mobileInput = document.getElementById('mobile-input');
+  term.loadAddon(fitAddon);
+  term.loadAddon(webLinksAddon);
+  term.open(document.getElementById('terminal'));
+  fitAddon.fit();
+
+  function focusMobileInput() {
+    mobileInput.focus({ preventScroll: true });
+    setTimeout(() => mobileInput.focus({ preventScroll: true }), 50);
+  }
+
+  // ── WebSocket ─────────────────────────────────────────────────
+  const badge = document.getElementById('conn-badge');
+  let ws = null;
+  let token = '';
+
+  function connect() {
+    badge.className = 'connecting';
+    badge.textContent = 'connecting…';
+
+    // Fetch token from ttyd
+    fetch('/token').then(r => r.json()).then(d => {
+      token = d.token || '';
+      openWS();
+    }).catch(() => openWS());
+  }
+
+  function openWS() {
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    ws = new WebSocket(`${proto}://${location.host}/ws`);
+    ws.binaryType = 'arraybuffer';
+
+    ws.onopen = () => {
+      // Send auth token
+      ws.send(JSON.stringify({ AuthToken: token }));
+      badge.className = 'connected';
+      badge.textContent = 'connected';
+      // Send initial size
+      sendResize();
+      setTimeout(() => { fitAddon.fit(); sendResize(); term.focus(); }, 80);
+      setTimeout(() => { fitAddon.fit(); sendResize(); }, 300);
+    };
+
+    ws.onmessage = (evt) => {
+      const data = new Uint8Array(evt.data);
+      const cmd = String.fromCharCode(data[0]);
+      const payload = new TextDecoder().decode(data.slice(1));
+      if (cmd === '0') {
+        term.write(payload);
+      } else if (cmd === '1') {
+        document.title = payload || '🌮 Taco Terminal';
+      }
+    };
+
+    ws.onclose = () => {
+      badge.className = 'disconnected';
+      badge.textContent = 'disconnected';
+    };
+    ws.onerror = () => {
+      badge.className = 'disconnected';
+      badge.textContent = 'error';
+    };
+  }
+
+  function sendResize() {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      const msg = JSON.stringify({ columns: term.cols, rows: term.rows });
+      const buf = new Uint8Array(1 + msg.length);
+      buf[0] = '1'.charCodeAt(0);
+      for (let i = 0; i < msg.length; i++) buf[i + 1] = msg.charCodeAt(i);
+      ws.send(buf);
+    }
+  }
+
+  function sendData(text) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      const enc = new TextEncoder().encode(text);
+      const buf = new Uint8Array(1 + enc.length);
+      buf[0] = '0'.charCodeAt(0);
+      buf.set(enc, 1);
+      ws.send(buf);
+    }
+  }
+
+  // Terminal input → WebSocket
+  term.onData(sendData);
+
+  // Mobile textarea bridge: real phone keyboard + paste support
+  mobileInput.addEventListener('input', (e) => {
+    const value = e.target.value;
+    if (!value) return;
+    sendData(value);
+    e.target.value = '';
+  });
+
+  mobileInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      sendData('\r');
+      e.preventDefault();
+    } else if (e.key === 'Backspace') {
+      sendData('\x7f');
+      e.preventDefault();
+    } else if (e.key === 'Tab') {
+      sendData('\t');
+      e.preventDefault();
+    }
+  });
+
+  // Tapping terminal area should activate mobile keyboard
+  termWrap.addEventListener('touchstart', () => {
+    term.focus();
+    focusMobileInput();
+  }, { passive: true });
+  termWrap.addEventListener('click', () => {
+    term.focus();
+    focusMobileInput();
+  });
+
+  // Resize
+  const ro = new ResizeObserver(() => { fitAddon.fit(); sendResize(); });
+  ro.observe(document.getElementById('terminal-wrap'));
+  window.addEventListener('resize', () => { fitAddon.fit(); sendResize(); });
+
+  connect();
+
+  // ── Toast ─────────────────────────────────────────────────────
+  let toastTimer;
+  function toast(msg) {
+    const el = document.getElementById('toast');
+    el.textContent = msg;
+    el.classList.add('show');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => el.classList.remove('show'), 1800);
+  }
+
+  // ── Toolbar buttons ───────────────────────────────────────────
+
+  // Copy selection
+  document.getElementById('btn-copy').onclick = async () => {
+    const sel = term.getSelection();
+    if (!sel) { toast('No selection — drag to select first'); return; }
+    try {
+      await navigator.clipboard.writeText(sel);
+      toast('Copied!');
+    } catch {
+      toast('Copy failed — check browser permissions');
+    }
+  };
+
+  // Paste
+  document.getElementById('btn-paste').onclick = async () => {
+    try {
+      const text = await navigator.clipboard.readText();
+      sendData(text);
+      term.focus();
+      focusMobileInput();
+      toast('Pasted');
+    } catch {
+      mobileInput.value = '';
+      focusMobileInput();
+      toast('Use phone paste now');
+    }
+  };
+
+  // Font size
+  const fontDisplay = document.getElementById('font-size-display');
+  function setFontSize(n) {
+    fontSize = Math.max(8, Math.min(32, n));
+    term.options.fontSize = fontSize;
+    fontDisplay.textContent = fontSize;
+    localStorage.setItem('tt-fontsize', fontSize);
+    fitAddon.fit();
+    sendResize();
+  }
+  setFontSize(fontSize);
+  document.getElementById('btn-font-down').onclick = () => setFontSize(fontSize - 1);
+  document.getElementById('btn-font-up').onclick   = () => setFontSize(fontSize + 1);
+
+  // Clear screen (Ctrl+L)
+  document.getElementById('btn-clear').onclick = () => {
+    sendData('\x0c');
+    term.focus();
+  };
+
+  // Scroll to bottom
+  document.getElementById('btn-scroll-bottom').onclick = () => {
+    term.scrollToBottom();
+    term.focus();
+  };
+
+  // Keyboard (focus terminal, mobile keyboard pops up)
+  document.getElementById('btn-keyboard').onclick = () => {
+    term.focus();
+    focusMobileInput();
+    toast('Keyboard ready');
+  };
+
+  // Reconnect
+  document.getElementById('btn-reconnect').onclick = () => {
+    if (ws) ws.close();
+    term.clear();
+    setTimeout(connect, 300);
+    toast('Reconnecting…');
+  };
+
+  // ── Quick-send bar ────────────────────────────────────────────
+  document.getElementById('quickbar').addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-send]');
+    if (!btn) return;
+    // Decode HTML entities in data-send
+    const ta = document.createElement('textarea');
+    ta.innerHTML = btn.dataset.send;
+    sendData(ta.value);
+    term.focus();
+    focusMobileInput();
+  });
+
+  // Try to focus input shortly after load on mobile
+  setTimeout(() => { fitAddon.fit(); sendResize(); }, 200);
+  setTimeout(() => { focusMobileInput(); }, 500);
+
+  // ── Paste Helper Modal ────────────────────────────────────────
+  const pasteModal = document.getElementById('paste-modal');
+  const pasteTextarea = document.getElementById('paste-textarea');
+
+  document.getElementById('btn-paste-helper').onclick = () => {
+    pasteModal.classList.add('show');
+    pasteTextarea.value = '';
+    setTimeout(() => pasteTextarea.focus(), 100);
+  };
+
+  function closePasteModal() {
+    pasteModal.classList.remove('show');
+    term.focus();
+    focusMobileInput();
+  }
+
+  function fillPaste(text) {
+    pasteTextarea.value = text;
+    pasteTextarea.focus();
+  }
+
+  function sendPaste() {
+    const text = pasteTextarea.value;
+    if (!text) { toast('Nothing to send'); return; }
+    sendData(text);
+    toast('Sent!');
+    closePasteModal();
+  }
+
+  function addEnter() {
+    pasteTextarea.value += '\n';
+    pasteTextarea.focus();
+  }
+
+  function clearPaste() {
+    pasteTextarea.value = '';
+    pasteTextarea.focus();
+  }
+
+  // Close modal on outside click
+  pasteModal.addEventListener('click', (e) => {
+    if (e.target === pasteModal) closePasteModal();
+  });
+
+  // ── Clipboard Bar (for Telegram copy/paste) ─────────────────
+  const clipboardInput = document.getElementById('clipboard-input');
+
+  function pasteFromClipboard() {
+    // Try to read from clipboard
+    navigator.clipboard.readText().then(text => {
+      clipboardInput.value = text;
+      toast('Pasted from clipboard!');
+      clipboardInput.focus();
+    }).catch(() => {
+      // Fallback: focus input so user can paste manually
+      clipboardInput.value = '';
+      clipboardInput.focus();
+      toast('Tap input, then paste from iOS menu');
+    });
+  }
+
+  function sendClipboard() {
+    const text = clipboardInput.value.trim();
+    const model = document.getElementById('model-selector').value;
+    if (!text) { toast('Nothing to send'); return; }
+    
+    // Instead of sending to terminal, we send to /api/ask to get a response
+    toast('Thinking...');
+    fetch('/api/ask', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, model })
+    })
+    .then(r => r.json())
+    .then(d => {
+      if (d.ok) {
+        term.write('\r\n\x1b[1;34m[TACO]\x1b[0m ' + d.text + '\r\n');
+        toast('Done!');
+      } else {
+        toast('Error: ' + d.error);
+      }
+    })
+    .catch(e => {
+      toast('Request failed');
+      console.error(e);
+    });
+
+    clipboardInput.value = '';
+    term.focus();
+    focusMobileInput();
+  }
+
+  // Allow Enter key to send
+  clipboardInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      sendClipboard();
+    }
+  });
+
+})();
+</script>
+</body>
+</html>

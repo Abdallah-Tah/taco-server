@@ -1,0 +1,14 @@
+poly_eip712_structs-0.0.1.dist-info/INSTALLER,sha256=zuuue4knoyJ-UwPPXg8fezS7VCrXJQrAP7zeNuwvFQg,4
+poly_eip712_structs-0.0.1.dist-info/LICENSE,sha256=lf0_NHU0hfx-AFC9zAckXCwe6nOff9mJPropdhYL5cU,1066
+poly_eip712_structs-0.0.1.dist-info/METADATA,sha256=fqI-db_RWqwJQKXvSlzojs4K06Xzj2tvffBgaHTROgA,7185
+poly_eip712_structs-0.0.1.dist-info/RECORD,,
+poly_eip712_structs-0.0.1.dist-info/WHEEL,sha256=2wepM1nk4DS4eFpYrW1TTqPcoGNfHhhO_i5m4cOimbo,92
+poly_eip712_structs-0.0.1.dist-info/top_level.txt,sha256=VZmLjuBfFSGWrQXfmfysbztlpKwmkIcYtJH-VC0dros,20
+poly_eip712_structs/__init__.py,sha256=LfobzZ4Mi-WTzKYTRDMwNsU2VX5N5cMFcUyjCsQPEYY,224
+poly_eip712_structs/__pycache__/__init__.cpython-311.pyc,,
+poly_eip712_structs/__pycache__/domain_separator.cpython-311.pyc,,
+poly_eip712_structs/__pycache__/struct.cpython-311.pyc,,
+poly_eip712_structs/__pycache__/types.cpython-311.pyc,,
+poly_eip712_structs/domain_separator.py,sha256=KZ95Ic3djyhWiAM6-Haqt3yR5zVV56a36O7jsy4gIqU,1233
+poly_eip712_structs/struct.py,sha256=7qO1TADeK1HfkMnyXGXuPadbqBBSdt8n5KkcW7AR9sE,12598
+poly_eip712_structs/types.py,sha256=SZwI6wdMfW01p_LWt4BrhND4dB3Q-bB_Ugc_n3WQG2E,8527

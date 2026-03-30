@@ -25,6 +25,10 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+VENDOR_DIR = Path(__file__).resolve().parent / ".vendor"
+if VENDOR_DIR.exists():
+    sys.path.insert(0, str(VENDOR_DIR))
+
 DATA_API = "https://data-api.polymarket.com"
 
 # ─── Dependencies ───

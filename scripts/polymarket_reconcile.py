@@ -9,17 +9,18 @@ from zoneinfo import ZoneInfo
 from pathlib import Path
 
 import requests
+from runtime_paths import SCRIPT_ROOT, TRADING_ROOT, resolve_runtime_python
 
 GAMMA = 'https://gamma-api.polymarket.com/markets?slug={slug}'
 ACTIVITY_API = 'https://data-api.polymarket.com/activity'
 TRADES_API = 'https://data-api.polymarket.com/trades'
 POSITIONS_API = 'https://data-api.polymarket.com/positions?user={user}'
 
-ROOT = Path.home() / '.openclaw' / 'workspace' / 'trading'
+ROOT = TRADING_ROOT
 SECRETS = Path.home() / '.config' / 'openclaw' / 'secrets.env'
 JOURNAL_DB = ROOT / 'journal.db'
-VENV = ROOT / '.polymarket-venv' / 'bin' / 'python3'
-EXECUTOR = ROOT / 'scripts' / 'polymarket_executor.py'
+VENV = resolve_runtime_python()
+EXECUTOR = SCRIPT_ROOT / 'polymarket_executor.py'
 WINDOW_SEC = 900
 LOCAL_TZ = ZoneInfo('America/New_York')
 

@@ -23,14 +23,17 @@ import requests
 from zoneinfo import ZoneInfo
 from edge_features import build_feature_snapshot
 from edge_model import score_edge
+from runtime_paths import resolve_runtime_python
 
 # ── Paths & creds ──────────────────────────────────────────────────────────────
-WORK_DIR      = Path("/home/abdaltm86/.openclaw/workspace/trading")
+ROOT_DIR      = Path("/home/abdaltm86/.openclaw/workspace")
+SCRIPT_DIR    = ROOT_DIR / "scripts"
+WORK_DIR      = ROOT_DIR / "trading"
 JOURNAL_DB    = WORK_DIR / "journal.db"
 CREDS_FILE    = Path("/home/abdaltm86/.config/openclaw/secrets.env")
-POSITIONS_F  = WORK_DIR / ".poly_eth15m_positions.json"
+POSITIONS_F   = WORK_DIR / ".poly_eth15m_positions.json"
 STATE_F       = WORK_DIR / ".poly_eth15m_state.json"
-LOG_F        = WORK_DIR / ".poly_eth15m.log"
+LOG_F         = WORK_DIR / ".poly_eth15m.log"
 
 # ── Load credentials ─────────────────────────────────────────────────────────
 def _load_env():
@@ -59,7 +62,7 @@ def _int(key, default):
 TELEGRAM_TOKEN = ENV.get("TELEGRAM_TOKEN", "8457917317:AAGtnuRix7Ei-rslwVAbfFIFJSK0UIwi0d4")
 CHAT_ID        = ENV.get("CHAT_ID",        "7520899464")
 POLY_WALLET    = ENV.get("POLY_WALLET",    "0x1a4c163a134D7154ebD5f7359919F9c439424f00")
-VENV_PY        = Path("/home/abdaltm86/.openclaw/workspace/trading/.polymarket-venv/bin/python3")
+VENV_PY        = resolve_runtime_python()
 DRY_RUN        = os.environ.get("ETH15M_DRY_RUN", ENV.get("ETH15M_DRY_RUN", "true")).lower() != "false"
 MAKER_ENABLED  = os.environ.get("ETH15M_MAKER_ENABLED", ENV.get("ETH15M_MAKER_ENABLED", "false")).lower() == "true"
 MAKER_DRY_RUN  = os.environ.get("ETH15M_MAKER_DRY_RUN", ENV.get("ETH15M_MAKER_DRY_RUN", "true")).lower() != "false"
@@ -135,8 +138,8 @@ def trigger_post_resolution_tasks():
     if DRY_RUN:
         return
     try:
-        subprocess.Popen([str(VENV_PY), str(WORK_DIR / 'scripts' / 'polymarket_reconcile.py')], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.Popen([str(VENV_PY), str(WORK_DIR / 'scripts' / 'polymarket_redeem.py')], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.Popen([str(VENV_PY), str(SCRIPT_DIR / 'polymarket_reconcile.py')], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.Popen([str(VENV_PY), str(SCRIPT_DIR / 'polymarket_redeem.py')], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception as e:
         log(f"[POST-RESOLUTION] task launch error: {e}")
 
@@ -237,7 +240,7 @@ def place_order(side, shares, price, condition_id, token_id):
     import subprocess
     cmd = [
         str(VENV_PY),
-        str(WORK_DIR / "scripts" / "polymarket_executor.py"),
+        str(SCRIPT_DIR / "polymarket_executor.py"),
         "buy_fok" if side.upper() == "BUY" else "sell",
         token_id,
         str(shares),
@@ -375,6 +378,8 @@ def build_edge_event_payload(
         "intended_entry_price": intended_entry_price,
         "actual_fill_price": actual_fill_price,
         "slippage": slippage,
+        "shadow_decision": shadow.get("shadow_decision"),
+        "shadow_skip_reason": shadow.get("shadow_skip_reason"),
         "decision": decision,
     }
 
@@ -392,7 +397,7 @@ def log_edge_decision(**kwargs):
 
 
 def maker_place_order(side, shares, price, condition_id, token_id):
-    cmd = [str(VENV_PY), str(WORK_DIR / "scripts" / "polymarket_executor.py"), "maker_buy", token_id, str(shares), str(price)]
+    cmd = [str(VENV_PY), str(SCRIPT_DIR / "polymarket_executor.py"), "maker_buy", token_id, str(shares), str(price)]
     if MAKER_DRY_RUN:
         log(f"[ETH-MAKER-DRY] {side} {shares} @{price:.4f} token={token_id}")
         return {"success": True, "dry": True, "order_id": f"dry-{int(time.time())}"}
@@ -408,7 +413,7 @@ def maker_place_order(side, shares, price, condition_id, token_id):
 
 
 def maker_order_status(order_id):
-    cmd = [str(VENV_PY), str(WORK_DIR / "scripts" / "polymarket_executor.py"), "order_status", str(order_id)]
+    cmd = [str(VENV_PY), str(SCRIPT_DIR / "polymarket_executor.py"), "order_status", str(order_id)]
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     for line in result.stdout.splitlines():
         if line.startswith('__RESULT__'):
@@ -418,7 +423,7 @@ def maker_order_status(order_id):
 
 
 def maker_verify_fill(token_id, min_size):
-    cmd = [str(VENV_PY), str(WORK_DIR / "scripts" / "polymarket_executor.py"), "verify_fill", str(token_id), str(min_size)]
+    cmd = [str(VENV_PY), str(SCRIPT_DIR / "polymarket_executor.py"), "verify_fill", str(token_id), str(min_size)]
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     for line in result.stdout.splitlines():
         if line.startswith('__RESULT__'):
@@ -428,7 +433,7 @@ def maker_verify_fill(token_id, min_size):
 
 
 def maker_cancel_order(order_id):
-    cmd = [str(VENV_PY), str(WORK_DIR / "scripts" / "polymarket_executor.py"), "cancel", str(order_id)]
+    cmd = [str(VENV_PY), str(SCRIPT_DIR / "polymarket_executor.py"), "cancel", str(order_id)]
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     return {"success": result.returncode == 0, "output": result.stdout, "error": result.stderr}
 
@@ -547,7 +552,7 @@ def check_arb(market, seconds_remaining=None, market_slug=None):
         log(f"[ETH-ARB] No arb. Combined={combined:.4f} >= {ARB_THRESHOLD}")
         log_edge_decision(
             market=market, signal_type="arb", decision="skip_no_edge",
-            seconds_remaining=seconds_remaining, skip_reason="combined_above_threshold",
+            seconds_remaining=seconds_remaining, skip_reason="arb_combined_above_threshold",
             market_slug=market_slug,
         )
         return None

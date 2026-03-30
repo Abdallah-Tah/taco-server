@@ -46,6 +46,9 @@ def test_btc_build_edge_event_payload_with_price_history():
     assert payload["model_p_yes"] is not None
     assert payload["model_p_no"] is not None
     assert payload["regime_ok"] in (0, 1)
+    assert payload["regime"] in ("trend", "chop", "unstable", "fixed")
+    assert payload["adaptive_net_edge_floor"] is not None
+    assert payload["adaptive_confidence_floor"] is not None
 
 
 def test_eth_build_edge_event_payload_skip_with_nulls():
