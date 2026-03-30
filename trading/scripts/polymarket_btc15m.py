@@ -694,11 +694,13 @@ def check_snipe(market, seconds_remaining):
         return None
     elif price >= 0.60:
         price_bucket = "mid"
-    elif price >= 0.40:
+    elif price >= SIGNAL_MIN_ENTRY_PRICE:
         price_bucket = "sweet_spot"
     else:
         price_bucket = "low"
-    
+        log(f"[SNIPE] FILTER: entry_price={price:.4f} < floor {SIGNAL_MIN_ENTRY_PRICE:.2f} (bucket={price_bucket}), skipping low price")
+        return None
+
     log(f"[SNIPE] PRICE_BUCKET: {price_bucket} (price={price:.4f})")
 
     if price > SNIPE_MAX_PRICE:
