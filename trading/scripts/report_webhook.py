@@ -220,6 +220,7 @@ class ReportWebhookHandler(BaseHTTPRequestHandler):
                        position_size_usd, pnl_absolute, exit_type, timestamp_close
                 FROM trades
                 WHERE timestamp_close IS NOT NULL
+                  AND pnl_absolute != 0
                 ORDER BY timestamp_close DESC LIMIT 1
             """)
             row = cur.fetchone()
