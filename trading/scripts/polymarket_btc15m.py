@@ -620,21 +620,18 @@ def check_maker_snipe(market, seconds_remaining):
         log(f"[BTC-MAKER] FILTER: sec_remaining={seconds_remaining}s < 15s, skipping ultra-late entry")
         return None
     
-    # Price bucket classification and filtering
-    if token_price >= 0.80:
+    # Price bucket classification and filtering — single source of truth: config vars
+    if token_price > SIGNAL_MAX_ENTRY_PRICE:
         price_bucket = "high"
-        log(f"[BTC-MAKER] FILTER: entry_price={token_price:.4f} >= 0.80 (bucket={price_bucket}), skipping high price")
+        log(f"[BTC-MAKER] FILTER: entry_price={token_price:.4f} > max {SIGNAL_MAX_ENTRY_PRICE:.2f} (bucket={price_bucket}), skipping high price")
         return None
     elif token_price >= 0.60:
         price_bucket = "mid"
-    elif token_price >= 0.40:
+    elif token_price >= SIGNAL_MIN_ENTRY_PRICE:
         price_bucket = "sweet_spot"
     else:
         price_bucket = "low"
-    
-    # Min price filter
-    if token_price < SIGNAL_MIN_ENTRY_PRICE:
-        log(f"[BTC-MAKER] entry={token_price:.4f} < min {SIGNAL_MIN_ENTRY_PRICE:.2f}, skipping")
+        log(f"[BTC-MAKER] FILTER: entry_price={token_price:.4f} < min {SIGNAL_MIN_ENTRY_PRICE:.2f} (bucket={price_bucket}), skipping low price")
         return None
     
     log(f"[BTC-MAKER] PRICE_BUCKET: {price_bucket} (price={token_price:.4f})")
@@ -646,9 +643,7 @@ def check_maker_snipe(market, seconds_remaining):
     if token_price < MAKER_MIN_PRICE:
         log(f"[BTC-MAKER] token_mid={token_price:.4f} < min {MAKER_MIN_PRICE:.4f}, skipping")
         return None
-    if token_price > SIGNAL_MAX_ENTRY_PRICE:
-        log(f"[BTC-MAKER] entry={token_price:.4f} > max {SIGNAL_MAX_ENTRY_PRICE:.4f}, skipping {direction} signal")
-        return None
+    # max already enforced at top of function via SIGNAL_MAX_ENTRY_PRICE
     limit_price = max(0.01, round(token_price - MAKER_OFFSET, 2))
     shares = max(5.0, math.floor((SNIPE_DEFAULT / max(limit_price, 0.01)) * 100) / 100)
     log(f"[BTC-MAKER] {direction} signal token_mid={token_price:.4f} limit={limit_price:.4f} shares={shares:.2f} dry={MAKER_DRY_RUN}")
@@ -785,10 +780,10 @@ def check_snipe(market, seconds_remaining):
         log(f"[SNIPE] FILTER: sec_remaining={seconds_remaining}s < 15s, skipping ultra-late entry")
         return None
     
-    # Price bucket classification and filtering
-    if price >= 0.80:
+    # Price bucket classification — single source of truth: config vars
+    if price > SIGNAL_MAX_ENTRY_PRICE:
         price_bucket = "high"
-        log(f"[SNIPE] FILTER: entry_price={price:.4f} >= 0.80 (bucket={price_bucket}), skipping high price")
+        log(f"[SNIPE] FILTER: entry_price={price:.4f} > max {SIGNAL_MAX_ENTRY_PRICE:.2f} (bucket={price_bucket}), skipping high price")
         return None
     elif price >= 0.60:
         price_bucket = "mid"
@@ -901,7 +896,7 @@ def main():
     init_active_fills_db()
     log("=" * 60)
     log(f"[BTC-15M] STARTING {'(DRY RUN)' if DRY_RUN else '(LIVE)'}")
-    log(f"[BTC-15M] Arb threshold=${ARB_THRESHOLD}, snipe delta>={SNIPE_DELTA_MIN}%, max daily loss=${MAX_DAILY_LOSS} | maker={MAKER_ENABLED} dry={MAKER_DRY_RUN} start=T-{MAKER_START_SEC} cancel=T-{MAKER_CANCEL_SEC} offset={MAKER_OFFSET}")
+    log(f"[BTC-15M] Arb threshold=${ARB_THRESHOLD}, snipe delta>={SNIPE_DELTA_MIN}%, max daily loss=${MAX_DAILY_LOSS} | min_entry={SIGNAL_MIN_ENTRY_PRICE:.2f} max_entry={SIGNAL_MAX_ENTRY_PRICE:.2f} maker={MAKER_ENABLED} dry={MAKER_DRY_RUN} start=T-{MAKER_START_SEC} cancel=T-{MAKER_CANCEL_SEC} offset={MAKER_OFFSET}")
     tg("[BTC-15M] Engine started!")
 
     while True:

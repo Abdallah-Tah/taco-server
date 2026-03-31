@@ -607,9 +607,9 @@ def check_maker_snipe(market, seconds_remaining):
         log(f"[ETH-MAKER] FILTER: sec_remaining={seconds_remaining}s < 15s, skipping ultra-late entry")
         return None
 
-    if token_price >= 0.80:
+    if token_price > SNIPE_MAX_PRICE:
         price_bucket = "high"
-        log(f"[ETH-MAKER] FILTER: entry_price={token_price:.4f} >= 0.80 (bucket={price_bucket}), skipping high price")
+        log(f"[ETH-MAKER] FILTER: entry_price={token_price:.4f} > max {SNIPE_MAX_PRICE:.2f} (bucket={price_bucket}), skipping high price")
         return None
     elif token_price >= 0.60:
         price_bucket = "mid"
@@ -617,7 +617,7 @@ def check_maker_snipe(market, seconds_remaining):
         price_bucket = "sweet_spot"
     else:
         price_bucket = "low"
-        log(f"[ETH-MAKER] FILTER: entry_price={token_price:.4f} < floor {SNIPE_MIN_PRICE:.2f} (bucket={price_bucket}), skipping low price")
+        log(f"[ETH-MAKER] FILTER: entry_price={token_price:.4f} < min {SNIPE_MIN_PRICE:.2f} (bucket={price_bucket}), skipping low price")
         return None
 
     log(f"[ETH-MAKER] PRICE_BUCKET: {price_bucket} (price={token_price:.4f})")
@@ -748,9 +748,9 @@ def check_snipe(market, seconds_remaining):
         log(f"[ETH-SNIPE] FILTER: sec_remaining={seconds_remaining}s < 15s, skipping ultra-late entry")
         return None
 
-    if price >= 0.80:
+    if price > SNIPE_MAX_PRICE:
         price_bucket = "high"
-        log(f"[ETH-SNIPE] FILTER: entry_price={price:.4f} >= 0.80 (bucket={price_bucket}), skipping high price")
+        log(f"[ETH-SNIPE] FILTER: entry_price={price:.4f} > max {SNIPE_MAX_PRICE:.2f} (bucket={price_bucket}), skipping high price")
         return None
     elif price >= 0.60:
         price_bucket = "mid"
@@ -854,7 +854,7 @@ def main():
     init_active_fills_db()
     log("=" * 60)
     log(f"[ETH-15M] STARTING {'(DRY RUN)' if DRY_RUN else '(LIVE)'}")
-    log(f"[ETH-15M] Arb threshold=${ARB_THRESHOLD}, snipe delta>={SNIPE_DELTA_MIN}%, max daily loss=${MAX_DAILY_LOSS} | maker={MAKER_ENABLED} dry={MAKER_DRY_RUN} start=T-{MAKER_START_SEC} cancel=T-{MAKER_CANCEL_SEC} offset={MAKER_OFFSET}")
+    log(f"[ETH-15M] Arb threshold=${ARB_THRESHOLD}, snipe delta>={SNIPE_DELTA_MIN}%, max daily loss=${MAX_DAILY_LOSS} | min_entry={SNIPE_MIN_PRICE:.2f} max_entry={SNIPE_MAX_PRICE:.2f} maker={MAKER_ENABLED} dry={MAKER_DRY_RUN} start=T-{MAKER_START_SEC} cancel=T-{MAKER_CANCEL_SEC} offset={MAKER_OFFSET}")
     tg("[ETH-15M] Engine started!")
 
     while True:
