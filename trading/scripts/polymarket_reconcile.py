@@ -280,34 +280,30 @@ def sync_journal(rows):
     for r in rows:
         if r['status'] not in ('RESOLVED_WON', 'RESOLVED_LOST'):
             continue
-        trade_id = f"{r['engine']}_{r['slug']}_{r['side'].lower()}"
         ts_open = r['time']
         ts_close = datetime.fromtimestamp((int(datetime.fromisoformat(ts_open).timestamp()) - (int(datetime.fromisoformat(ts_open).timestamp()) % WINDOW_SEC)) + WINDOW_SEC, tz=timezone.utc).isoformat()
         exit_price = 1.0 if r['status'] == 'RESOLVED_WON' else 0.0
         pnl = float(r['realized_pnl'] or 0.0)
         pnl_pct = (pnl / r['total_cost'] * 100) if r['total_cost'] else 0.0
-        c.execute("SELECT 1 FROM trades WHERE id = ?", (trade_id,))
-        exists = c.fetchone() is not None
-        vals = (
-            trade_id, r['engine'], ts_open, ts_close, r['slug'],
-            'poly-15m', r['side'], r['entry_price_avg'], exit_price,
-            r['total_shares'], r['total_cost'], pnl, pnl_pct,
-            'resolved', WINDOW_SEC, 'normal', f"market-reconciled {r['status']} fill_count={r['fill_count']}"
-        )
-        if exists:
+        # Use engine+asset+timestamp_open as unique key (matches UNIQUE constraint)
+        c.execute("SELECT id FROM trades WHERE engine=? AND asset=? AND timestamp_open=?", (r['engine'], r['slug'], ts_open))
+        existing = c.fetchone()
+        if existing:
+            # Update existing trade with resolution data
             c.execute("""
-                UPDATE trades SET timestamp_open=?, timestamp_close=?, entry_price=?, exit_price=?, position_size=?, position_size_usd=?,
+                UPDATE trades SET timestamp_close=?, entry_price=?, exit_price=?, position_size=?, position_size_usd=?,
                     pnl_absolute=?, pnl_percent=?, exit_type=?, hold_duration_seconds=?, notes=?
                 WHERE id=?
-            """, (ts_open, ts_close, r['entry_price_avg'], exit_price, r['total_shares'], r['total_cost'], pnl, pnl_pct, 'resolved', WINDOW_SEC, f"market-reconciled {r['status']} fill_count={r['fill_count']}", trade_id))
+            """, (ts_close, r['entry_price_avg'], exit_price, r['total_shares'], r['total_cost'], pnl, pnl_pct, 'resolved', WINDOW_SEC, f"market-reconciled {r['status']} fill_count={r['fill_count']}", existing[0]))
         else:
+            # Insert new trade (let ID auto-increment)
             c.execute("""
                 INSERT INTO trades (
-                    id, engine, timestamp_open, timestamp_close, asset, category, direction,
+                    engine, timestamp_open, timestamp_close, asset, category, direction,
                     entry_price, exit_price, position_size, position_size_usd, pnl_absolute,
                     pnl_percent, exit_type, hold_duration_seconds, regime, notes
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, vals)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (r['engine'], ts_open, ts_close, r['slug'], 'poly-15m', r['side'], r['entry_price_avg'], exit_price, r['total_shares'], r['total_cost'], pnl, pnl_pct, 'resolved', WINDOW_SEC, 'normal', f"market-reconciled {r['status']} fill_count={r['fill_count']}"))
     conn.commit()
     conn.close()
 

@@ -342,6 +342,76 @@ def log_trade(engine, direction, size_usd, entry_price, pnl, exit_type, hold_sec
         log(f"Journal error: {e}")
 
 
+def init_active_fills_db():
+    import sqlite3
+    try:
+        conn = sqlite3.connect(str(JOURNAL_DB))
+        c = conn.cursor()
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS active_fills (
+                engine TEXT NOT NULL,
+                window_ts INTEGER NOT NULL,
+                direction TEXT NOT NULL,
+                fill_timestamp TEXT NOT NULL,
+                PRIMARY KEY (engine, window_ts, direction)
+            )
+        """)
+        c.execute("""
+            CREATE INDEX IF NOT EXISTS idx_active_fills_window_dir
+            ON active_fills (window_ts, direction)
+        """)
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log(f"[ETH] active_fills init error: {e}")
+
+
+def prune_active_fills(current_window_ts):
+    import sqlite3
+    try:
+        conn = sqlite3.connect(str(JOURNAL_DB))
+        c = conn.cursor()
+        c.execute("DELETE FROM active_fills WHERE window_ts < ?", (int(current_window_ts),))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log(f"[ETH] active_fills prune error: {e}")
+
+
+def record_active_fill(engine, window_ts, direction):
+    import sqlite3
+    try:
+        if not window_ts or not direction:
+            return
+        conn = sqlite3.connect(str(JOURNAL_DB))
+        c = conn.cursor()
+        c.execute("""
+            INSERT OR REPLACE INTO active_fills (engine, window_ts, direction, fill_timestamp)
+            VALUES (?, ?, ?, ?)
+        """, (engine, int(window_ts), direction, datetime.now(timezone.utc).isoformat()))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log(f"[ETH] active_fills record error: {e}")
+
+
+def peer_has_same_direction_fill(peer_engine, window_ts, direction):
+    import sqlite3
+    try:
+        conn = sqlite3.connect(str(JOURNAL_DB))
+        c = conn.cursor()
+        c.execute("""
+            SELECT 1 FROM active_fills
+            WHERE engine=? AND window_ts=? AND direction=?
+            LIMIT 1
+        """, (peer_engine, int(window_ts), direction))
+        row = c.fetchone()
+        conn.close()
+        return bool(row)
+    except Exception as e:
+        log(f"[ETH] active_fills peer check error: {e}")
+        return False
+
 
 def maker_place_order(side, shares, price, condition_id, token_id):
     cmd = [str(VENV_PY), str(WORK_DIR / "scripts" / "polymarket_executor.py"), "maker_buy", token_id, str(shares), str(price)]
@@ -379,6 +449,40 @@ def maker_verify_fill(token_id, min_size):
     return {"filled": False, "reason": result.stderr or result.stdout or 'no_verify'}
 
 
+def _summarize_verified_fill(vf):
+    trades = vf.get('trades') or []
+    if not trades:
+        return {
+            "avg_fill_price": None,
+            "effective_cost": None,
+            "tx_hashes": [],
+            "source": vf.get("source"),
+        }
+
+    total_shares = 0.0
+    total_cost = 0.0
+    tx_hashes = []
+    for t in trades:
+        try:
+            sz = float(t.get('size') or 0)
+            px = float(t.get('price') or 0)
+            total_shares += sz
+            total_cost += sz * px
+            txh = t.get('transactionHash')
+            if txh:
+                tx_hashes.append(txh)
+        except Exception:
+            continue
+
+    avg_fill_price = (total_cost / total_shares) if total_shares > 0 else None
+    return {
+        "avg_fill_price": avg_fill_price,
+        "effective_cost": total_cost if total_shares > 0 else None,
+        "tx_hashes": tx_hashes,
+        "source": vf.get("source"),
+    }
+
+
 def maker_cancel_order(order_id):
     cmd = [str(VENV_PY), str(WORK_DIR / "scripts" / "polymarket_executor.py"), "cancel", str(order_id)]
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
@@ -401,6 +505,7 @@ def check_maker_snipe(market, seconds_remaining):
             _state['maker_done'] = True
             _state['snipe_done'] = True
             _state['consecutive_losses'] = 0
+            record_active_fill("eth15m", _state.get("window_ts"), _state.get('maker_side'))
             save_state()
             tg(f"[ETH-MAKER] FILLED order {oid}")
             return True
@@ -410,8 +515,22 @@ def check_maker_snipe(market, seconds_remaining):
                 fill_key = f"{oid}:{vf.get('filled_size')}"
                 seen = set(_state.get('maker_seen_fills', []))
                 if fill_key not in seen:
-                    log(f"[ETH-MAKER] fill verified via activity/trades size={vf.get('filled_size')}")
+                    fill_meta = _summarize_verified_fill(vf)
+                    submitted_limit = _state.get('maker_price')
+                    avg_fill_price = fill_meta.get('avg_fill_price')
+                    effective_cost = fill_meta.get('effective_cost')
+                    tx_hashes = fill_meta.get('tx_hashes') or []
+                    tx_preview = ",".join(tx_hashes[:3]) if tx_hashes else "n/a"
+                    log(
+                        f"[ETH-MAKER] fill verified via {fill_meta.get('source')} "
+                        f"size={vf.get('filled_size')} "
+                        f"submitted_limit={submitted_limit:.4f} "
+                        f"avg_fill_price={(f'{avg_fill_price:.4f}' if avg_fill_price is not None else 'n/a')} "
+                        f"effective_cost={(f'${effective_cost:.4f}' if effective_cost is not None else 'n/a')} "
+                        f"tx_hashes={tx_preview}"
+                    )
                     tg(f"[ETH-MAKER] FILL VERIFIED {vf.get('filled_size')} shares")
+                    record_active_fill("eth15m", _state.get("window_ts"), _state.get('maker_side'))
                     seen.add(fill_key)
                     _state['maker_seen_fills'] = list(seen)[-200:]
                 _state['maker_done'] = True
@@ -487,6 +606,11 @@ def check_maker_snipe(market, seconds_remaining):
         log(f"[ETH-MAKER] momentum={momentum:+.3f}% < {MOMENTUM_MIN:.3f}%, skipping (weak)")
         return None
     log(f"[ETH-MAKER] CONFIRMED {confirmations}/{SIGNAL_CONFIRM_COUNT} | momentum={momentum:+.3f}%")
+
+    current_window_ts = _state.get("window_ts")
+    if current_window_ts and peer_has_same_direction_fill("btc15m", current_window_ts, direction):
+        log(f"[ETH-MAKER] CORRELATION BLOCK: BTC already filled {direction} in window {current_window_ts}, skipping")
+        return None
 
     token_id = market['clob_token_id'][0] if direction == 'UP' else (market['clob_token_id'][1] if len(market['clob_token_id']) > 1 else '')
     token_price = market['yes_price'] if direction == 'UP' else market['no_price']
@@ -624,6 +748,11 @@ def check_snipe(market, seconds_remaining):
             log(f"[ETH-SNIPE] momentum decelerating first={delta_first:+.4f}% second={delta_second:+.4f}%, skipping")
             return None
 
+    current_window_ts = _state.get("window_ts")
+    if current_window_ts and peer_has_same_direction_fill("btc15m", current_window_ts, direction):
+        log(f"[ETH-SNIPE] CORRELATION BLOCK: BTC already filled {direction} in window {current_window_ts}, skipping")
+        return None
+
     token_id = market["clob_token_id"][0] if direction == "UP" else (market["clob_token_id"][1] if len(market["clob_token_id"]) > 1 else "")
     price    = market["yes_price"] if direction == "UP" else market["no_price"]
 
@@ -672,6 +801,7 @@ def check_snipe(market, seconds_remaining):
         tg(f"[ETH-SNIPE] NO FILL confirmed | {notes}")
         return False
     tg(f"[ETH-SNIPE] FILL CONFIRMED {r.get('filled_size', shares):.2f} shares | {notes}")
+    record_active_fill("eth15m", _state.get("window_ts"), direction)
 
     _state["snipe_done"]        = True
     _state["prev_snipe_side"]  = direction
@@ -682,6 +812,7 @@ def check_snipe(market, seconds_remaining):
 
 # ── New window setup ──────────────────────────────────────────────────────────
 def setup_new_window(slug, window_ts):
+    prune_active_fills(window_ts)
     eth_price = get_eth_price()
     if eth_price is None:
         eth_price = _state.get("window_open_eth", 0.0)
@@ -725,6 +856,7 @@ def check_daily_limit():
 def main():
     global _state
     load_state()
+    init_active_fills_db()
     log("=" * 60)
     log(f"[ETH-15M] STARTING {'(DRY RUN)' if DRY_RUN else '(LIVE)'}")
     log(f"[ETH-15M] Arb threshold=${ARB_THRESHOLD}, snipe delta>={SNIPE_DELTA_MIN}%, max daily loss=${MAX_DAILY_LOSS} | maker={MAKER_ENABLED} dry={MAKER_DRY_RUN} start=T-{MAKER_START_SEC} cancel=T-{MAKER_CANCEL_SEC} offset={MAKER_OFFSET}")

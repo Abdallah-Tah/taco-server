@@ -352,6 +352,77 @@ def log_trade(engine, direction, size_usd, entry_price, pnl, exit_type, hold_sec
         log(f"Journal error: {e}")
 
 
+def init_active_fills_db():
+    import sqlite3
+    try:
+        conn = sqlite3.connect(str(JOURNAL_DB))
+        c = conn.cursor()
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS active_fills (
+                engine TEXT NOT NULL,
+                window_ts INTEGER NOT NULL,
+                direction TEXT NOT NULL,
+                fill_timestamp TEXT NOT NULL,
+                PRIMARY KEY (engine, window_ts, direction)
+            )
+        """)
+        c.execute("""
+            CREATE INDEX IF NOT EXISTS idx_active_fills_window_dir
+            ON active_fills (window_ts, direction)
+        """)
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log(f"[BTC] active_fills init error: {e}")
+
+
+def prune_active_fills(current_window_ts):
+    import sqlite3
+    try:
+        conn = sqlite3.connect(str(JOURNAL_DB))
+        c = conn.cursor()
+        c.execute("DELETE FROM active_fills WHERE window_ts < ?", (int(current_window_ts),))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log(f"[BTC] active_fills prune error: {e}")
+
+
+def record_active_fill(engine, window_ts, direction):
+    import sqlite3
+    try:
+        if not window_ts or not direction:
+            return
+        conn = sqlite3.connect(str(JOURNAL_DB))
+        c = conn.cursor()
+        c.execute("""
+            INSERT OR REPLACE INTO active_fills (engine, window_ts, direction, fill_timestamp)
+            VALUES (?, ?, ?, ?)
+        """, (engine, int(window_ts), direction, datetime.now(timezone.utc).isoformat()))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log(f"[BTC] active_fills record error: {e}")
+
+
+def peer_has_same_direction_fill(peer_engine, window_ts, direction):
+    import sqlite3
+    try:
+        conn = sqlite3.connect(str(JOURNAL_DB))
+        c = conn.cursor()
+        c.execute("""
+            SELECT 1 FROM active_fills
+            WHERE engine=? AND window_ts=? AND direction=?
+            LIMIT 1
+        """, (peer_engine, int(window_ts), direction))
+        row = c.fetchone()
+        conn.close()
+        return bool(row)
+    except Exception as e:
+        log(f"[BTC] active_fills peer check error: {e}")
+        return False
+
+
 
 def maker_place_order(side, shares, price, condition_id, token_id):
     cmd = [str(VENV_PY), str(WORK_DIR / "scripts" / "polymarket_executor.py"), "maker_buy", token_id, str(shares), str(price)]
@@ -413,6 +484,7 @@ def check_maker_snipe(market, seconds_remaining):
             _state['maker_done'] = True
             _state['snipe_done'] = True
             _state["consecutive_losses"] = 0  # Reset on successful fill
+            record_active_fill("btc15m", _state.get("window_ts"), _state.get('maker_side'))
             save_state()
             tg(f"[BTC-MAKER] FILLED order {oid}")
             log_trade("btc15m", _state.get('maker_side', 'UP'), 
@@ -432,13 +504,14 @@ def check_maker_snipe(market, seconds_remaining):
                     log(f"[BTC-MAKER] fill verified via activity/trades size={vf.get('filled_size')}")
                     tg(f"[BTC-MAKER] FILL VERIFIED {vf.get('filled_size')} shares")
                     # Log verified fill to journal
-                    log_trade("btc15m", _state.get('maker_side', 'UP'),
+                    log_trade("btc15m", _state.get('maker_side'),
                         vf.get('filled_size', 0) * _state.get('maker_price', 0),
                         _state.get('maker_price', 0), 0, 'filled',
                         int(time.time()) - _state.get('maker_last_poll', int(time.time())),
                         notes=f"maker_verify oid={oid} size={vf.get('filled_size')}",
                         sec_remaining=_state.get('maker_sec_remaining'),
                         price_bucket=_state.get('maker_price_bucket'))
+                    record_active_fill("btc15m", _state.get("window_ts"), _state.get('maker_side'))
                     seen.add(fill_key)
                     _state['maker_seen_fills'] = list(seen)[-200:]
                 _state['maker_done'] = True
@@ -518,6 +591,10 @@ def check_maker_snipe(market, seconds_remaining):
         log(f"[BTC-MAKER] momentum={momentum:+.3f}% < {MOMENTUM_MIN:.3f}%, skipping (weak)")
         return None
     log(f"[BTC-MAKER] CONFIRMED {confirmations}/{SIGNAL_CONFIRM_COUNT} | momentum={momentum:+.3f}%")
+    current_window_ts = _state.get("window_ts")
+    if current_window_ts and peer_has_same_direction_fill("eth15m", current_window_ts, direction):
+        log(f"[BTC-MAKER] CORRELATION BLOCK: ETH already filled {direction} in window {current_window_ts}, skipping")
+        return None
     token_id = market['clob_token_id'][0] if direction == 'UP' else (market['clob_token_id'][1] if len(market['clob_token_id']) > 1 else '')
     token_price = market['yes_price'] if direction == 'UP' else market['no_price']
     
@@ -677,6 +754,11 @@ def check_snipe(market, seconds_remaining):
         log(f"[SNIPE] Delta {delta_pct:+.3f}% too small, skipping")
         return None
 
+    current_window_ts = _state.get("window_ts")
+    if current_window_ts and peer_has_same_direction_fill("eth15m", current_window_ts, direction):
+        log(f"[BTC-SNIPE] CORRELATION BLOCK: ETH already filled {direction} in window {current_window_ts}, skipping")
+        return None
+
     # Pick token
     token_id = market["clob_token_id"][0] if direction == "UP" else (market["clob_token_id"][1] if len(market["clob_token_id"]) > 1 else "")
     price    = market["yes_price"] if direction == "UP" else market["no_price"]
@@ -736,6 +818,7 @@ def check_snipe(market, seconds_remaining):
         tg(f"[BTC-SNIPE] NO FILL confirmed | {notes}")
         return False
     tg(f"[BTC-SNIPE] FILL CONFIRMED {r.get('filled_size', shares):.2f} shares | {notes}")
+    record_active_fill("btc15m", _state.get("window_ts"), direction)
 
     _state["snipe_done"]        = True
     _state["prev_snipe_side"]  = direction
@@ -746,6 +829,7 @@ def check_snipe(market, seconds_remaining):
 
 # ── New window setup ──────────────────────────────────────────────────────────
 def setup_new_window(slug, window_ts):
+    prune_active_fills(window_ts)
     btc_price = get_btc_price()
     if btc_price is None:
         btc_price = _state.get("window_open_btc", 0.0)
@@ -791,6 +875,7 @@ def check_daily_limit():
 def main():
     global _state
     load_state()
+    init_active_fills_db()
     log("=" * 60)
     log(f"[BTC-15M] STARTING {'(DRY RUN)' if DRY_RUN else '(LIVE)'}")
     log(f"[BTC-15M] Arb threshold=${ARB_THRESHOLD}, snipe delta>={SNIPE_DELTA_MIN}%, max daily loss=${MAX_DAILY_LOSS} | maker={MAKER_ENABLED} dry={MAKER_DRY_RUN} start=T-{MAKER_START_SEC} cancel=T-{MAKER_CANCEL_SEC} offset={MAKER_OFFSET}")

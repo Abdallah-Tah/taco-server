@@ -24,3 +24,35 @@
 ## Operational reminders
 - Use local files/logs/process state as source of truth when chat history and machine state disagree.
 - Persist important decisions to memory files so context survives resets.
+
+## /report command format (permanent rule)
+When Abdallah asks for /report, always use live data and this exact template:
+
+```
+📊 TRADING REPORT
+Generated: {datetime UTC}
+
+💰 Portfolio: ${total} | Free: ${usdc} | Positions: ${open_val}
+
+BTC-15m:
+  Resolved: {total} | W:{wins} L:{losses} | PnL: ${pnl}
+
+ETH-15m:
+  Resolved: {total} | W:{wins} L:{losses} | PnL: ${pnl}
+
+Today:
+  BTC: {n} trades | W:{w} | ${pnl}
+  ETH: {n} trades | W:{w} | ${pnl}
+
+Net today: ${net} | 🟢/🟡/🔴 status
+```
+
+Data sources:
+- Wallet balance: `scripts/polymarket_executor.py balance` (divide raw by 1e6)
+- Open positions: `https://data-api.polymarket.com/positions?user=0x1a4c163a134D7154ebD5f7359919F9c439424f00`
+- Trade stats: `journal.db`
+
+Rules:
+- Default = current day stats
+- If user says "from X to Y" = use that date range for Today section
+- Never use cached/stale numbers — always pull live

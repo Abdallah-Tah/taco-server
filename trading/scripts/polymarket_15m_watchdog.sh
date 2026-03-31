@@ -58,6 +58,8 @@ check_engine() {
     pid=$(cat "$pidfile" 2>/dev/null || true)
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
       running=1
+    else
+      rm -f "$pidfile"
     fi
   fi
   if [ "$running" -eq 0 ] && pgrep -f "$script" >/dev/null 2>&1; then
@@ -91,6 +93,7 @@ check_engine() {
   else
     echo down > "$statefile"
     log "$name restart FAILED"
+    tail -20 "$logfile" >> "$LOG_FILE" 2>/dev/null || true
     send_tg "🚨 ${name} engine DOWN — automatic restart FAILED. Check logs now."
   fi
 }

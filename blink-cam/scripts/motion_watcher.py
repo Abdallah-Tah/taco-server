@@ -1,342 +1,260 @@
 #!/usr/bin/env python3
 """
-Blink Camera Motion Watcher with Face Recognition
-Monitors Blink cameras for motion, captures photos, detects faces/animals, sends Telegram alerts
+Blink Camera Motion Watcher
+Monitors Blink cameras for motion, captures photos, detects objects with YOLO,
+and sends alerts via Telegram.
 """
 
 import os
 import sys
 import time
 import asyncio
+import logging
 from pathlib import Path
 from datetime import datetime
+
+import aiohttp
 from dotenv import load_dotenv
+from blinkpy.blinkpy import Blink
+from blinkpy.auth import Auth, BlinkTwoFARequiredError
+from blinkpy.helpers import util
+from ultralytics import YOLO
 
-# Load environment variables
-SCRIPT_DIR = Path(__file__).parent
-ENV_FILE = SCRIPT_DIR / ".env"
-if ENV_FILE.exists():
-    load_dotenv(ENV_FILE)
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+    ]
+)
+logger = logging.getLogger(__name__)
 
-# Configuration from environment
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", os.environ.get("TELEGRAM_BOT_TOKEN", ""))
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "7520899464")
-BLINK_USERNAME = os.environ.get("BLINK_USERNAME", "")
-BLINK_PASSWORD = os.environ.get("BLINK_PASSWORD", "")
-SNAPSHOT_COOLDOWN = int(os.environ.get("SNAPSHOT_COOLDOWN", "30"))
-POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "10"))
+# Configuration
+BASE_DIR = Path(__file__).resolve().parent.parent
+load_dotenv(BASE_DIR / ".env")
 
-# Paths
-SNAPSHOT_DIR = Path.home() / ".openclaw" / "workspace" / "camera" / "snapshots"
-LOG_FILE = Path.home() / ".openclaw" / "workspace" / "camera" / "blink_motion.log"
-KNOWN_FACES_DIR = SCRIPT_DIR / "known_faces"
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+BLINK_USERNAME = os.getenv("BLINK_USERNAME", "")
+BLINK_PASSWORD = os.getenv("BLINK_PASSWORD", "")
 
+SNAPSHOT_COOLDOWN = int(os.getenv("SNAPSHOT_COOLDOWN", 10))
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", 10))
+
+SNAPSHOT_DIR = BASE_DIR / "snapshots"
 SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
-KNOWN_FACES_DIR.mkdir(parents=True, exist_ok=True)
+
+SESSION_FILE = BASE_DIR / ".blink_session"
+YOLO_MODEL_PATH = BASE_DIR / "yolov8n.pt"
+
+# Global YOLO model (lazy loaded)
+_model = None
 
 
-def log(message):
-    """Log message to file and print"""
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    log_entry = f"[{timestamp}] {message}"
-    print(log_entry, flush=True)
-    with open(LOG_FILE, "a") as f:
-        f.write(log_entry + "\n")
+def get_model():
+    """Lazy-load the YOLO model."""
+    global _model
+    if _model is None:
+        logger.info("🤖 Loading YOLO model...")
+        _model = YOLO(str(YOLO_MODEL_PATH))
+    return _model
 
 
-def send_telegram_photo(photo_path, caption):
-    """Send photo with caption to Telegram"""
+def detect_objects(image_path):
+    """Detect specific objects in an image using YOLO."""
+    model = get_model()
+    results = model(str(image_path), verbose=False)
+
+    # Classes we care about (mapping COCO class IDs to names)
+    target_classes = {
+        0: "person",
+        15: "cat",
+        16: "dog",
+        17: "horse",
+        18: "sheep",
+        19: "cow",
+    }
+
+    found = set()
+    for result in results:
+        for box in result.boxes:
+            cls_id = int(box.cls[0])
+            conf = float(box.conf[0])
+
+            if conf >= 0.5 and cls_id in target_classes:
+                found.add(target_classes[cls_id])
+
+    return list(found)
+
+
+async def send_telegram(session, photo_path, caption):
+    """Send a photo with a caption to Telegram asynchronously."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log("⚠️ Telegram credentials not configured")
+        logger.warning("⚠️ Telegram not configured")
         return False
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
     
     try:
-        import requests
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
-        with open(photo_path, "rb") as photo:
-            files = {"photo": photo}
-            data = {"chat_id": TELEGRAM_CHAT_ID, "caption": caption}
-            resp = requests.post(url, files=files, data=data, timeout=30)
-            if resp.status_code == 200:
-                log(f"✅ Telegram alert sent: {caption}")
+        data = aiohttp.FormData()
+        data.add_field("chat_id", TELEGRAM_CHAT_ID)
+        data.add_field("caption", caption)
+        data.add_field("photo", open(photo_path, "rb"), filename=photo_path.name)
+
+        async with session.post(url, data=data, timeout=30) as resp:
+            if resp.status == 200:
+                logger.info("✅ Telegram alert sent")
                 return True
             else:
-                log(f"❌ Telegram API error: {resp.status_code} - {resp.text}")
+                text = await resp.text()
+                logger.error(f"❌ Telegram error: {resp.status} - {text}")
                 return False
     except Exception as e:
-        log(f"❌ Telegram send failed: {e}")
+        logger.error(f"❌ Failed to send Telegram: {e}")
         return False
 
 
-def detect_faces_and_animals(image_path):
-    """Detect faces and animals in image"""
-    try:
-        import cv2
-        import numpy as np
-        import face_recognition
-        from ultralytics import YOLO
-        
-        # Load image
-        image = face_recognition.load_image_file(str(image_path))
-        cv_image = cv2.imread(str(image_path))
-        
-        results = {"faces": [], "animals": []}
-        
-        # Face detection
-        try:
-            face_locations = face_recognition.face_locations(image)
-            face_encodings = face_recognition.face_encodings(image, face_locations)
-            
-            # Load known faces
-            known_encodings = []
-            known_names = []
-            for known_file in KNOWN_FACES_DIR.glob("*.jpg"):
-                try:
-                    known_image = face_recognition.load_image_file(str(known_file))
-                    known_encoding = face_recognition.face_encodings(known_image)[0]
-                    known_encodings.append(known_encoding)
-                    known_names.append(known_file.stem)
-                except Exception:
-                    pass
-            
-            for (top, right, bottom, left), face_encoding in zip(face_locations, face_encodings):
-                name = "unknown"
-                if known_encodings:
-                    matches = face_recognition.compare_faces(known_encodings, face_encoding, tolerance=0.6)
-                    face_distances = face_recognition.face_distance(known_encodings, face_encoding)
-                    if len(face_distances) > 0:
-                        best_match_idx = np.argmin(face_distances)
-                        if matches[best_match_idx]:
-                            name = known_names[best_match_idx]
-                
-                results["faces"].append({
-                    "name": name,
-                    "location": (top, right, bottom, left),
-                    "confidence": 1.0 - (np.min(face_distances) if len(face_distances) > 0 else 1.0)
-                })
-        except Exception as e:
-            log(f"⚠️ Face detection error: {e}")
-        
-        # Animal detection with YOLO
-        try:
-            model = YOLO("yolov8n.pt")
-            cv_img = cv2.imread(str(image_path))
-            yolo_results = model(cv_img, verbose=False)
-            
-            animal_classes = {
-                14: "dog", 15: "cat", 16: "horse", 17: "sheep", 18: "cow",
-                19: "elephant", 20: "bear", 21: "zebra", 22: "giraffe",
-                0: "person"
-            }
-            
-            for r in yolo_results:
-                boxes = r.boxes
-                for box in boxes:
-                    cls = int(box.cls[0])
-                    conf = float(box.conf[0])
-                    if conf > 0.5 and cls in animal_classes:
-                        results["animals"].append({
-                            "class": animal_classes[cls],
-                            "confidence": conf
-                        })
-        except Exception as e:
-            log(f"⚠️ Animal detection error: {e}")
-        
-        return results
-    except ImportError as e:
-        log(f"⚠️ Detection libraries not available: {e}")
-        return {"faces": [], "animals": []}
-    except Exception as e:
-        log(f"⚠️ Detection error: {e}")
-        return {"faces": [], "animals": []}
-
-
-class BlinkMotionWatcher:
+class Watcher:
+    """Monitors Blink cameras and coordinates actions."""
     def __init__(self):
         self.blink = None
-        self.cameras = {}
-        self.last_snapshot = {}
-        self.motion_count = 0
-        
+        self.session = None
+        self.last_motion = {}
+
     async def init_blink(self):
-        """Initialize Blink connection"""
-        try:
-            from blinkpy import blinkpy
-            from blinkpy.auth import Auth
-            from blinkpy.helpers.util import get_auth_entry
-            
-            log("📷 Initializing Blink connection...")
-            
-            if not BLINK_USERNAME or not BLINK_PASSWORD:
-                log("❌ ERROR: BLINK_USERNAME and BLINK_PASSWORD not set in .env")
-                return False
-            
-            self.blink = blinkpy.Blink()
-            auth = Auth({
+        """Initialize Blink connection and handle authentication."""
+        self.session = aiohttp.ClientSession()
+        
+        login_data = None
+        if SESSION_FILE.exists():
+            try:
+                login_data = await util.json_load(str(SESSION_FILE))
+                logger.info("✅ Loaded saved Blink session")
+            except Exception as e:
+                logger.warning(f"⚠️ Could not load session: {e}")
+
+        # If no saved session, use username/password
+        if not login_data:
+            login_data = {
                 "username": BLINK_USERNAME,
-                "password": BLINK_PASSWORD
-            })
-            self.blink.auth = auth
-            
-            # Try to load saved session
-            session_file = SCRIPT_DIR / ".blink_session"
-            if session_file.exists():
-                try:
-                    self.blink.auth.load_auth(str(session_file))
-                    await self.blink.start()
-                    log("✅ Loaded saved Blink session")
-                except Exception:
-                    log("⚠️ Saved session invalid, re-authenticating...")
-            
-            # Fresh auth
-            if not self.blink.cameras:
-                log("🔐 Authenticating with Blink...")
-                await self.blink.start()
-                # Save session
-                self.blink.auth.save_auth(str(session_file))
-                log("✅ Blink session saved")
-            
-            self.cameras = self.blink.cameras
-            if not self.cameras:
-                log("❌ No Blink cameras found")
+                "password": BLINK_PASSWORD,
+            }
+
+        auth = Auth(
+            login_data=login_data,
+            no_prompt=True,
+            session=self.session,
+        )
+
+        self.blink = Blink(session=self.session)
+        self.blink.auth = auth
+
+        try:
+            await self.blink.start()
+        except BlinkTwoFARequiredError:
+            logger.info("🔐 2FA required. Enter code:")
+            code = sys.stdin.readline().strip()
+            if not code:
+                logger.error("❌ No 2FA code provided")
+                return False
+
+            ok = await self.blink.auth.complete_2fa_login(code)
+            if not ok:
+                logger.error("❌ 2FA verification failed")
                 return False
             
-            log(f"✅ Connected to {len(self.cameras)} camera(s): {', '.join(self.cameras.keys())}")
-            return True
-            
-        except Exception as e:
-            log(f"❌ Blink init failed: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
-    
-    async def check_motion(self):
-        """Check all cameras for motion"""
+            # Restart after successful 2FA
+            await self.blink.start()
+
+        # Save session for next time
         try:
-            await self.blink.refresh()
-            motion_detected = False
-            
-            for name, camera in self.cameras.items():
-                try:
-                    # Check motion status
-                    motion_status = camera.motion_detected
-                    
-                    if motion_status:
-                        motion_detected = True
-                        self.motion_count += 1
-                        
-                        # Check cooldown
-                        now = time.time()
-                        last = self.last_snapshot.get(name, 0)
-                        if now - last < SNAPSHOT_COOLDOWN:
-                            log(f"📸 {name}: motion detected (cooldown active)")
-                            continue
-                        
-                        self.last_snapshot[name] = now
-                        
-                        log(f"🚨 Motion detected on {name}! (#{self.motion_count})")
-                        
-                        # Capture image
-                        await camera.snap_picture()
-                        await self.blink.refresh()
-                        
-                        # Get image URL
-                        image_url = camera.image_path
-                        if not image_url:
-                            log(f"⚠️ No image available for {name}")
-                            continue
-                        
-                        # Download image
-                        import requests
-                        img_resp = requests.get(image_url, timeout=10)
-                        if img_resp.status_code != 200:
-                            log(f"⚠️ Failed to download image for {name}")
-                            continue
-                        
-                        # Save snapshot
-                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                        snapshot_path = SNAPSHOT_DIR / f"blink_{name}_{timestamp}.jpg"
-                        with open(snapshot_path, "wb") as f:
-                            f.write(img_resp.content)
-                        log(f"📸 Snapshot saved: {snapshot_path.name}")
-                        
-                        # Analyze image
-                        detection_results = detect_faces_and_animals(snapshot_path)
-                        
-                        # Build caption
-                        caption_parts = [f"🚨 Blink Alert: {name} (#{self.motion_count})"]
-                        
-                        faces = detection_results.get("faces", [])
-                        if faces:
-                            face_names = [f["name"] for f in faces]
-                            if "unknown" in face_names:
-                                caption_parts.append("⚠️ Unknown person detected")
-                            else:
-                                caption_parts.append(f"👤 Known: {', '.join(set(face_names))}")
-                        else:
-                            caption_parts.append("👤 No faces detected")
-                        
-                        animals = detection_results.get("animals", [])
-                        if animals:
-                            animal_list = [f"{a['class']} ({a['confidence']:.0%})" for a in animals]
-                            caption_parts.append(f"🐾 Detected: {', '.join(animal_list)}")
-                        
-                        caption = "\n".join(caption_parts)
-                        
-                        # Send to Telegram
-                        send_telegram_photo(str(snapshot_path), caption)
-                        
-                except Exception as e:
-                    log(f"⚠️ Error checking {name}: {e}")
-            
-            return motion_detected
-            
+            await self.blink.save(str(SESSION_FILE))
+            logger.info("💾 Blink session saved")
         except Exception as e:
-            log(f"❌ Motion check failed: {e}")
+            logger.error(f"❌ Failed to save session: {e}")
+
+        if not self.blink.cameras:
+            logger.error("❌ No cameras found")
             return False
-    
-    async def run(self):
-        """Main monitoring loop"""
-        log("=" * 60)
-        log("🔴 Blink Motion Watcher Started")
-        log("=" * 60)
-        log(f"Snapshot cooldown: {SNAPSHOT_COOLDOWN}s")
-        log(f"Poll interval: {POLL_INTERVAL}s")
-        log(f"Telegram chat: {TELEGRAM_CHAT_ID}")
-        log("=" * 60)
-        
-        if not await self.init_blink():
-            return 1
-        
-        last_status = time.time()
-        
+
+        logger.info(f"✅ Monitoring cameras: {list(self.blink.cameras.keys())}")
+        return True
+
+    async def loop(self):
+        """Main monitoring loop."""
+        logger.info("🚀 Starting motion watcher loop...")
         try:
             while True:
-                await self.check_motion()
-                
-                # Status every 5 minutes
-                if time.time() - last_status > 300:
-                    log(f"📊 Status: {self.motion_count} total motions detected")
-                    last_status = time.time()
-                
+                await self.blink.refresh()
+
+                for name, cam in self.blink.cameras.items():
+                    if not cam.motion_detected:
+                        continue
+
+                    # Cooldown check
+                    now = time.time()
+                    if now - self.last_motion.get(name, 0) < SNAPSHOT_COOLDOWN:
+                        continue
+
+                    self.last_motion[name] = now
+                    logger.info(f"🚨 Motion on {name}")
+
+                    # Capture and download image
+                    await cam.snap_picture()
+                    await self.blink.refresh()
+
+                    # Save snapshot using the library's built-in authenticated downloader
+                    ts = int(now)
+                    fname = SNAPSHOT_DIR / f"{name}_{ts}.jpg"
+                    
+                    try:
+                        await cam.image_to_file(str(fname))
+                        logger.info(f"💾 Snapshot saved: {fname.name}")
+                    except Exception as e:
+                        logger.error(f"❌ Failed to download image for {name}: {e}")
+                        continue
+
+                    # Detection
+                    detected = detect_objects(fname)
+                    caption = f"🚨 {name}"
+                    if detected:
+                        caption += f"\nDetected: {', '.join(detected)}"
+
+                    # Alert
+                    await send_telegram(self.session, fname, caption)
+
                 await asyncio.sleep(POLL_INTERVAL)
-                
-        except KeyboardInterrupt:
-            log("👋 Shutting down...")
+        except asyncio.CancelledError:
+            logger.info("🛑 Loop cancelled")
         except Exception as e:
-            log(f"❌ Fatal error: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.error(f"❌ Error in loop: {e}", exc_info=True)
         finally:
-            if self.blink:
-                try:
-                    await self.blink.stop()
-                except Exception:
-                    pass
-        
-        return 0
+            if self.session:
+                await self.session.close()
+
+    async def close(self):
+        """Close resources."""
+        if self.session:
+            await self.session.close()
+
+
+async def main():
+    watcher = Watcher()
+    if not await watcher.init_blink():
+        await watcher.close()
+        return
+
+    try:
+        await watcher.loop()
+    except KeyboardInterrupt:
+        logger.info("👋 Shutting down...")
+    finally:
+        await watcher.close()
 
 
 if __name__ == "__main__":
-    watcher = BlinkMotionWatcher()
-    sys.exit(asyncio.run(watcher.run()))
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass

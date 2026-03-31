@@ -54,3 +54,37 @@ Add whatever helps you do your job. This is your cheat sheet.
 - Provider host: https://ollama.com
 - Default model: qwen3.5:cloud
 - Note: cloud models require OLLAMA_API_KEY set in ~/.config/openclaw/secrets.env
+
+### /report Command Format
+When Abdallah asks for /report, always use **live API data** and this exact template:
+
+```
+📊 TRADING REPORT
+Generated: {datetime UTC}
+
+💰 Portfolio: ${total} | Free: ${usdc} | Positions: ${open_val}
+
+BTC-15m:
+  Resolved: {total} | W:{wins} L:{losses} | PnL: ${pnl}
+
+ETH-15m:
+  Resolved: {total} | W:{wins} L:{losses} | PnL: ${pnl}
+
+Today:
+  BTC: {n} trades | W:{w} | ${pnl}
+  ETH: {n} trades | W:{w} | ${pnl}
+
+Net today: ${net} | 🟢/🟡/🔴 status
+```
+
+**Data sources:**
+- Wallet (free USDC): `scripts/polymarket_executor.py balance` → divide raw by 1e6
+- Open positions (live value): `https://data-api.polymarket.com/positions?user=0x1a4c163a134D7154ebD5f7359919F9c439424f00`
+- Trade stats: `~/.openclaw/workspace/trading/journal.db`
+
+**Rules:**
+- Default = current day stats
+- "from X to Y" = apply date range to Today section
+- Always pull live — never use cached numbers
+
+**Additional rule:** Only display engines that are currently running (check `ps aux | grep polymarket_<engine>`). If an engine is not running, omit it from the report entirely.
