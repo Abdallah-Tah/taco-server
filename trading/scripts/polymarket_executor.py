@@ -239,6 +239,29 @@ def verify_fill(token_id, min_size=0.0, lookback_sec=120):
     """Check Data API for a recent executed BUY fill on this asset.
     Activity is usually faster than trades, so prefer that first.
     """
+    def _enrich(hits, total, source):
+        total_cost = 0.0
+        tx_hashes = []
+        for h in hits:
+            try:
+                sz = float(h.get("size") or 0)
+                px = float(h.get("price") or 0)
+                total_cost += sz * px
+                txh = h.get("transactionHash")
+                if txh:
+                    tx_hashes.append(txh)
+            except Exception:
+                continue
+        avg_fill_price = (total_cost / total) if total > 0 else None
+        return {
+            "filled": total >= max(0.0, min_size * 0.5),
+            "filled_size": total,
+            "trades": hits,
+            "source": source,
+            "avg_fill_price": avg_fill_price,
+            "effective_cost": total_cost if total > 0 else None,
+            "tx_hashes": tx_hashes,
+        }
     try:
         user = load_secrets().get("POLYMARKET_FUNDER")
         if not user:
@@ -265,7 +288,7 @@ def verify_fill(token_id, min_size=0.0, lookback_sec=120):
                 total += sz
                 hits.append(a)
             if total > 0:
-                return {"filled": total >= max(0.0, min_size * 0.5), "filled_size": total, "trades": hits, "source": "activity"}
+                return _enrich(hits, total, "activity")
 
         # Slower fallback: trades feed
         r = requests.get(f"{DATA_API}/trades", params={"user": user, "limit": 500, "offset": 0, "takerOnly": "false"}, timeout=15)
@@ -285,7 +308,7 @@ def verify_fill(token_id, min_size=0.0, lookback_sec=120):
             sz = float(t.get("size") or 0)
             total += sz
             hits.append(t)
-        return {"filled": total > 0 and total >= max(0.0, min_size * 0.5), "filled_size": total, "trades": hits, "source": "trades"}
+        return _enrich(hits, total, "trades")
     except Exception as e:
         return {"filled": False, "reason": str(e)}
 

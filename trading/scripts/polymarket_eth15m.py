@@ -73,7 +73,7 @@ SNIPE_DELTA_MIN = _float("ETH15M_SNIPE_DELTA_MIN", 0.05)
 SIGNAL_CONFIRM_COUNT = _int("ETH15M_SIGNAL_CONFIRM_COUNT", 2)
 SIGNAL_CONFIRM_SEC   = _int("ETH15M_SIGNAL_CONFIRM_SEC", 15)
 SNIPE_MIN_PRICE = _float("ETH15M_SIGNAL_MIN_ENTRY_PRICE", 0.50)
-SNIPE_MAX_PRICE = _float("ETH15M_SNIPE_MAX_PRICE", 0.80)
+SNIPE_MAX_PRICE = _float("ETH15M_SIGNAL_MAX_ENTRY_PRICE", _float("ETH15M_SNIPE_MAX_PRICE", 0.80))
 SNIPE_DEFAULT   = _float("ETH15M_SNIPE_DEFAULT_SIZE", 5.00)
 SNIPE_STRONG    = _float("ETH15M_SNIPE_STRONG_SIZE", 7.50)
 SNIPE_STRONG_D  = _float("ETH15M_SNIPE_STRONG_DELTA", 0.10)  # percent
@@ -306,6 +306,7 @@ def place_order(side, shares, price, condition_id, token_id):
                 fill = (data.get('fill_check') or {})
                 payload['filled'] = bool(fill.get('filled'))
                 payload['filled_size'] = fill.get('filled_size', 0)
+                payload['fill_check'] = fill
                 payload['posted'] = data
                 break
     except Exception:
@@ -450,37 +451,23 @@ def maker_verify_fill(token_id, min_size):
 
 
 def _summarize_verified_fill(vf):
-    trades = vf.get('trades') or []
-    if not trades:
-        return {
-            "avg_fill_price": None,
-            "effective_cost": None,
-            "tx_hashes": [],
-            "source": vf.get("source"),
-        }
-
-    total_shares = 0.0
-    total_cost = 0.0
-    tx_hashes = []
-    for t in trades:
-        try:
-            sz = float(t.get('size') or 0)
-            px = float(t.get('price') or 0)
-            total_shares += sz
-            total_cost += sz * px
-            txh = t.get('transactionHash')
-            if txh:
-                tx_hashes.append(txh)
-        except Exception:
-            continue
-
-    avg_fill_price = (total_cost / total_shares) if total_shares > 0 else None
     return {
-        "avg_fill_price": avg_fill_price,
-        "effective_cost": total_cost if total_shares > 0 else None,
-        "tx_hashes": tx_hashes,
+        "avg_fill_price": vf.get("avg_fill_price"),
+        "effective_cost": vf.get("effective_cost"),
+        "tx_hashes": vf.get("tx_hashes") or [],
         "source": vf.get("source"),
     }
+
+
+def _execution_anomaly_check(submitted_price, avg_fill_price):
+    try:
+        if submitted_price is None or avg_fill_price is None:
+            return
+        if abs(float(avg_fill_price) - float(submitted_price)) > 0.05:
+            log(f"[EXECUTION_ANOMALY] submitted={float(submitted_price):.4f} filled={float(avg_fill_price):.4f}")
+            tg(f"[ALERT] Execution anomaly detected! submitted={float(submitted_price):.4f} filled={float(avg_fill_price):.4f}")
+    except Exception:
+        pass
 
 
 def maker_cancel_order(order_id):
@@ -529,6 +516,7 @@ def check_maker_snipe(market, seconds_remaining):
                         f"effective_cost={(f'${effective_cost:.4f}' if effective_cost is not None else 'n/a')} "
                         f"tx_hashes={tx_preview}"
                     )
+                    _execution_anomaly_check(submitted_limit, avg_fill_price)
                     tg(f"[ETH-MAKER] FILL VERIFIED {vf.get('filled_size')} shares")
                     record_active_fill("eth15m", _state.get("window_ts"), _state.get('maker_side'))
                     seen.add(fill_key)
@@ -800,6 +788,13 @@ def check_snipe(market, seconds_remaining):
         log(f"[ETH-SNIPE] No fill confirmed — not counting this trade as real")
         tg(f"[ETH-SNIPE] NO FILL confirmed | {notes}")
         return False
+    fill = r.get('fill_check') or {}
+    avg_fill_price = fill.get('avg_fill_price')
+    effective_cost = fill.get('effective_cost')
+    tx_hashes = fill.get('tx_hashes') or []
+    if avg_fill_price is not None:
+        log(f"[ETH-SNIPE] fill verified via {fill.get('source')} size={r.get('filled_size', shares)} submitted_price={price:.4f} avg_fill_price={float(avg_fill_price):.4f} effective_cost=${float(effective_cost or 0):.4f} tx_hashes={','.join(tx_hashes[:3]) if tx_hashes else 'n/a'}")
+        _execution_anomaly_check(price, avg_fill_price)
     tg(f"[ETH-SNIPE] FILL CONFIRMED {r.get('filled_size', shares):.2f} shares | {notes}")
     record_active_fill("eth15m", _state.get("window_ts"), direction)
 

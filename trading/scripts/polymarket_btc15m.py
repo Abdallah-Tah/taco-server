@@ -308,6 +308,7 @@ def place_order(side, shares, price, condition_id, token_id):
                 fill = (data.get('fill_check') or {})
                 payload['filled'] = bool(fill.get('filled'))
                 payload['filled_size'] = fill.get('filled_size', 0)
+                payload['fill_check'] = fill
                 payload['posted'] = data
                 break
     except Exception:
@@ -460,6 +461,17 @@ def maker_verify_fill(token_id, min_size):
     return {"filled": False, "reason": result.stderr or result.stdout or 'no_verify'}
 
 
+def _execution_anomaly_check(submitted_price, avg_fill_price):
+    try:
+        if submitted_price is None or avg_fill_price is None:
+            return
+        if abs(float(avg_fill_price) - float(submitted_price)) > 0.05:
+            log(f"[EXECUTION_ANOMALY] submitted={float(submitted_price):.4f} filled={float(avg_fill_price):.4f}")
+            tg(f"[ALERT] Execution anomaly detected! submitted={float(submitted_price):.4f} filled={float(avg_fill_price):.4f}")
+    except Exception:
+        pass
+
+
 def maker_cancel_order(order_id):
     cmd = [str(VENV_PY), str(WORK_DIR / "scripts" / "polymarket_executor.py"), "cancel", str(order_id)]
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
@@ -501,7 +513,11 @@ def check_maker_snipe(market, seconds_remaining):
                 fill_key = f"{oid}:{vf.get('filled_size')}"
                 seen = set(_state.get('maker_seen_fills', []))
                 if fill_key not in seen:
-                    log(f"[BTC-MAKER] fill verified via activity/trades size={vf.get('filled_size')}")
+                    avg_fill_price = vf.get('avg_fill_price')
+                    effective_cost = vf.get('effective_cost')
+                    tx_hashes = vf.get('tx_hashes') or []
+                    log(f"[BTC-MAKER] fill verified via {vf.get('source')} size={vf.get('filled_size')} submitted_limit={_state.get('maker_price', 0):.4f} avg_fill_price={(f'{float(avg_fill_price):.4f}' if avg_fill_price is not None else 'n/a')} effective_cost={(f'${float(effective_cost or 0):.4f}' if avg_fill_price is not None else 'n/a')} tx_hashes={','.join(tx_hashes[:3]) if tx_hashes else 'n/a'}")
+                    _execution_anomaly_check(_state.get('maker_price', 0), avg_fill_price)
                     tg(f"[BTC-MAKER] FILL VERIFIED {vf.get('filled_size')} shares")
                     # Log verified fill to journal
                     log_trade("btc15m", _state.get('maker_side'),
@@ -817,6 +833,13 @@ def check_snipe(market, seconds_remaining):
         log(f"[SNIPE] No fill confirmed — not counting this trade as real")
         tg(f"[BTC-SNIPE] NO FILL confirmed | {notes}")
         return False
+    fill = r.get('fill_check') or {}
+    avg_fill_price = fill.get('avg_fill_price')
+    effective_cost = fill.get('effective_cost')
+    tx_hashes = fill.get('tx_hashes') or []
+    if avg_fill_price is not None:
+        log(f"[BTC-SNIPE] fill verified via {fill.get('source')} size={r.get('filled_size', shares)} submitted_price={price:.4f} avg_fill_price={float(avg_fill_price):.4f} effective_cost=${float(effective_cost or 0):.4f} tx_hashes={','.join(tx_hashes[:3]) if tx_hashes else 'n/a'}")
+        _execution_anomaly_check(price, avg_fill_price)
     tg(f"[BTC-SNIPE] FILL CONFIRMED {r.get('filled_size', shares):.2f} shares | {notes}")
     record_active_fill("btc15m", _state.get("window_ts"), direction)
 
