@@ -330,7 +330,7 @@ def log_trade(engine, direction, size_usd, entry_price, pnl, exit_type, hold_sec
             engine, datetime.now(timezone.utc).isoformat(),
             datetime.now(timezone.utc).isoformat() if exit_type else None,
             "eth-15m",
-            "btc-updown",
+            "eth-updown",
             direction, entry_price, entry_price if not exit_type else entry_price,
             size_usd / entry_price if entry_price else 0,
             size_usd, pnl or 0.0, (pnl/size_usd*100) if size_usd else 0,
