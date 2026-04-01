@@ -39,9 +39,15 @@ Skills are shared. Your setup is yours. Keeping them apart means you can update 
 
 ### TTS / Voice
 
-- Main English voice for Taco: the current OpenClaw/TTS English voice used in the intro sample approved on 2026-03-25
-- Arabic voice previously preferred for Taco: **Hamed**
-- Voice interaction preference: if user sends voice, reply with voice in the same language when possible
+- Main English voice for Taco: **en-US-AndrewNeural** (edge-tts)
+- Arabic voice: **ar-SA-HamedNeural**
+- French voice: **fr-FR-HenriNeural**
+- Voice interaction rule:
+  - User sends voice → reply with voice in the SAME language
+  - User sends text → reply with text
+  - Detect language from transcript, pick matching voice
+- STT: faster-whisper (local, free, no API key)
+- Model: "tiny" (fast, Pi-friendly)
 
 ### Wallets
 

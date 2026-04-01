@@ -23,9 +23,22 @@
 
 ## Operational reminders
 - Use local files/logs/process state as source of truth when chat history and machine state disagree.
+- BTC/ETH restart multiple times today, Feb 2026)
+- BTC-15m lost $35 today, $10/trade, 42% WR)
+- ETH-15m lost $16 today, $5/trade, 25% WR)
+- Both engines killed after daily loss hit -$51.45
+- No automatic daily loss circuit breaker existed
+- Reconciled entry_price = weighted avg of fill prices (correct behavior)
+- Signal quality in 0.45-0.55 range is weak, Edge strongest in 0.55-0.65
 - Persist important decisions to memory files so context survives resets.
 
 ## /report command format (permanent rule)
+
+Same as TOols.md + MEMORY,TODO
+When Abdallah asks for /report, always use live data and this exact template:
+
+## /report command format (permanent rule)
+When Abdallah asks in /report, always use live data and this exact template...
 When Abdallah asks for /report, always use live data and this exact template:
 
 ```

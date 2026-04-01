@@ -463,9 +463,15 @@ def _execution_anomaly_check(submitted_price, avg_fill_price):
     try:
         if submitted_price is None or avg_fill_price is None:
             return
-        if abs(float(avg_fill_price) - float(submitted_price)) > 0.05:
-            log(f"[EXECUTION_ANOMALY] submitted={float(submitted_price):.4f} filled={float(avg_fill_price):.4f}")
-            tg(f"[ALERT] Execution anomaly detected! submitted={float(submitted_price):.4f} filled={float(avg_fill_price):.4f}")
+        sp = float(submitted_price)
+        fp = float(avg_fill_price)
+        # Only alert on ADVERSE fills (BUY filled above limit = bad)
+        # Favorable fills (BUY filled below limit) are logged but not alerted
+        if fp > sp and abs(fp - sp) > 0.05:
+            log(f"[EXECUTION_ANOMALY] ADVERSE: submitted={sp:.4f} filled={fp:.4f} (paid more than limit)")
+            tg(f"[ALERT] Execution anomaly! BUY filled ABOVE limit: submitted={sp:.4f} filled={fp:.4f}")
+        elif abs(fp - sp) > 0.05:
+            log(f"[EXECUTION_ANOMALY] FAVORABLE: submitted={sp:.4f} filled={fp:.4f} (saved ${abs(fp-sp)*100:.1f}%)")
     except Exception:
         pass
 
