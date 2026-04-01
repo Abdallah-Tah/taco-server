@@ -940,7 +940,7 @@ def main():
         if btc:
             _state["btc_prices"].append((int(time.time()), btc))
             # Keep last window's prices only
-            cutoff = window_ts
+            cutoff = int(time.time()) - 4200  # keep ~70 minutes for 1h trend filter
             _state["btc_prices"] = [(t, p) for t, p in _state["btc_prices"] if t >= cutoff]
 
         # Strategy A: Arb (first 14.75 min)
