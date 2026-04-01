@@ -750,8 +750,8 @@ def check_snipe(market, seconds_remaining):
     token_id = market["clob_token_id"][0] if direction == "UP" else (market["clob_token_id"][1] if len(market["clob_token_id"]) > 1 else "")
     price    = market["yes_price"] if direction == "UP" else market["no_price"]
 
-    if seconds_remaining < 15:
-        log(f"[ETH-SNIPE] FILTER: sec_remaining={seconds_remaining}s < 15s, skipping ultra-late entry")
+    if seconds_remaining < 5:
+        log(f"[ETH-SNIPE] FILTER: sec_remaining={seconds_remaining}s < 5s, skipping ultra-late entry")
         return None
 
     if price > SNIPE_MAX_PRICE:
