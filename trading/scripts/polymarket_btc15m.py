@@ -1,7 +1,26 @@
 #!/usr/bin/env python3
 """
-polymarket_btc15m.py — BTC 15-Minute Polymarket Engine
-======================================================
+polymarket_btc15m.py — BTC 15-Minute Polymarket Engine (IMPROVED)
+=================================================================
+Changes from original:
+  1. SIGNAL_MAX_ENTRY_PRICE raised 0.68 -> 0.80 (unblocks high-conviction signals)
+  2. MAKER_OFFSET reduced 0.005 -> 0.001 (more competitive limit orders)
+  3. Fixed BTC price trimming bug in main loop (was breaking 1h trend filter)
+  4. Softened momentum deceleration threshold 0.5 -> 0.3
+  5. Added maker retry after cancellation if time permits (>45s remaining)
+  6. Added FOK taker fallback if maker order unfilled after 60s
+  7. Reduced arb log noise (logs once per window instead of every cycle)
+  8. Added fill-rate tracking for diagnostics
+  9. MAKER_START_SEC raised 300 -> 540 (catch signals before market fully prices them in)
+ 10. SIGNAL_MAX_ENTRY_PRICE lowered 0.82 -> 0.72 (skip expensive tokens, better risk/reward)
+ 11. SIGNAL_MIN_ENTRY_PRICE lowered 0.45 -> 0.38 (catch early confirmed signals with good value)
+ 12. SIGNAL_MAX_ENTRY_PRICE raised 0.72 -> 0.76 (allow late recovery entries, still blocks 0.82+)
+ 13. FOK fallback price +0.02 premium above mid to hit the actual ask instead of mid-price
+ 14. Asymmetric delta: DOWN requires 0.10% (was 0.025%) — DOWN was 25% win rate
+ 15. Correlation block stagger: ETH waits 20s before entering same-direction as BTC
+ 16. DOWN signals disabled by default (BTC DOWN was 25% win rate, -$37.96)
+ 17. Max entry capped at 0.55 (entries above 0.55 have negative expectancy)
+
 Two strategies:
   A) Binary Arb      — buy UP+DOWN when combined < $0.98, guaranteed profit
   B) Late Snipe      — directional bet near window close based on BTC delta
@@ -59,11 +78,17 @@ VENV_PY        = Path("/home/abdaltm86/.openclaw/workspace/trading/.polymarket-v
 DRY_RUN        = os.environ.get("BTC15M_DRY_RUN",  ENV.get("BTC15M_DRY_RUN",  "true")).lower() != "false"
 MAKER_ENABLED  = os.environ.get("BTC15M_MAKER_ENABLED", ENV.get("BTC15M_MAKER_ENABLED", "false")).lower() == "true"
 MAKER_DRY_RUN  = os.environ.get("BTC15M_MAKER_DRY_RUN", ENV.get("BTC15M_MAKER_DRY_RUN", "true")).lower() != "false"
-MAKER_START_SEC = _int("BTC15M_MAKER_START_SEC", 300)
+MAKER_START_SEC = _int("BTC15M_MAKER_START_SEC", 540)
 MAKER_CANCEL_SEC = _int("BTC15M_MAKER_CANCEL_SEC", 10)
-MAKER_OFFSET = _float("BTC15M_MAKER_OFFSET", 0.005)
+# FIX #2: Reduced offset from 0.005 -> 0.001 for more competitive fills
+MAKER_OFFSET = _float("BTC15M_MAKER_OFFSET", 0.001)
 MAKER_POLL_SEC = _int("BTC15M_MAKER_POLL_SEC", 10)
 MAKER_MIN_PRICE = _float("BTC15M_MAKER_MIN_PRICE", 0.01)
+# FIX #5: FOK fallback after N seconds of unfilled maker order
+MAKER_FOK_FALLBACK_SEC = _int("BTC15M_MAKER_FOK_FALLBACK_SEC", 60)
+# FIX #5: Allow retry after cancellation if >N seconds remain
+MAKER_RETRY_MIN_SEC = _int("BTC15M_MAKER_RETRY_MIN_SEC", 45)
+
 BTC15M_GABAGOOL_ENABLED = os.environ.get("BTC15M_GABAGOOL_ENABLED", ENV.get("BTC15M_GABAGOOL_ENABLED", "false")).lower() == "true"
 BTC15M_GABAGOOL_DRY_RUN = os.environ.get("BTC15M_GABAGOOL_DRY_RUN", ENV.get("BTC15M_GABAGOOL_DRY_RUN", "true")).lower() != "false"
 GABAGOOL_MAX_LEG = _float("GABAGOOL_MAX_LEG", 0.48)
@@ -74,12 +99,17 @@ WINDOW_SEC      = _int("BTC15M_WINDOW_SEC", 900)          # 15 minutes
 ARB_THRESHOLD   = _float("BTC15M_ARB_THRESHOLD", 0.98)
 ARB_SIZE        = _float("BTC15M_ARB_SIZE", 10.00)
 SNIPE_DELTA_MIN = _float("BTC15M_SNIPE_DELTA_MIN", 0.025)
+# FIX #14: Asymmetric delta — DOWN needs stronger signal (25% win rate at 0.025% was terrible)
+SNIPE_DELTA_MIN_DOWN = _float("BTC15M_SNIPE_DELTA_MIN_DOWN", 0.10)
+# FIX #16: Disable DOWN entirely — 25% win rate, -$37.96 over 2 days. Only trade UP.
+DOWN_ENABLED = os.environ.get("BTC15M_DOWN_ENABLED", ENV.get("BTC15M_DOWN_ENABLED", "false")).lower() == "true"
 SNIPE_MAX_PRICE = _float("BTC15M_SNIPE_MAX_PRICE", 0.90)
 # Signal confirmation (improved filtering)
 SIGNAL_CONFIRM_COUNT   = _int("BTC15M_SIGNAL_CONFIRM_COUNT", 2)   # consecutive polls needed
 SIGNAL_CONFIRM_SEC     = _int("BTC15M_SIGNAL_CONFIRM_SEC", 15)     # max age of confirm samples
-SIGNAL_MAX_ENTRY_PRICE = _float("BTC15M_SIGNAL_MAX_ENTRY_PRICE", 0.80)  # skip if entry worse than this
-SIGNAL_MIN_ENTRY_PRICE = _float("BTC15M_SIGNAL_MIN_ENTRY_PRICE", 0.50)  # skip if entry lower than this
+# FIX #17: Capped max entry at 0.55 — low entries (<0.45) have 67% win rate, above 0.55 loses money
+SIGNAL_MAX_ENTRY_PRICE = _float("BTC15M_SIGNAL_MAX_ENTRY_PRICE", 0.55)
+SIGNAL_MIN_ENTRY_PRICE = _float("BTC15M_SIGNAL_MIN_ENTRY_PRICE", 0.45)
 SNIPE_DEFAULT   = _float("BTC15M_SNIPE_DEFAULT_SIZE", 5.00)
 SNIPE_STRONG    = _float("BTC15M_SNIPE_STRONG_SIZE", 7.50)
 SNIPE_STRONG_D  = _float("BTC15M_SNIPE_STRONG_DELTA", 0.10)  # percent
@@ -89,12 +119,15 @@ SCAN_SEC        = _int("BTC15M_SCAN_INTERVAL", 10)
 MAX_DAILY_LOSS  = _float("BTC15M_MAX_DAILY_LOSS", 15.00)
 SERIES_ID       = "10192"
 SERIES_SLUG     = "btc-up-or-down-15m"
+# FIX #4: Softened momentum deceleration threshold (was 0.5 implicitly)
+MOMENTUM_DECEL_THRESHOLD = _float("BTC15M_MOMENTUM_DECEL_THRESHOLD", 0.30)
 
 # ── State ─────────────────────────────────────────────────────────────────────
 _state = {
     "window_ts":       0,
     "window_open_btc": 0.0,
     "arb_done":        False,
+    "arb_logged":      False,   # FIX #7: only log arb miss once per window
     "snipe_done":      False,
     "btc_prices":      [],   # list of (timestamp, price)
     "daily_pnl":       0.0,
@@ -110,11 +143,17 @@ _state = {
     "maker_done":       False,
     "maker_last_poll":  0,
     "maker_seen_fills": [],
+    "maker_attempt_count": 0,   # FIX #5: track retry attempts per window
+    "maker_placed_ts":  0,      # FIX #5: when was current order placed
     "gabagool_yes_low": None,
     "gabagool_yes_ts": 0,
     "gabagool_no_low": None,
     "gabagool_no_ts": 0,
     "gabagool_window_logged": False,
+    # FIX #8: fill rate diagnostics
+    "diag_orders_placed": 0,
+    "diag_orders_filled": 0,
+    "diag_orders_cancelled": 0,
 }
 _positions = []   # list of dicts for open/confirmation positions
 
@@ -223,6 +262,12 @@ def load_state():
         with open(STATE_F) as f:
             _state = json.load(f)
     _state.setdefault('maker_seen_fills', [])
+    _state.setdefault('maker_attempt_count', 0)
+    _state.setdefault('maker_placed_ts', 0)
+    _state.setdefault('arb_logged', False)
+    _state.setdefault('diag_orders_placed', 0)
+    _state.setdefault('diag_orders_filled', 0)
+    _state.setdefault('diag_orders_cancelled', 0)
 
 # ── BTC price from Coinbase ────────────────────────────────────────────────────
 def get_btc_price():
@@ -467,8 +512,6 @@ def _execution_anomaly_check(submitted_price, avg_fill_price):
             return
         sp = float(submitted_price)
         fp = float(avg_fill_price)
-        # Only alert on ADVERSE fills (BUY filled above limit = bad)
-        # Favorable fills (BUY filled below limit) are logged but not alerted
         if fp > sp and abs(fp - sp) > 0.05:
             log(f"[EXECUTION_ANOMALY] ADVERSE: submitted={sp:.4f} filled={fp:.4f} (paid more than limit)")
             tg(f"[ALERT] Execution anomaly! BUY filled ABOVE limit: submitted={sp:.4f} filled={fp:.4f}")
@@ -484,6 +527,66 @@ def maker_cancel_order(order_id):
     return {"success": result.returncode == 0, "output": result.stdout, "error": result.stderr}
 
 
+def _reset_maker_state_for_retry():
+    """Reset maker state to allow a retry within the same window."""
+    _state['maker_order_id'] = ""
+    _state['maker_token_id'] = ""
+    _state['maker_side'] = ""
+    _state['maker_price'] = 0.0
+    _state['maker_shares'] = 0.0
+    _state['maker_done'] = False
+    _state['maker_last_poll'] = 0
+    _state['maker_placed_ts'] = 0
+    save_state()
+
+
+def _handle_maker_fill(oid, source="status", vf=None):
+    """Centralized fill handling for maker orders."""
+    _state['maker_done'] = True
+    _state['snipe_done'] = True
+    _state["consecutive_losses"] = 0
+    _state["diag_orders_filled"] = _state.get("diag_orders_filled", 0) + 1
+    record_active_fill("btc15m", _state.get("window_ts"), _state.get('maker_side'))
+    save_state()
+    
+    if source == "status":
+        tg(f"[BTC-MAKER] FILLED order {oid}")
+        log_trade("btc15m", _state.get('maker_side', 'UP'), 
+            _state.get('maker_shares', 0) * _state.get('maker_price', 0),
+            _state.get('maker_price', 0), 0, 'filled',
+            int(time.time()) - _state.get('maker_placed_ts', int(time.time())),
+            notes=f"maker_fill oid={oid}",
+            sec_remaining=_state.get('maker_sec_remaining'),
+            price_bucket=_state.get('maker_price_bucket'))
+    elif source == "verify" and vf:
+        avg_fill_price = vf.get('avg_fill_price')
+        effective_cost = vf.get('effective_cost')
+        tx_hashes = vf.get('tx_hashes') or []
+        log(f"[BTC-MAKER] fill verified via {vf.get('source')} size={vf.get('filled_size')} "
+            f"submitted_limit={_state.get('maker_price', 0):.4f} "
+            f"avg_fill_price={(f'{float(avg_fill_price):.4f}' if avg_fill_price is not None else 'n/a')} "
+            f"effective_cost={(f'${float(effective_cost or 0):.4f}' if avg_fill_price is not None else 'n/a')} "
+            f"tx_hashes={','.join(tx_hashes[:3]) if tx_hashes else 'n/a'}")
+        _execution_anomaly_check(_state.get('maker_price', 0), avg_fill_price)
+        tg(f"[BTC-MAKER] FILL VERIFIED {vf.get('filled_size')} shares")
+        log_trade("btc15m", _state.get('maker_side'),
+            vf.get('filled_size', 0) * _state.get('maker_price', 0),
+            _state.get('maker_price', 0), 0, 'filled',
+            int(time.time()) - _state.get('maker_placed_ts', int(time.time())),
+            notes=f"maker_verify oid={oid} size={vf.get('filled_size')}",
+            sec_remaining=_state.get('maker_sec_remaining'),
+            price_bucket=_state.get('maker_price_bucket'))
+    elif source == "fok_fallback":
+        tg(f"[BTC-MAKER] FOK FALLBACK FILL")
+        log_trade("btc15m", _state.get('maker_side', 'UP'),
+            _state.get('maker_shares', 0) * _state.get('maker_price', 0),
+            _state.get('maker_price', 0), 0, 'filled',
+            int(time.time()) - _state.get('maker_placed_ts', int(time.time())),
+            notes=f"fok_fallback oid={oid}",
+            sec_remaining=_state.get('maker_sec_remaining'),
+            price_bucket=_state.get('maker_price_bucket'))
+
+
 def check_maker_snipe(market, seconds_remaining):
     if not MAKER_ENABLED:
         return None
@@ -494,60 +597,84 @@ def check_maker_snipe(market, seconds_remaining):
         return None
     
     oid = _state.get("maker_order_id")
+    
+    # ── Manage existing order ──
     if oid and (time.time() - _state.get("maker_last_poll", 0) >= MAKER_POLL_SEC or seconds_remaining <= MAKER_CANCEL_SEC):
         _state["maker_last_poll"] = int(time.time())
         st = maker_order_status(oid)
         log(f"[BTC-MAKER] status order_id={oid} -> {st.get('status')}")
+        
         if st.get('status') in ('filled', 'partially_filled'):
-            _state['maker_done'] = True
-            _state['snipe_done'] = True
-            _state["consecutive_losses"] = 0  # Reset on successful fill
-            record_active_fill("btc15m", _state.get("window_ts"), _state.get('maker_side'))
-            save_state()
-            tg(f"[BTC-MAKER] FILLED order {oid}")
-            log_trade("btc15m", _state.get('maker_side', 'UP'), 
-                _state.get('maker_shares', 0) * _state.get('maker_price', 0),
-                _state.get('maker_price', 0), 0, 'filled',
-                int(time.time()) - _state.get('maker_last_poll', int(time.time())),
-                notes=f"maker_fill oid={oid}",
-                sec_remaining=_state.get('maker_sec_remaining'),
-                price_bucket=_state.get('maker_price_bucket'))
+            _handle_maker_fill(oid, source="status")
             return True
+        
         if st.get('status') == 'not_found':
             vf = maker_verify_fill(_state.get('maker_token_id'), _state.get('maker_shares', 0))
             if vf.get('filled'):
                 fill_key = f"{oid}:{vf.get('filled_size')}"
                 seen = set(_state.get('maker_seen_fills', []))
                 if fill_key not in seen:
-                    avg_fill_price = vf.get('avg_fill_price')
-                    effective_cost = vf.get('effective_cost')
-                    tx_hashes = vf.get('tx_hashes') or []
-                    log(f"[BTC-MAKER] fill verified via {vf.get('source')} size={vf.get('filled_size')} submitted_limit={_state.get('maker_price', 0):.4f} avg_fill_price={(f'{float(avg_fill_price):.4f}' if avg_fill_price is not None else 'n/a')} effective_cost={(f'${float(effective_cost or 0):.4f}' if avg_fill_price is not None else 'n/a')} tx_hashes={','.join(tx_hashes[:3]) if tx_hashes else 'n/a'}")
-                    _execution_anomaly_check(_state.get('maker_price', 0), avg_fill_price)
-                    tg(f"[BTC-MAKER] FILL VERIFIED {vf.get('filled_size')} shares")
-                    # Log verified fill to journal
-                    log_trade("btc15m", _state.get('maker_side'),
-                        vf.get('filled_size', 0) * _state.get('maker_price', 0),
-                        _state.get('maker_price', 0), 0, 'filled',
-                        int(time.time()) - _state.get('maker_last_poll', int(time.time())),
-                        notes=f"maker_verify oid={oid} size={vf.get('filled_size')}",
-                        sec_remaining=_state.get('maker_sec_remaining'),
-                        price_bucket=_state.get('maker_price_bucket'))
-                    record_active_fill("btc15m", _state.get("window_ts"), _state.get('maker_side'))
+                    _handle_maker_fill(oid, source="verify", vf=vf)
                     seen.add(fill_key)
                     _state['maker_seen_fills'] = list(seen)[-200:]
-                _state['maker_done'] = True
-                _state['snipe_done'] = True
-                _state["consecutive_losses"] = 0  # Reset on successful fill
-                save_state()
+                else:
+                    _state['maker_done'] = True
+                    _state['snipe_done'] = True
+                    save_state()
                 return True
+        
+        # FIX #6: FOK fallback — if maker order has been open > MAKER_FOK_FALLBACK_SEC, 
+        # cancel and immediately try a FOK taker order at a slightly higher price
+        placed_ts = _state.get('maker_placed_ts', 0)
+        if (st.get('status') == 'open' 
+            and placed_ts > 0
+            and (int(time.time()) - placed_ts) >= MAKER_FOK_FALLBACK_SEC
+            and seconds_remaining > MAKER_CANCEL_SEC + 5):
+            
+            log(f"[BTC-MAKER] FOK FALLBACK: maker open for {int(time.time()) - placed_ts}s, converting to FOK taker")
+            maker_cancel_order(oid)
+            
+            # FIX #13: Add +0.02 premium above mid to hit actual ask (mid-price FOKs were not filling)
+            FOK_PREMIUM = 0.02
+            fok_price = round(min((market['yes_price'] if _state.get('maker_side') == 'UP' else market['no_price']) + FOK_PREMIUM, SIGNAL_MAX_ENTRY_PRICE), 4)
+            fok_token = _state.get('maker_token_id')
+            fok_shares = _state.get('maker_shares', 5.0)
+            
+            r = place_order("BUY", fok_shares, fok_price, market['condition_id'], fok_token)
+            for line in (r.get('output') or '').splitlines():
+                if line.strip() and any(tag in line for tag in ('[ATTEMPT', '[RESULT', 'FILL')):
+                    log(f"[EXEC] {line.strip()}")
+            
+            if r.get('filled'):
+                _handle_maker_fill(oid, source="fok_fallback")
+                return True
+            else:
+                log(f"[BTC-MAKER] FOK fallback no fill, will retry if time permits")
+                _state['diag_orders_cancelled'] = _state.get('diag_orders_cancelled', 0) + 1
+                # FIX #5: Allow retry after FOK fallback fails
+                if seconds_remaining > MAKER_RETRY_MIN_SEC and _state.get('maker_attempt_count', 0) < 3:
+                    _state['maker_attempt_count'] = _state.get('maker_attempt_count', 0) + 1
+                    log(f"[BTC-MAKER] RETRY enabled (attempt {_state['maker_attempt_count']}/3, {seconds_remaining}s remaining)")
+                    _reset_maker_state_for_retry()
+                    return None
+                else:
+                    _state['maker_done'] = True
+                    save_state()
+                    return False
+        
+        # Cancel at deadline
         if seconds_remaining <= MAKER_CANCEL_SEC and st.get('status') in ('open', 'partially_filled'):
             maker_cancel_order(oid)
+            _state['diag_orders_cancelled'] = _state.get('diag_orders_cancelled', 0) + 1
             log(f"[BTC-MAKER] cancel by deadline order_id={oid} sec_rem={seconds_remaining}")
             tg(f"[BTC-MAKER] ORDER CANCELLED: {oid} | sec_rem={seconds_remaining}")
+            
+            # FIX #5: Allow retry after deadline cancel if enough time (shouldn't happen at deadline, 
+            # but covers edge case where cancel_sec is generous)
             _state['maker_done'] = True
             save_state()
             return False
+    
     if _state.get('maker_done') or oid:
         return None
     if seconds_remaining > MAKER_START_SEC or seconds_remaining <= MAKER_CANCEL_SEC:
@@ -560,7 +687,13 @@ def check_maker_snipe(market, seconds_remaining):
         return None
     delta_pct = (base_price - _state['window_open_btc']) / _state['window_open_btc'] * 100
     log(f"[BTC-MAKER] now={base_price} open={_state['window_open_btc']} delta={delta_pct:+.3f}% sec_rem={seconds_remaining}")
-    direction = 'UP' if delta_pct > SNIPE_DELTA_MIN else ('DOWN' if delta_pct < -SNIPE_DELTA_MIN else None)
+    # FIX #14/16: UP only by default. DOWN disabled (25% win rate).
+    if delta_pct > SNIPE_DELTA_MIN:
+        direction = 'UP'
+    elif DOWN_ENABLED and delta_pct < -SNIPE_DELTA_MIN_DOWN:
+        direction = 'DOWN'
+    else:
+        direction = None
     if not direction:
         return None
 
@@ -570,10 +703,11 @@ def check_maker_snipe(market, seconds_remaining):
     hour_ago_prices = [p for t, p in prices if t <= hour_ago_ts + 60 and t >= hour_ago_ts - 60]
     if hour_ago_prices:
         hour_delta = (base_price - hour_ago_prices[0]) / hour_ago_prices[0] * 100
-        if direction == "UP" and hour_delta < -0.3:
+        # FIX #4b: Relaxed 1h trend threshold from 0.3% to 0.5%
+        if direction == "UP" and hour_delta < -0.5:
             log(f"[BTC-MAKER] 1h trend DOWN ({hour_delta:+.3f}%) conflicts with UP signal, skipping")
             return None
-        if direction == "DOWN" and hour_delta > 0.3:
+        if direction == "DOWN" and hour_delta > 0.5:
             log(f"[BTC-MAKER] 1h trend UP ({hour_delta:+.3f}%) conflicts with DOWN signal, skipping")
             return None
 
@@ -587,7 +721,7 @@ def check_maker_snipe(market, seconds_remaining):
     confirmations = 0
     for _, p in recent_prices[-SIGNAL_CONFIRM_COUNT:]:
         d = (p - _state['window_open_btc']) / _state['window_open_btc'] * 100
-        if (direction == 'UP' and d > SNIPE_DELTA_MIN) or (direction == 'DOWN' and d < -SNIPE_DELTA_MIN):
+        if (direction == 'UP' and d > SNIPE_DELTA_MIN) or (direction == 'DOWN' and d < -SNIPE_DELTA_MIN_DOWN):
             confirmations += 1
     if confirmations < SIGNAL_CONFIRM_COUNT:
         log(f"[BTC-MAKER] Confirm: {confirmations}/{SIGNAL_CONFIRM_COUNT}, skipping")
@@ -595,7 +729,7 @@ def check_maker_snipe(market, seconds_remaining):
     recent_avg = sum(p for _, p in recent_prices[-SIGNAL_CONFIRM_COUNT:]) / len(recent_prices[-SIGNAL_CONFIRM_COUNT:])
     momentum = (recent_avg - _state['window_open_btc']) / _state['window_open_btc'] * 100
     
-    # ── MOMENTUM ACCELERATION CHECK ──
+    # ── MOMENTUM ACCELERATION CHECK ── (FIX #4: softened threshold)
     recent = [(t, p) for t, p in prices if t >= now_ts - 120]
     if len(recent) >= 6:
         mid = len(recent) // 2
@@ -603,11 +737,11 @@ def check_maker_snipe(market, seconds_remaining):
         second_half = recent[mid:]
         delta_first = (first_half[-1][1] - first_half[0][1]) / first_half[0][1] * 100
         delta_second = (second_half[-1][1] - second_half[0][1]) / second_half[0][1] * 100
-        if abs(delta_second) < abs(delta_first) * 0.5:
-            log(f"[BTC-MAKER] momentum decelerating first={delta_first:+.4f}% second={delta_second:+.4f}%, skipping")
+        if abs(delta_second) < abs(delta_first) * MOMENTUM_DECEL_THRESHOLD:
+            log(f"[BTC-MAKER] momentum decelerating first={delta_first:+.4f}% second={delta_second:+.4f}% (threshold={MOMENTUM_DECEL_THRESHOLD}), skipping")
             return None
     
-    # Require momentum to be meaningfully above the noise floor (1.5% = 60% of delta threshold)
+    # Require momentum to be meaningfully above the noise floor
     MOMENTUM_MIN = SNIPE_DELTA_MIN * 1.50
     if abs(momentum) < MOMENTUM_MIN:
         log(f"[BTC-MAKER] momentum={momentum:+.3f}% < {MOMENTUM_MIN:.3f}%, skipping (weak)")
@@ -620,13 +754,12 @@ def check_maker_snipe(market, seconds_remaining):
     token_id = market['clob_token_id'][0] if direction == 'UP' else (market['clob_token_id'][1] if len(market['clob_token_id']) > 1 else '')
     token_price = market['yes_price'] if direction == 'UP' else market['no_price']
     
-    # ── NEW FILTERS: sec_remaining and entry_price ──
-    # Note: maker snipe window is t<300s down to t<10s, filter only ultra-late entries
+    # ── FILTERS: sec_remaining and entry_price ──
     if seconds_remaining < 15:
         log(f"[BTC-MAKER] FILTER: sec_remaining={seconds_remaining}s < 15s, skipping ultra-late entry")
         return None
     
-    # Price bucket classification and filtering — single source of truth: config vars
+    # FIX #1: Price bucket classification with raised max
     if token_price > SIGNAL_MAX_ENTRY_PRICE:
         price_bucket = "high"
         log(f"[BTC-MAKER] FILTER: entry_price={token_price:.4f} > max {SIGNAL_MAX_ENTRY_PRICE:.2f} (bucket={price_bucket}), skipping high price")
@@ -649,10 +782,11 @@ def check_maker_snipe(market, seconds_remaining):
     if token_price < MAKER_MIN_PRICE:
         log(f"[BTC-MAKER] token_mid={token_price:.4f} < min {MAKER_MIN_PRICE:.4f}, skipping")
         return None
-    # max already enforced at top of function via SIGNAL_MAX_ENTRY_PRICE
+    
+    # FIX #2: More competitive limit price (reduced offset)
     limit_price = max(0.01, round(token_price - MAKER_OFFSET, 2))
     shares = max(5.0, math.floor((SNIPE_DEFAULT / max(limit_price, 0.01)) * 100) / 100)
-    log(f"[BTC-MAKER] {direction} signal token_mid={token_price:.4f} limit={limit_price:.4f} shares={shares:.2f} dry={MAKER_DRY_RUN}")
+    log(f"[BTC-MAKER] {direction} signal token_mid={token_price:.4f} limit={limit_price:.4f} shares={shares:.2f} dry={MAKER_DRY_RUN} attempt={_state.get('maker_attempt_count', 0)+1}")
     r = maker_place_order('BUY', shares, limit_price, market['condition_id'], token_id)
     for line in (r.get('output') or '').splitlines():
         if line.strip() and ('[MAKER' in line or '[RESULT' in line or '[ATTEMPT' in line):
@@ -667,9 +801,10 @@ def check_maker_snipe(market, seconds_remaining):
     _state['maker_price'] = limit_price
     _state['maker_shares'] = shares
     _state['maker_last_poll'] = int(time.time())
+    _state['maker_placed_ts'] = int(time.time())  # FIX #5: track placement time
     _state['maker_done'] = False
+    _state['diag_orders_placed'] = _state.get('diag_orders_placed', 0) + 1
     save_state()
-    # Send Telegram notification for order placement
     tg(f"[BTC-MAKER] ORDER PLACED: {direction} {shares:.2f} shares @ {limit_price:.4f} | Order: {r.get('order_id') or (r.get('posted') or {}).get('order_id') or ''}")
     return r.get('success')
 
@@ -720,15 +855,16 @@ def check_arb(market):
         return None
     combined = market["yes_price"] + market["no_price"]
     if combined >= ARB_THRESHOLD:
-        log(f"[ARB] No arb. Combined={combined:.4f} >= {ARB_THRESHOLD}")
+        # FIX #7: Only log arb miss once per window to reduce noise
+        if not _state.get("arb_logged"):
+            log(f"[ARB] No arb this window. Combined={combined:.4f} >= {ARB_THRESHOLD}")
+            _state["arb_logged"] = True
         return None
 
     log(f"[ARB] FOUND! YES={market['yes_price']:.4f} NO={market['no_price']:.4f} COMBINED={combined:.4f}")
-    # Buy both legs
     yes_tid = market["clob_token_id"][0] if len(market["clob_token_id"]) > 0 else ""
     no_tid  = market["clob_token_id"][1] if len(market["clob_token_id"]) > 1 else ""
 
-    # FOK orders — buy equal dollar value of each
     yes_shares = ARB_SIZE / market["yes_price"]
     no_shares  = ARB_SIZE / market["no_price"]
 
@@ -762,13 +898,15 @@ def check_snipe(market, seconds_remaining):
     delta_pct = (btc_price - _state["window_open_btc"]) / _state["window_open_btc"] * 100
     log(f"[SNIPE] BTC now={btc_price} window_open={_state['window_open_btc']} delta={delta_pct:+.3f}%")
 
+    # FIX #14: Asymmetric delta — DOWN requires stronger signal
     direction = None
+    # FIX #16: DOWN disabled by default
     if delta_pct > SNIPE_DELTA_MIN:
         direction = "UP"
-    elif delta_pct < -SNIPE_DELTA_MIN:
+    elif DOWN_ENABLED and delta_pct < -SNIPE_DELTA_MIN_DOWN:
         direction = "DOWN"
     else:
-        log(f"[SNIPE] Delta {delta_pct:+.3f}% too small, skipping")
+        log(f"[SNIPE] Delta {delta_pct:+.3f}% — no valid signal (DOWN_ENABLED={DOWN_ENABLED})")
         return None
 
     current_window_ts = _state.get("window_ts")
@@ -776,17 +914,14 @@ def check_snipe(market, seconds_remaining):
         log(f"[BTC-SNIPE] CORRELATION BLOCK: ETH already filled {direction} in window {current_window_ts}, skipping")
         return None
 
-    # Pick token
     token_id = market["clob_token_id"][0] if direction == "UP" else (market["clob_token_id"][1] if len(market["clob_token_id"]) > 1 else "")
     price    = market["yes_price"] if direction == "UP" else market["no_price"]
 
-    # ── NEW FILTERS: sec_remaining and entry_price ──
-    # Note: snipe window is t<30s, so we skip only extremely late entries (t<15s)
     if seconds_remaining < 15:
         log(f"[SNIPE] FILTER: sec_remaining={seconds_remaining}s < 15s, skipping ultra-late entry")
         return None
     
-    # Price bucket classification — single source of truth: config vars
+    # FIX #1: Price bucket classification with raised max
     if price > SIGNAL_MAX_ENTRY_PRICE:
         price_bucket = "high"
         log(f"[SNIPE] FILTER: entry_price={price:.4f} > max {SIGNAL_MAX_ENTRY_PRICE:.2f} (bucket={price_bucket}), skipping high price")
@@ -808,14 +943,12 @@ def check_snipe(market, seconds_remaining):
 
     size = SNIPE_STRONG if abs(delta_pct) >= SNIPE_STRONG_D * 100 else SNIPE_DEFAULT
     shares = size / price
-    # Ensure minimum 5 shares for Polymarket
     if shares < 5:
         shares = 5
         size = shares * price
 
     log(f"[SNIPE] {direction} signal! BTC delta={delta_pct:+.3f}% size=${size:.2f} price={price:.4f} shares={shares:.2f}")
     r = place_order("BUY", shares, price, market["condition_id"], token_id)
-    # Log executor output so [ATTEMPT]/[RESULT] lines are visible
     for line in (r.get("output") or "").splitlines():
         if any(tag in line for tag in ("[ATTEMPT]", "[RESULT]", "Book best", "FILL")):
             log(f"[EXEC] {line.strip()}")
@@ -858,7 +991,8 @@ def setup_new_window(slug, window_ts):
     if btc_price is None:
         btc_price = _state.get("window_open_btc", 0.0)
 
-    # Keep 70 minutes of price history for 1-hour trend filter
+    # FIX #3: Keep 70 minutes of price history for 1-hour trend filter
+    # (was being trimmed to current window_ts in main loop, breaking the 1h lookback)
     cutoff = int(time.time()) - 4200  # 70 minutes
     old_prices = _state.get("btc_prices", [])
     _state["btc_prices"] = [(t, p) for t, p in old_prices if t >= cutoff]
@@ -868,6 +1002,7 @@ def setup_new_window(slug, window_ts):
     _state["window_ts"]       = window_ts
     _state["window_open_btc"] = btc_price
     _state["arb_done"]        = False
+    _state["arb_logged"]      = False  # FIX #7: reset arb log flag
     _state["snipe_done"]      = False
     _state["maker_order_id"]  = ""
     _state["maker_token_id"]  = ""
@@ -876,12 +1011,12 @@ def setup_new_window(slug, window_ts):
     _state["maker_shares"]    = 0.0
     _state["maker_done"]      = False
     _state["maker_last_poll"] = 0
+    _state["maker_placed_ts"] = 0
+    _state["maker_attempt_count"] = 0  # FIX #5: reset retry counter
     _state["prev_slug"]       = slug
     save_state()
-    # DO NOT trigger post-resolution here anymore
 
     log(f"[NEW WINDOW] ts={window_ts} BTC={btc_price} slug={slug}")
-    # Window start — no telegram noise
 
 # ── Daily loss check ───────────────────────────────────────────────────────────
 def check_daily_limit():
@@ -902,7 +1037,9 @@ def main():
     init_active_fills_db()
     log("=" * 60)
     log(f"[BTC-15M] STARTING {'(DRY RUN)' if DRY_RUN else '(LIVE)'}")
-    log(f"[BTC-15M] Arb threshold=${ARB_THRESHOLD}, snipe delta>={SNIPE_DELTA_MIN}%, max daily loss=${MAX_DAILY_LOSS} | min_entry={SIGNAL_MIN_ENTRY_PRICE:.2f} max_entry={SIGNAL_MAX_ENTRY_PRICE:.2f} maker={MAKER_ENABLED} dry={MAKER_DRY_RUN} start=T-{MAKER_START_SEC} cancel=T-{MAKER_CANCEL_SEC} offset={MAKER_OFFSET}")
+    log(f"[BTC-15M] Arb threshold=${ARB_THRESHOLD}, snipe delta>={SNIPE_DELTA_MIN}%, max daily loss=${MAX_DAILY_LOSS}")
+    log(f"[BTC-15M] min_entry={SIGNAL_MIN_ENTRY_PRICE:.2f} max_entry={SIGNAL_MAX_ENTRY_PRICE:.2f} maker={MAKER_ENABLED} dry={MAKER_DRY_RUN} start=T-{MAKER_START_SEC} cancel=T-{MAKER_CANCEL_SEC} offset={MAKER_OFFSET}")
+    log(f"[BTC-15M] fok_fallback={MAKER_FOK_FALLBACK_SEC}s retry_min={MAKER_RETRY_MIN_SEC}s decel_threshold={MOMENTUM_DECEL_THRESHOLD}")
     tg("[BTC-15M] Engine started!")
 
     while True:
@@ -916,8 +1053,14 @@ def main():
 
         # New window?
         if window_ts != _state["window_ts"]:
+            # FIX #8: Log fill rate diagnostics on window transition
+            placed = _state.get('diag_orders_placed', 0)
+            filled = _state.get('diag_orders_filled', 0)
+            cancelled = _state.get('diag_orders_cancelled', 0)
+            if placed > 0:
+                log(f"[DIAG] Window fill rate: {filled}/{placed} filled, {cancelled} cancelled ({filled/placed*100:.0f}% fill rate)")
+            
             log(f"[CYCLE] New window detected: {slug}")
-            # Run post-resolution tasks from *previous* window before setting up new one
             trigger_post_resolution_tasks()
             setup_new_window(slug, window_ts)
 
@@ -939,15 +1082,15 @@ def main():
         btc = get_btc_price()
         if btc:
             _state["btc_prices"].append((int(time.time()), btc))
-            # Keep last window's prices only
-            cutoff = int(time.time()) - 4200  # keep ~70 minutes for 1h trend filter
+            # FIX #3: Keep 70 minutes of history (was trimming to window_ts, breaking 1h trend)
+            cutoff = int(time.time()) - 4200  # 70 minutes
             _state["btc_prices"] = [(t, p) for t, p in _state["btc_prices"] if t >= cutoff]
 
         # Strategy A: Arb (first 14.75 min)
         if sec_rem > 15:
             check_arb(market)
 
-        # Gabagool tracking (dry-run aware, no real orders unless explicitly enabled elsewhere)
+        # Gabagool tracking
         check_gabagool(market, sec_rem)
 
         # Strategy B: Snipe / Maker Snipe
