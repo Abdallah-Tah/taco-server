@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT_DEFAULT="/home/abdaltm86/.openclaw/workspace"
+cur="${1:-$ROOT_DEFAULT}"
+
+while true; do
+  clear
+  echo "📁 Mobile File Browser"
+  echo "----------------------"
+  echo "Current: $cur"
+  echo
+  echo "0) .. (parent)"
+
+  mapfile -t entries < <(find "$cur" -maxdepth 1 -mindepth 1 | sort)
+  i=1
+  for p in "${entries[@]}"; do
+    name=$(basename "$p")
+    if [[ -d "$p" ]]; then
+      echo "$i) [DIR]  $name"
+    else
+      size=$(stat -c %s "$p" 2>/dev/null || echo "?")
+      echo "$i) [FILE] $name ($size B)"
+    fi
+    ((i++))
+  done
+
+  echo
+  echo "Commands: number | r=refresh | q=quit"
+  read -rp "> " choice
+
+  case "$choice" in
+    q|Q) exit 0 ;;
+    r|R) continue ;;
+    0)
+      parent=$(dirname "$cur")
+      [[ "$parent" == "$cur" ]] || cur="$parent"
+      continue
+      ;;
+  esac
+
+  if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#entries[@]} )); then
+    sel="${entries[$((choice-1))]}"
+    if [[ -d "$sel" ]]; then
+      cur="$sel"
+    else
+      clear
+      echo "📄 $(basename "$sel")"
+      echo "----------------------"
+      if file "$sel" | grep -qiE 'text|json|script|xml|yaml|csv|log'; then
+        sed -n '1,220p' "$sel"
+      else
+        file "$sel"
+        echo
+        echo "Binary/non-text file."
+      fi
+      echo
+      read -rp 'Press Enter to go back...' _
+    fi
+  fi
+done

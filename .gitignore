@@ -1,0 +1,4 @@
+dashboard/node_modules/
+dashboard/.package-lock.json
+*.log
+.DS_Store

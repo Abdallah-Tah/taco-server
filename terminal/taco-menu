@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+set -euo pipefail
+pause(){ echo; read -rp 'Press Enter to go back...' _; }
+show_trader_live() {
+  while true; do
+    clear
+    echo '🌮 Trader Live View'
+    echo '-------------------'
+    echo 'Press q then Enter to go back.'
+    echo
+    tail -n 25 /tmp/taco_trader.log 2>/dev/null || echo 'No trader log found'
+    echo
+    read -r -t 3 -p 'Refreshes every 3s > ' key || true
+    if [[ "${key:-}" == "q" || "${key:-}" == "Q" ]]; then
+      break
+    fi
+  done
+}
+while true; do
+  clear
+  cat <<'EOF'
+🌮 Taco Control Panel
+---------------------
+1. Restart OpenClaw
+2. OpenClaw status
+3. Switch/check models
+4. Trader status
+5. Trader log (live)
+6. System info
+7. Open full shell
+8. File browser
+9. Ranger file manager
+10. Exit
+
+Tip: in the shell, type: menu or fm
+EOF
+  read -rp 'Choose 1-10: ' choice
+  case "$choice" in
+    1)
+      systemctl --user restart openclaw-gateway.service
+      echo '✅ OpenClaw restarted.'
+      pause
+      ;;
+    2)
+      systemctl --user status openclaw-gateway.service | sed -n '1,14p'
+      pause
+      ;;
+    3)
+      echo '--- Models ---'
+      ollama list || true
+      echo
+      echo 'To switch model in chat, use /model inside Telegram.'
+      pause
+      ;;
+    4)
+      echo '--- Trader process ---'
+      ps aux | grep taco_trader.py | grep -v grep || echo 'Trader not running'
+      echo
+      echo '--- Latest log ---'
+      tail -n 20 /tmp/taco_trader.log 2>/dev/null || echo 'No trader log found'
+      pause
+      ;;
+    5)
+      show_trader_live
+      ;;
+    6)
+      echo '--- Memory ---'
+      free -h
+      echo
+      echo '--- Disk ---'
+      df -h /
+      echo
+      echo '--- Uptime ---'
+      uptime
+      pause
+      ;;
+    7)
+      exec /home/abdaltm86/Documents/taco-servers/terminal/mobile-shell
+      ;;
+    8)
+      exec /home/abdaltm86/Documents/taco-servers/terminal/mobile-files
+      ;;
+    9)
+      exec ranger /home/abdaltm86/.openclaw/workspace
+      ;;
+    10)
+      exit 0
+      ;;
+    *)
+      echo 'Invalid choice.'
+      sleep 1
+      ;;
+  esac
+done
