@@ -39,13 +39,17 @@ Skills are shared. Your setup is yours. Keeping them apart means you can update 
 
 ### TTS / Voice
 
-- Main English voice for Taco: **en-US-AndrewNeural** (edge-tts)
+- Main English voice for Taco: **en-US-DavisNeural** (edge-tts)
 - Arabic voice: **ar-SA-HamedNeural**
 - French voice: **fr-FR-HenriNeural**
-- Voice interaction rule:
-  - User sends voice → reply with voice in the SAME language
-  - User sends text → reply with text
-  - Detect language from transcript, pick matching voice
+- Reply mode rule:
+  - User sends text -> reply with text
+  - User sends voice -> reply with voice
+  - Do not turn text replies into voice unless explicitly asked
+- Language rule for voice replies:
+  - Detect the language from the transcript
+  - Reply in the same language
+  - Pick the matching configured voice when available
 - STT: faster-whisper (local, free, no API key)
 - Model: "tiny" (fast, Pi-friendly)
 

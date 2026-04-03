@@ -17,6 +17,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -45,6 +46,7 @@ def send_to_telegram(message, chat_id):
         for chunk in chunks:
             result = subprocess.run([
                 "openclaw", "message", "send",
+                "--channel", "telegram",
                 "--target", str(chat_id),
                 "--message", chunk
             ], capture_output=True, text=True, timeout=30)
@@ -119,6 +121,14 @@ def handle_command(command_name, chat_id, dry_run=False):
     }
 
 
+def handle_command_async(command_name, chat_id):
+    """Run Telegram command handling outside the webhook request path."""
+    try:
+        handle_command(command_name, chat_id)
+    except Exception as exc:
+        print(f"Async command handling failed: {exc}", file=sys.stderr, flush=True)
+
+
 class ReportWebhookHandler(BaseHTTPRequestHandler):
     """HTTP handler for report webhook requests."""
 
@@ -151,11 +161,15 @@ class ReportWebhookHandler(BaseHTTPRequestHandler):
                             break
 
                 if chat_id and command:
-                    result = handle_command(command, chat_id)
                     self.send_response(200)
                     self.send_header('Content-Type', 'application/json')
                     self.end_headers()
-                    self.wfile.write(json.dumps(result).encode())
+                    self.wfile.write(json.dumps({"status": "accepted"}).encode())
+                    threading.Thread(
+                        target=handle_command_async,
+                        args=(command, chat_id),
+                        daemon=True,
+                    ).start()
                 else:
                     self.send_response(200)
                     self.send_header('Content-Type', 'application/json')

@@ -17,6 +17,7 @@ app = Flask(__name__)
 
 # Configuration
 ROOT = Path.home() / ".openclaw" / "workspace" / "trading"
+PUBLIC_URL = "https://degrees-aluminum-equilibrium-rarely.trycloudflare.com"
 DB_PATH = ROOT / "journal.db"
 AUTH_TOKEN = os.environ.get("TACO_API_TOKEN", "your-secret-token-here")
 
@@ -123,6 +124,7 @@ def get_system_stats():
 
 # API Endpoints
 
+@app.route('/system', methods=['GET'])
 @app.route('/api/system', methods=['GET'])
 def api_system():
     """System health endpoint"""

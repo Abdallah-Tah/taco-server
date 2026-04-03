@@ -1,0 +1,29 @@
+{
+  "positions": {
+    "DOGE-USD": {
+      "pair": "DOGE-USD",
+      "entry_price": 0.08959,
+      "amount": 122.78156044201361,
+      "size_usd": 11.0,
+      "entry_time": "2026-04-02T12:50:32.823160+00:00",
+      "trade_id": "1369696b-ed68-4b43-ab0e-6135e21e5c30",
+      "take_profit": 0.092278,
+      "stop_loss": 0.087798
+    },
+    "SOL-USD": {
+      "pair": "SOL-USD",
+      "entry_price": 79.2,
+      "amount": 0.1388888888888889,
+      "size_usd": 11.0,
+      "entry_time": "2026-04-02T14:42:24.075409+00:00",
+      "trade_id": "9b22b184-e45c-4335-a085-1c8dd14668df",
+      "take_profit": 81.576,
+      "stop_loss": 77.616
+    }
+  },
+  "daily_trades": 2,
+  "daily_reset": "2026-04-02",
+  "last_trade_time": {
+    "SOL-USD": 1775140640.8530838
+  }
+}

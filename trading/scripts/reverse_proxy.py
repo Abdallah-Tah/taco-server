@@ -13,14 +13,14 @@ PROXY_PORT = 18792
 
 class ProxyHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
-        # Route /api/* to webhook, everything else to OpenClaw
+        # Route report/webhook endpoints to the webhook service.
         if self.path.startswith('/api/'):
             self._proxy_to(WEBHOOK_PORT)
         else:
             self._proxy_to(OPENCLAW_PORT)
     
     def do_POST(self):
-        if self.path.startswith('/api/'):
+        if self.path.startswith('/api/') or self.path == '/webhook':
             self._proxy_to(WEBHOOK_PORT, method='POST')
         else:
             self._proxy_to(OPENCLAW_PORT, method='POST')

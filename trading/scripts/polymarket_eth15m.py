@@ -19,10 +19,12 @@ Changes from original:
  14. Correlation stagger: ETH waits 20s before entering, so BTC fills first and block can detect
  15. DOWN signals disabled by default (ETH DOWN was 38% win rate, -$9.96)
  16. Max entry capped at 0.55 (entries above 0.55 have negative expectancy)
+ 17. Re-enabled DOWN signals — ETH DOWN at 0.65 had 44% win rate (best signal Apr 2)
 
 Dry run by default. Set DRY_RUN=false to go live.
 """
 import json
+import hashlib
 import os
 import math
 import subprocess
@@ -91,8 +93,8 @@ ARB_SIZE        = _float("ETH15M_ARB_SIZE", 10.00)
 SNIPE_DELTA_MIN = _float("ETH15M_SNIPE_DELTA_MIN", 0.05)
 # FIX #14: Asymmetric delta — DOWN needs stronger signal (38% win rate was bad)
 SNIPE_DELTA_MIN_DOWN = _float("ETH15M_SNIPE_DELTA_MIN_DOWN", 0.12)
-# FIX #16: Disable DOWN entirely — 38% win rate, -$9.96 over 2 days
-DOWN_ENABLED = os.environ.get("ETH15M_DOWN_ENABLED", ENV.get("ETH15M_DOWN_ENABLED", "false")).lower() == "true"
+# FIX #16: Re-enabled DOWN — ETH DOWN at 0.65 entry had 44% win rate, best signal today
+DOWN_ENABLED = os.environ.get("ETH15M_DOWN_ENABLED", ENV.get("ETH15M_DOWN_ENABLED", "true")).lower() == "true"
 SIGNAL_CONFIRM_COUNT = _int("ETH15M_SIGNAL_CONFIRM_COUNT", 2)
 SIGNAL_CONFIRM_SEC   = _int("ETH15M_SIGNAL_CONFIRM_SEC", 15)
 # FIX #17: Capped max entry at 0.55 — above 0.55 has negative expectancy
@@ -138,6 +140,7 @@ _state = {
     "diag_orders_placed": 0,
     "diag_orders_filled": 0,
     "diag_orders_cancelled": 0,
+    "notified_resolved_ids": [],
 }
 _positions = []
 
@@ -167,6 +170,39 @@ def tg(msg):
     threading.Thread(target=_send, daemon=True).start()
 
 
+def notify_recent_resolutions():
+    if DRY_RUN:
+        return
+    try:
+        conn = sqlite3.connect(str(JOURNAL_DB))
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, asset, side, pnl_absolute
+            FROM trades
+            WHERE engine='eth15m' AND exit_type='resolved'
+            ORDER BY timestamp_close DESC
+            LIMIT 10
+        """)
+        rows = cur.fetchall()
+        conn.close()
+    except Exception as e:
+        log(f"[ETH-POST-RESOLUTION] notify_recent_resolutions failed: {e}")
+        return
+
+    seen = set(_state.get("notified_resolved_ids", []))
+    notified = list(_state.get("notified_resolved_ids", []))
+    new_rows = [row for row in reversed(rows) if row[0] and row[0] not in seen]
+    for trade_id, asset, side, pnl_abs in new_rows:
+        pnl_abs = float(pnl_abs or 0.0)
+        outcome = "WIN" if pnl_abs >= 0 else "LOST"
+        tg(f"[ETH-15M] {outcome}: {side or '?'} {asset or ''} | P&L ${pnl_abs:+.2f}")
+        notified.append(trade_id)
+
+    if new_rows:
+        _state["notified_resolved_ids"] = notified[-100:]
+        save_state()
+
+
 def trigger_post_resolution_tasks():
     if DRY_RUN:
         return
@@ -174,6 +210,7 @@ def trigger_post_resolution_tasks():
         reconcile_proc = subprocess.Popen([str(VENV_PY), str(WORK_DIR / 'scripts' / 'polymarket_reconcile.py')], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             reconcile_proc.wait(timeout=30)
+            notify_recent_resolutions()
             check_consecutive_losses()
         except subprocess.TimeoutExpired:
             log("[ETH-POST-RESOLUTION] WARNING: Reconcile timed out.")
@@ -352,11 +389,33 @@ def place_order(side, shares, price, condition_id, token_id):
     return payload
 
 # ── Journal logging ───────────────────────────────────────────────────────────
+def _current_trade_slug():
+    window_ts = int(_state.get("window_ts") or 0)
+    return f"eth-updown-15m-{window_ts}" if window_ts else "eth-15m"
+
+
+def _current_trade_id(direction):
+    slug = _current_trade_slug()
+    stable = f"eth15m:{slug}:{direction or 'UNKNOWN'}"
+    return hashlib.sha256(stable.encode()).hexdigest()[:32]
+
+
+def _current_window_open_iso():
+    window_ts = int(_state.get("window_ts") or 0)
+    if not window_ts:
+        return datetime.now(timezone.utc).isoformat()
+    return datetime.fromtimestamp(window_ts, tz=timezone.utc).isoformat()
+
+
 def log_trade(engine, direction, size_usd, entry_price, pnl, exit_type, hold_sec, notes="", sec_remaining=None, price_bucket=None):
     import sqlite3
     try:
         conn = sqlite3.connect(str(JOURNAL_DB))
         c = conn.cursor()
+        trade_id = _current_trade_id(direction)
+        timestamp_open = _current_window_open_iso()
+        is_resolved = exit_type == "resolved"
+        asset = _current_trade_slug()
         
         full_notes = notes
         if sec_remaining is not None:
@@ -366,17 +425,18 @@ def log_trade(engine, direction, size_usd, entry_price, pnl, exit_type, hold_sec
         
         c.execute("""
             INSERT INTO trades (
-                engine, timestamp_open, timestamp_close, asset,
+                id, engine, timestamp_open, timestamp_close, asset,
                 category, direction, entry_price, exit_price,
                 position_size, position_size_usd, pnl_absolute, pnl_percent,
                 exit_type, hold_duration_seconds, regime, notes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            engine, datetime.now(timezone.utc).isoformat(),
-            datetime.now(timezone.utc).isoformat() if exit_type else None,
-            "eth-15m",
-            "btc-updown",
-            direction, entry_price, entry_price if not exit_type else entry_price,
+            trade_id,
+            engine, timestamp_open,
+            datetime.now(timezone.utc).isoformat() if is_resolved else None,
+            asset,
+            "eth-updown",
+            direction, entry_price, entry_price if is_resolved else None,
             size_usd / entry_price if entry_price else 0,
             size_usd, pnl or 0.0, (pnl/size_usd*100) if size_usd else 0,
             exit_type or "open", hold_sec or 0,
@@ -531,49 +591,63 @@ def _reset_maker_state_for_retry():
 
 def _handle_maker_fill(oid, source="status", vf=None):
     """Centralized fill handling for maker orders."""
+    fill_side = _state.get('maker_side')
+    fill_price = _state.get('maker_price', 0)
+    fill_shares = _state.get('maker_shares', 0)
+    fill_placed_ts = _state.get('maker_placed_ts', int(time.time()))
+    fill_sec_remaining = _state.get('maker_sec_remaining')
+    fill_price_bucket = _state.get('maker_price_bucket')
+
     _state['maker_done'] = True
     _state['snipe_done'] = True
     _state['consecutive_losses'] = 0
     _state['diag_orders_filled'] = _state.get('diag_orders_filled', 0) + 1
-    record_active_fill("eth15m", _state.get("window_ts"), _state.get('maker_side'))
+    record_active_fill("eth15m", _state.get("window_ts"), fill_side)
+    _state['maker_order_id'] = ""
+    _state['maker_token_id'] = ""
+    _state['maker_side'] = ""
+    _state['maker_price'] = 0.0
+    _state['maker_shares'] = 0.0
+    _state['maker_last_poll'] = 0
+    _state['maker_placed_ts'] = 0
     save_state()
     
     if source == "status":
         tg(f"[ETH-MAKER] FILLED order {oid}")
-        log_trade("eth15m", _state.get('maker_side', 'UP'),
-            _state.get('maker_shares', 0) * _state.get('maker_price', 0),
-            _state.get('maker_price', 0), 0, 'filled',
-            int(time.time()) - _state.get('maker_placed_ts', int(time.time())),
+        log_trade("eth15m", fill_side or 'UP',
+            fill_shares * fill_price,
+            fill_price, 0, 'filled',
+            int(time.time()) - fill_placed_ts,
             notes=f"maker_fill oid={oid}",
-            sec_remaining=_state.get('maker_sec_remaining'),
-            price_bucket=_state.get('maker_price_bucket'))
+            sec_remaining=fill_sec_remaining,
+            price_bucket=fill_price_bucket)
     elif source == "verify" and vf:
         avg_fill_price = vf.get('avg_fill_price')
         effective_cost = vf.get('effective_cost')
         tx_hashes = vf.get('tx_hashes') or []
         log(f"[ETH-MAKER] fill verified via {vf.get('source')} size={vf.get('filled_size')} "
-            f"submitted_limit={_state.get('maker_price', 0):.4f} "
+            f"submitted_limit={fill_price:.4f} "
             f"avg_fill_price={(f'{float(avg_fill_price):.4f}' if avg_fill_price is not None else 'n/a')} "
             f"effective_cost={(f'${float(effective_cost or 0):.4f}' if effective_cost is not None else 'n/a')} "
             f"tx_hashes={','.join(tx_hashes[:3]) if tx_hashes else 'n/a'}")
-        _execution_anomaly_check(_state.get('maker_price', 0), avg_fill_price)
+        _execution_anomaly_check(fill_price, avg_fill_price)
         tg(f"[ETH-MAKER] FILL VERIFIED {vf.get('filled_size')} shares")
-        log_trade("eth15m", _state.get('maker_side'),
-            vf.get('filled_size', 0) * _state.get('maker_price', 0),
-            _state.get('maker_price', 0), 0, 'filled',
-            int(time.time()) - _state.get('maker_placed_ts', int(time.time())),
+        log_trade("eth15m", fill_side,
+            vf.get('filled_size', 0) * fill_price,
+            fill_price, 0, 'filled',
+            int(time.time()) - fill_placed_ts,
             notes=f"maker_verify oid={oid} size={vf.get('filled_size')}",
-            sec_remaining=_state.get('maker_sec_remaining'),
-            price_bucket=_state.get('maker_price_bucket'))
+            sec_remaining=fill_sec_remaining,
+            price_bucket=fill_price_bucket)
     elif source == "fok_fallback":
         tg(f"[ETH-MAKER] FOK FALLBACK FILL")
-        log_trade("eth15m", _state.get('maker_side', 'UP'),
-            _state.get('maker_shares', 0) * _state.get('maker_price', 0),
-            _state.get('maker_price', 0), 0, 'filled',
-            int(time.time()) - _state.get('maker_placed_ts', int(time.time())),
+        log_trade("eth15m", fill_side or 'UP',
+            fill_shares * fill_price,
+            fill_price, 0, 'filled',
+            int(time.time()) - fill_placed_ts,
             notes=f"fok_fallback oid={oid}",
-            sec_remaining=_state.get('maker_sec_remaining'),
-            price_bucket=_state.get('maker_price_bucket'))
+            sec_remaining=fill_sec_remaining,
+            price_bucket=fill_price_bucket)
 
 
 def check_maker_snipe(market, seconds_remaining):
@@ -619,6 +693,7 @@ def check_maker_snipe(market, seconds_remaining):
             
             log(f"[ETH-MAKER] FOK FALLBACK: maker open for {int(time.time()) - placed_ts}s, converting to FOK taker")
             maker_cancel_order(oid)
+            tg(f"[ETH-MAKER] ORDER CANCELLED (FOK fallback): {oid} | open_for={int(time.time()) - placed_ts}s")
             
             # FIX #12: Add +0.02 premium above mid to hit actual ask (mid-price FOKs were not filling)
             FOK_PREMIUM = 0.02
