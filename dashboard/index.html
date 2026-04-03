@@ -1,259 +1,1217 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>TacoClaw Live Trading Dashboard</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;500;700&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
-    <style>
-        :root { --bg: #020617; --surface: #0f172a; --banana: #FACC15; --banana-glow: rgba(250, 204, 21, 0.4); --border: rgba(250, 204, 21, 0.1); }
-        body { background-color: var(--bg); color: #f1f1f1; font-family: 'Space Grotesk', sans-serif; overflow: hidden; height: 100vh; }
-        .mono { font-family: 'JetBrains Mono', monospace; }
-        .glass { background: rgba(15, 23, 42, 0.85); backdrop-filter: blur(24px); border: 1px solid var(--border); }
-        .layout-grid { display: grid; grid-template-columns: 1fr 400px; grid-template-rows: 72px 1fr; height: 100vh; gap: 1px; background: rgba(250, 204, 21, 0.05); }
-        .nav-header { grid-column: 1 / -1; z-index: 100; }
-        .main-stage { grid-column: 1 / 2; overflow-y: auto; padding: 1.5rem; background: radial-gradient(circle at top left, #0f172a 0%, #020617 100%); }
-        .activity-sidebar { grid-column: 2 / 3; background: #020617; overflow-y: auto; border-left: 1px solid var(--border); }
-        .banana-card { background: var(--surface); border: 1px solid var(--border); padding: 1.25rem; border-radius: 1.25rem; }
-        .stat-label { font-size: 0.65rem; font-weight: 800; color: #64748b; text-transform: uppercase; letter-spacing: 0.2em; }
-        .stat-value { font-size: 1.75rem; font-weight: 700; line-height: 1; margin-top: 0.25rem; }
-        #galaxy-container { height: 450px; background: #000; border-radius: 2rem; position: relative; overflow: hidden; border: 1px solid rgba(250, 204, 21, 0.2); }
-        #galaxy-canvas { width: 100%; height: 100%; }
-        .galaxy-overlay { position: absolute; top: 1.5rem; left: 2rem; pointer-events: none; }
-        @keyframes fadeInRight { from { opacity: 0; transform: translateX(30px); } to { opacity: 1; transform: translateX(0); } }
-        .animate-event { animation: fadeInRight 0.4s ease-out forwards; }
-        ::-webkit-scrollbar { width: 4px; }
-        ::-webkit-scrollbar-thumb { background: #334155; border-radius: 10px; }
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TacoClaw Live — Galaxy Engine</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Orbitron:wght@400;500;600;700;800;900&family=Exo+2:wght@300;400;500;600;700&display=swap');
+
+  :root {
+    --bg-deep: #060b18;
+    --bg-panel: #0a1128;
+    --bg-card: #0d1a33;
+    --border-glow: rgba(0, 180, 255, 0.15);
+    --accent-cyan: #00d4ff;
+    --accent-purple: #a855f7;
+    --accent-pink: #ff3b8b;
+    --accent-gold: #fbbf24;
+    --accent-green: #34d399;
+    --accent-red: #ef4444;
+    --text-primary: #e2e8f0;
+    --text-dim: #64748b;
+    --text-bright: #f8fafc;
+    --laser-green: #00ff88;
+    --laser-core: #ffffff;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: var(--bg-deep);
+    color: var(--text-primary);
+    font-family: 'Exo 2', sans-serif;
+    overflow: hidden;
+    height: 100vh;
+  }
+
+  .galaxy-container {
+    position: relative;
+    width: 100%;
+    height: 100vh;
+    overflow: hidden;
+  }
+
+  .galaxy-container.screen-shake {
+    animation: screenShake 0.4s ease-out;
+  }
+
+  @keyframes screenShake {
+    0% { transform: translate(0, 0); }
+    15% { transform: translate(-4px, 3px); }
+    30% { transform: translate(5px, -2px); }
+    45% { transform: translate(-3px, -4px); }
+    60% { transform: translate(4px, 2px); }
+    75% { transform: translate(-2px, 3px); }
+    100% { transform: translate(0, 0); }
+  }
+
+  canvas#starfield,
+  canvas#laserCanvas {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+  }
+
+  canvas#starfield { z-index: 0; }
+  canvas#laserCanvas {
+    z-index: 6;
+    pointer-events: none;
+  }
+
+  .nebula-layer {
+    position: absolute;
+    inset: 0;
+    z-index: 1;
+    pointer-events: none;
+  }
+
+  .nebula-blob {
+    position: absolute;
+    border-radius: 50%;
+    filter: blur(80px);
+    animation: nebulaPulse 12s ease-in-out infinite;
+  }
+
+  .nebula-blob.blue {
+    width: 500px;
+    height: 400px;
+    background: radial-gradient(ellipse, rgba(0, 120, 255, 0.08), transparent 70%);
+    top: 10%;
+    left: 15%;
+  }
+
+  .nebula-blob.purple {
+    width: 600px;
+    height: 350px;
+    background: radial-gradient(ellipse, rgba(130, 0, 255, 0.06), transparent 70%);
+    top: 50%;
+    right: 10%;
+    animation-delay: -4s;
+  }
+
+  .nebula-blob.pink {
+    width: 400px;
+    height: 300px;
+    background: radial-gradient(ellipse, rgba(255, 59, 139, 0.04), transparent 70%);
+    bottom: 15%;
+    left: 40%;
+    animation-delay: -8s;
+  }
+
+  @keyframes nebulaPulse {
+    0%, 100% { opacity: 0.6; transform: scale(1); }
+    33% { opacity: 1; transform: scale(1.1); }
+    66% { opacity: 0.4; transform: scale(0.95); }
+  }
+
+  .win-flash {
+    position: absolute;
+    inset: 0;
+    z-index: 20;
+    pointer-events: none;
+    opacity: 0;
+    background: radial-gradient(ellipse at 12% 55%, rgba(0, 255, 136, 0.4), transparent 60%);
+  }
+
+  .win-flash.active {
+    animation: flashBurst 0.6s ease-out forwards;
+  }
+
+  @keyframes flashBurst {
+    0% { opacity: 1; }
+    100% { opacity: 0; }
+  }
+
+  .win-banner {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%) scale(0);
+    z-index: 25;
+    pointer-events: none;
+    font-family: 'Orbitron', sans-serif;
+    font-size: 42px;
+    font-weight: 900;
+    letter-spacing: 6px;
+    color: var(--laser-green);
+    text-shadow:
+      0 0 20px rgba(0, 255, 136, 0.8),
+      0 0 60px rgba(0, 255, 136, 0.4),
+      0 0 120px rgba(0, 255, 136, 0.2);
+    white-space: nowrap;
+    opacity: 0;
+  }
+
+  .win-banner.active {
+    animation: bannerPop 1.8s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  }
+
+  @keyframes bannerPop {
+    0% { transform: translate(-50%, -50%) scale(0); opacity: 0; }
+    15% { transform: translate(-50%, -50%) scale(1.3); opacity: 1; }
+    25% { transform: translate(-50%, -50%) scale(1); opacity: 1; }
+    70% { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+    100% { opacity: 0; transform: translate(-50%, -60%) scale(0.9); }
+  }
+
+  .win-banner .pnl {
+    font-size: 28px;
+    display: block;
+    margin-top: 6px;
+    letter-spacing: 2px;
+  }
+
+  .header {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 10;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 16px 24px;
+    background: linear-gradient(180deg, rgba(6, 11, 24, 0.95), transparent);
+  }
+
+  .header-left {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+  }
+
+  .logo-ring {
+    width: 44px;
+    height: 44px;
+    border: 2px solid var(--accent-cyan);
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    animation: logoSpin 20s linear infinite;
+    box-shadow: 0 0 20px rgba(0, 212, 255, 0.2);
+  }
+
+  @keyframes logoSpin {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+  }
+
+  .logo-ring span {
+    font-size: 20px;
+    animation: logoSpin 20s linear infinite reverse;
+  }
+
+  .brand h1 {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 18px;
+    font-weight: 800;
+    letter-spacing: 3px;
+    background: linear-gradient(135deg, var(--accent-cyan), var(--accent-purple));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+
+  .brand .subtitle {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 9px;
+    letter-spacing: 4px;
+    color: var(--text-dim);
+    text-transform: uppercase;
+  }
+
+  .header-nav {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+
+  .nav-btn,
+  .shell-btn {
+    text-decoration: none;
+  }
+
+  .nav-btn {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    letter-spacing: 1px;
+    padding: 8px 16px;
+    background: transparent;
+    border: 1px solid rgba(255,255,255,0.08);
+    color: var(--text-dim);
+    border-radius: 6px;
+    cursor: pointer;
+    transition: all 0.3s;
+  }
+
+  .nav-btn:hover { border-color: var(--accent-cyan); color: var(--text-primary); }
+
+  .nav-btn.active {
+    border-color: var(--accent-cyan);
+    color: var(--accent-cyan);
+    background: rgba(0, 212, 255, 0.06);
+    box-shadow: 0 0 15px rgba(0, 212, 255, 0.1);
+  }
+
+  .temp-badge {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: var(--accent-gold);
+    padding: 6px 12px;
+    border: 1px solid rgba(251, 191, 36, 0.2);
+    border-radius: 6px;
+    background: rgba(251, 191, 36, 0.05);
+  }
+
+  .shell-btn {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    padding: 8px 18px;
+    background: linear-gradient(135deg, var(--accent-cyan), #0088cc);
+    border: none;
+    color: #000;
+    font-weight: 700;
+    letter-spacing: 1px;
+    border-radius: 6px;
+    cursor: pointer;
+    box-shadow: 0 0 20px rgba(0, 212, 255, 0.3);
+  }
+
+  .engine-panel {
+    position: absolute;
+    top: 80px;
+    left: 20px;
+    right: 380px;
+    bottom: 260px;
+    z-index: 5;
+    border: 1px solid var(--border-glow);
+    border-radius: 12px;
+    overflow: hidden;
+    background: rgba(10, 17, 40, 0.3);
+    backdrop-filter: blur(4px);
+  }
+
+  .engine-panel-header {
+    padding: 14px 20px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+  }
+
+  .engine-title {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 3px;
+    color: var(--accent-cyan);
+  }
+
+  .engine-status {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .pulse-dot {
+    width: 8px;
+    height: 8px;
+    background: var(--accent-green);
+    border-radius: 50%;
+    animation: pulse 2s ease-in-out infinite;
+    box-shadow: 0 0 10px rgba(52, 211, 153, 0.5);
+  }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.5; transform: scale(0.8); }
+  }
+
+  .status-text {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    color: var(--accent-green);
+    letter-spacing: 1px;
+  }
+
+  .taco-sprite {
+    position: absolute;
+    z-index: 7;
+    font-size: 52px;
+    transition: transform 0.1s, left 0.25s ease-out, top 0.25s ease-out;
+    filter: drop-shadow(0 0 15px rgba(251, 191, 36, 0.3));
+    cursor: pointer;
+    user-select: none;
+    left: 6%;
+    top: 50%;
+  }
+
+  .taco-sprite.charging {
+    animation: tacoCharge 0.3s ease-in-out;
+  }
+
+  .taco-sprite.firing {
+    animation: tacoRecoil 0.15s ease-out;
+  }
+
+  @keyframes tacoCharge {
+    0% { transform: scale(1); filter: drop-shadow(0 0 15px rgba(251, 191, 36, 0.3)); }
+    50% { transform: scale(1.2); filter: drop-shadow(0 0 30px rgba(0, 255, 136, 0.8)); }
+    100% { transform: scale(1.1); filter: drop-shadow(0 0 40px rgba(0, 255, 136, 1)); }
+  }
+
+  @keyframes tacoRecoil {
+    0% { transform: scale(1.1) translateX(0); }
+    50% { transform: scale(0.9) translateX(-8px); }
+    100% { transform: scale(1) translateX(0); }
+  }
+
+  .log-entries {
+    position: absolute;
+    top: 50px;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    overflow: hidden;
+    padding: 10px;
+  }
+
+  .log-entry {
+    position: absolute;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    white-space: nowrap;
+    padding: 4px 10px;
+    border-radius: 4px;
+    background: rgba(0, 0, 0, 0.4);
+    border-left: 2px solid;
+    animation: logFloat var(--dur, 18s) linear forwards;
+    opacity: 0;
+    backdrop-filter: blur(2px);
+  }
+
+  .log-entry.order_placed { border-color: var(--accent-cyan); color: rgba(0, 212, 255, 0.8); }
+  .log-entry.order_cancelled_fok { border-color: var(--accent-purple); color: rgba(168, 85, 247, 0.75); }
+  .log-entry.skip { border-color: var(--accent-gold); color: rgba(251, 191, 36, 0.8); }
+  .log-entry.loss { border-color: var(--accent-red); color: rgba(239, 68, 68, 0.8); }
+  .log-entry.fill_verified,
+  .log-entry.redeem,
+  .log-entry.win {
+    border-color: var(--laser-green);
+    color: rgba(52, 211, 153, 0.95);
+    font-weight: 600;
+    box-shadow: 0 0 12px rgba(0, 255, 136, 0.15);
+  }
+
+  @keyframes logFloat {
+    0% { opacity: 0; transform: translateX(105%); }
+    5% { opacity: 0.8; }
+    85% { opacity: 0.6; }
+    100% { opacity: 0; transform: translateX(-105%) translateY(-30px); }
+  }
+
+  .planet {
+    position: absolute;
+    z-index: 3;
+    pointer-events: none;
+    right: 15%;
+    top: 20%;
+  }
+
+  .planet-body {
+    width: 40px;
+    height: 40px;
+    border-radius: 50%;
+    background: radial-gradient(circle at 35% 35%, #a78bfa, #7c3aed, #4c1d95);
+    box-shadow: 0 0 25px rgba(167, 139, 250, 0.2), inset -6px -6px 15px rgba(0,0,0,0.4);
+    animation: planetBob 8s ease-in-out infinite;
+  }
+
+  @keyframes planetBob {
+    0%, 100% { transform: translateY(0); }
+    50% { transform: translateY(-6px); }
+  }
+
+  .stats-bar {
+    position: absolute;
+    bottom: 130px;
+    left: 20px;
+    right: 380px;
+    z-index: 10;
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 12px;
+  }
+
+  .stat-card {
+    background: rgba(13, 26, 51, 0.8);
+    border: 1px solid var(--border-glow);
+    border-radius: 10px;
+    padding: 16px 20px;
+    backdrop-filter: blur(10px);
+    transition: all 0.3s;
+    position: relative;
+  }
+
+  .stat-card:hover {
+    border-color: var(--accent-cyan);
+    box-shadow: 0 0 25px rgba(0, 212, 255, 0.1);
+    transform: translateY(-2px);
+  }
+
+  .stat-label {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 9px;
+    letter-spacing: 2px;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    margin-bottom: 6px;
+  }
+
+  .stat-value {
+    font-family: 'Orbitron', sans-serif;
+    font-weight: 700;
+  }
+
+  .stat-value.money { font-size: 28px; color: var(--text-bright); }
+  .stat-value.percent { font-size: 28px; color: var(--accent-green); }
+  .stat-value.streak { font-size: 28px; color: var(--accent-gold); }
+  .stat-value.uptime { font-size: 22px; color: var(--accent-cyan); }
+
+  .kill-counter {
+    position: absolute;
+    bottom: 4px;
+    right: 8px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 9px;
+    color: var(--laser-green);
+    opacity: 0.6;
+    letter-spacing: 1px;
+  }
+
+  .positions-panel {
+    position: absolute;
+    bottom: 10px;
+    left: 20px;
+    right: 380px;
+    z-index: 10;
+    background: rgba(13, 26, 51, 0.7);
+    border: 1px solid var(--border-glow);
+    border-radius: 10px;
+    backdrop-filter: blur(10px);
+    overflow: hidden;
+  }
+
+  .positions-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 12px 20px;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+  }
+
+  .positions-title {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 10px;
+    letter-spacing: 3px;
+    color: var(--text-dim);
+  }
+
+  .locked-badge {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    padding: 3px 10px;
+    background: rgba(0, 212, 255, 0.1);
+    border: 1px solid rgba(0, 212, 255, 0.2);
+    border-radius: 20px;
+    color: var(--accent-cyan);
+  }
+
+  .position-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 10px 20px;
+    border-bottom: 1px solid rgba(255,255,255,0.02);
+    transition: background 0.2s;
+    gap: 12px;
+  }
+
+  .position-row:hover { background: rgba(255,255,255,0.02); }
+
+  .position-name {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: var(--text-primary);
+    flex: 1;
+  }
+
+  .position-price {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: var(--text-dim);
+    margin: 0 16px;
+  }
+
+  .position-pnl {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    font-weight: 600;
+  }
+
+  .position-pnl.loss { color: var(--accent-red); }
+  .position-pnl.gain { color: var(--accent-green); }
+
+  .event-feed {
+    position: absolute;
+    top: 80px;
+    right: 10px;
+    width: 355px;
+    bottom: 10px;
+    z-index: 10;
+    background: rgba(13, 26, 51, 0.7);
+    border: 1px solid var(--border-glow);
+    border-radius: 12px;
+    backdrop-filter: blur(10px);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .feed-header {
+    padding: 14px 18px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+    flex-shrink: 0;
+  }
+
+  .feed-title {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 11px;
+    letter-spacing: 2px;
+    color: var(--accent-purple);
+  }
+
+  .feed-badge {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 9px;
+    color: var(--text-dim);
+    letter-spacing: 1px;
+  }
+
+  .feed-scroll {
+    flex: 1;
+    overflow-y: auto;
+    padding: 8px;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(255,255,255,0.1) transparent;
+  }
+
+  .feed-item {
+    padding: 12px;
+    border-radius: 8px;
+    margin-bottom: 6px;
+    background: rgba(0, 0, 0, 0.2);
+    border-left: 3px solid;
+    animation: feedSlide 0.4s ease-out;
+  }
+
+  .feed-item.order_placed { border-color: var(--accent-cyan); }
+  .feed-item.order_cancelled_fok { border-color: var(--accent-purple); }
+  .feed-item.skip { border-color: var(--accent-gold); }
+  .feed-item.loss { border-color: var(--accent-red); }
+  .feed-item.fill_verified,
+  .feed-item.redeem,
+  .feed-item.win {
+    border-color: var(--laser-green);
+    background: rgba(0, 255, 136, 0.05);
+    box-shadow: 0 0 20px rgba(0, 255, 136, 0.08);
+  }
+
+  @keyframes feedSlide {
+    from { opacity: 0; transform: translateX(20px); }
+    to { opacity: 1; transform: translateX(0); }
+  }
+
+  .feed-item-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 4px;
+  }
+
+  .feed-type {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+  }
+
+  .feed-type.order_placed { color: var(--accent-cyan); }
+  .feed-type.order_cancelled_fok { color: var(--accent-purple); }
+  .feed-type.skip { color: var(--accent-gold); }
+  .feed-type.loss { color: var(--accent-red); }
+  .feed-type.fill_verified,
+  .feed-type.redeem,
+  .feed-type.win { color: var(--laser-green); }
+
+  .feed-time {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 9px;
+    color: var(--text-dim);
+  }
+
+  .feed-pair {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 10px;
+    font-weight: 600;
+    color: var(--accent-cyan);
+    margin-bottom: 4px;
+  }
+
+  .feed-msg {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    color: var(--text-dim);
+    line-height: 1.5;
+    white-space: normal;
+    word-break: break-word;
+  }
+
+  .grid-overlay {
+    position: absolute;
+    inset: 0;
+    z-index: 1;
+    pointer-events: none;
+    opacity: 0.03;
+    background-image:
+      linear-gradient(rgba(0, 212, 255, 0.3) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(0, 212, 255, 0.3) 1px, transparent 1px);
+    background-size: 60px 60px;
+  }
+
+  .scanline {
+    position: absolute;
+    inset: 0;
+    z-index: 4;
+    pointer-events: none;
+    background: repeating-linear-gradient(
+      0deg,
+      transparent,
+      transparent 2px,
+      rgba(0, 0, 0, 0.03) 2px,
+      rgba(0, 0, 0, 0.03) 4px
+    );
+  }
+</style>
 </head>
 <body>
-    <div class="layout-grid">
-        <header class="nav-header glass flex items-center justify-between px-10">
-            <div class="flex items-center gap-5">
-                <div class="bg-yellow-400 p-2 rounded-xl shadow-[0_0_20px_rgba(250,204,21,0.4)]">
-                    <span class="text-2xl">🍌</span>
-                </div>
-                <div>
-                    <h1 class="font-black text-xl tracking-tighter text-white uppercase italic">Taco<span class="text-yellow-400">Claw</span> Live</h1>
-                    <div class="text-[9px] text-slate-500 font-bold uppercase tracking-[0.3em]">Real-Time Trading Activity</div>
-                </div>
-            </div>
-            <nav class="flex gap-10">
-                <a href="#" class="text-[10px] font-black text-white tracking-widest uppercase border-b-2 border-yellow-400 pb-1">Live Dashboard</a>
-                <a href="http://192.168.40.209:7681/" target="_blank" class="text-[10px] font-black text-zinc-500 tracking-widest uppercase hover:text-yellow-400">Terminal</a>
-                <a href="/system" target="_blank" class="text-[10px] font-black text-zinc-500 tracking-widest uppercase hover:text-white">Health</a>
-            </nav>
-            <div class="flex items-center gap-4">
-                <div class="text-right"><div class="text-[9px] text-slate-500 font-black uppercase">CORE TEMP</div><div class="text-sm font-black text-yellow-400" id="top-temp">--°C</div></div>
-                <button onclick="window.open('http://192.168.40.209:7681/', '_blank')" class="px-5 py-2 bg-yellow-400 text-black text-[10px] font-black uppercase rounded-lg">Shell</button>
-            </div>
-        </header>
 
-        <main class="main-stage">
-            <div id="galaxy-container" class="mb-6">
-                <div class="galaxy-overlay">
-                    <div class="flex items-center gap-2 mb-1"><span class="w-2 h-2 rounded-full bg-yellow-400 animate-ping"></span><h2 class="text-[10px] font-black uppercase tracking-[0.5em] text-yellow-400">Live Engine Activity</h2></div>
-                    <p class="text-[10px] text-slate-500 font-bold uppercase tracking-widest" id="combat-status">Waiting for live engine events...</p>
-                </div>
-                <canvas id="galaxy-canvas"></canvas>
-            </div>
+<div class="galaxy-container" id="galaxyContainer">
+  <canvas id="starfield"></canvas>
+  <canvas id="laserCanvas"></canvas>
 
-            <div class="grid grid-cols-4 gap-4 mb-6">
-                <div class="banana-card border-l-4 border-l-yellow-400"><div class="stat-label">Portfolio Value</div><div class="stat-value" id="stat-cap">$0.00</div></div>
-                <div class="banana-card border-l-4 border-l-emerald-400"><div class="stat-label">Win Rate</div><div class="stat-value text-emerald-400" id="stat-winrate">0%</div></div>
-                <div class="banana-card border-l-4 border-l-sky-400"><div class="stat-label">Current Streak</div><div class="stat-value text-sky-400" id="stat-streak">0</div></div>
-                <div class="banana-card border-l-4 border-l-purple-400"><div class="stat-label">System Uptime</div><div class="stat-value text-purple-400" id="stat-uptime">--</div></div>
-            </div>
+  <div class="nebula-layer">
+    <div class="nebula-blob blue"></div>
+    <div class="nebula-blob purple"></div>
+    <div class="nebula-blob pink"></div>
+  </div>
 
-            <div class="glass rounded-2xl overflow-hidden shadow-2xl">
-                <div class="px-8 py-4 border-b border-yellow-400/10 flex justify-between items-center bg-yellow-400/5">
-                    <h2 class="text-[10px] font-black uppercase tracking-[0.3em] text-zinc-500">Open Positions</h2>
-                    <span class="text-[9px] font-bold text-yellow-400 px-3 py-1 bg-yellow-400/10 rounded-full" id="pos-count">0 LOCKED</span>
-                </div>
-                <table class="w-full text-left text-sm">
-                    <tbody id="pos-table" class="divide-y divide-white/5"></tbody>
-                </table>
-            </div>
-        </main>
+  <div class="grid-overlay"></div>
+  <div class="scanline"></div>
 
-        <aside class="activity-sidebar flex flex-col">
-            <div class="p-6 border-b border-yellow-400/10 flex items-center justify-between sticky top-0 bg-[#020617] z-10"><h2 class="text-xs font-black uppercase tracking-[0.4em] text-yellow-400">Live Event Feed</h2><span class="text-[9px] text-slate-600 font-mono italic">REALTIME_SSE</span></div>
-            <div id="tx-stream" class="p-4 flex flex-col gap-3"></div>
-        </aside>
+  <div class="win-flash" id="winFlash"></div>
+  <div class="win-banner" id="winBanner">
+    🌮 WIN TRADE 🌮
+    <span class="pnl" id="winPnl">+$0.00</span>
+  </div>
+
+  <div class="header">
+    <div class="header-left">
+      <div class="logo-ring"><span>🌮</span></div>
+      <div class="brand">
+        <h1>TACOCLAW LIVE</h1>
+        <div class="subtitle">Real-Time Trading Activity</div>
+      </div>
+    </div>
+    <div class="header-nav">
+      <a class="nav-btn active" href="/">Live Dashboard</a>
+      <a class="nav-btn" href="http://192.168.40.209:7681/" target="_blank" rel="noreferrer">Terminal</a>
+      <a class="nav-btn" href="/system" target="_blank" rel="noreferrer">Health</a>
+      <div class="temp-badge" id="tempBadge">🌡 --.-°C</div>
+      <a class="shell-btn" href="http://192.168.40.209:7681/" target="_blank" rel="noreferrer">SHELL</a>
+    </div>
+  </div>
+
+  <div class="engine-panel" id="enginePanel">
+    <div class="engine-panel-header">
+      <div class="engine-title">LIVE ENGINE ACTIVITY</div>
+      <div class="engine-status">
+        <div class="pulse-dot"></div>
+        <span class="status-text" id="engineStatus">STREAMING</span>
+      </div>
     </div>
 
-    <script>
-        const canvas = document.getElementById('galaxy-canvas');
-        const ctx = canvas.getContext('2d');
-        let ship = { x: 100, y: 200, targetX: 100, targetY: 200, emoji: '🌮', lasers: [] };
-        let stars = [], targets = [], explosions = [], obstacles = [];
-        let seededHistory = new Set();
+    <div class="taco-sprite" id="tacoSprite">🌮</div>
+    <div class="planet"><div class="planet-body"></div></div>
+    <div class="log-entries" id="logEntries"></div>
+  </div>
 
-        function initGalaxy() {
-            canvas.width = canvas.offsetWidth; canvas.height = canvas.offsetHeight;
-            stars = [];
-            for(let i=0; i<150; i++) stars.push({x: Math.random()*canvas.width, y: Math.random()*canvas.height, s: Math.random()*3, c: Math.random() > 0.8 ? '#FACC15' : '#fff'});
-        }
+  <div class="stats-bar">
+    <div class="stat-card">
+      <div class="stat-label">Portfolio Value</div>
+      <div class="stat-value money" id="portfolioValue">$0.00</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Win Rate</div>
+      <div class="stat-value percent" id="winRate">0%</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Current Streak</div>
+      <div class="stat-value streak" id="streak">0</div>
+      <div class="kill-counter" id="killCounter">LASERS: 0</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">System Uptime</div>
+      <div class="stat-value uptime" id="uptime">--</div>
+    </div>
+  </div>
 
-        function formatEventMessage(ev) {
-            const head = [ev.engine, ev.symbol, ev.event_type].filter(Boolean).join(' | ');
-            const details = [];
-            if (ev.reason) details.push(`reason=${ev.reason}`);
-            if (ev.amount !== undefined && ev.amount !== null) details.push(`amount=${ev.amount}`);
-            if (ev.price !== undefined && ev.price !== null) details.push(`price=${ev.price}`);
-            if (ev.entry_price !== undefined && ev.entry_price !== null) details.push(`entry=${ev.entry_price}`);
-            if (ev.order_id) details.push(`order=${String(ev.order_id).slice(0, 10)}`);
-            return [head, details.join(' | ')].filter(Boolean).join(' :: ');
-        }
+  <div class="positions-panel">
+    <div class="positions-header">
+      <div class="positions-title">OPEN POSITIONS</div>
+      <div class="locked-badge" id="positionsCount">0 LOCKED</div>
+    </div>
+    <div id="positionsList"></div>
+  </div>
 
-        function handleEvent(ev, opts = {}) {
-            if (!ev || !ev.event_type) return;
-            const historyKey = ev.seq || ev.id || `${ev.event_type}-${ev.engine || ''}-${ev.order_id || ''}-${ev.timestamp || ''}`;
-            if (!opts.allowDuplicate && seededHistory.has(historyKey)) return;
-            seededHistory.add(historyKey);
-            const tx = canvas.width - 150;
-            const ty = 50 + Math.random()*(canvas.height-100);
-            
-            if (ev.event_type === 'order_placed') {
-                targets.push({ id: ev.order_id, x: tx, y: ty, label: `${ev.symbol} ${ev.side}`, type: 'placed', alpha: 1 });
-                ship.targetX = tx - 100; ship.targetY = ty;
-                document.getElementById('combat-status').textContent = `Order placed: ${ev.engine || ''} ${ev.symbol || ''}`.trim();
-                setTimeout(() => { ship.lasers.push({ x: ship.x + 20, y: ship.y, tx: tx, ty: ty }); }, 500);
-            } 
-            else if (ev.event_type === 'order_cancelled_fok') {
-                const target = targets.find(t => t.id === ev.order_id);
-                if (target) {
-                    target.type = 'cancelled';
-                    document.getElementById('combat-status').textContent = `Order cancelled / FOK fallback: ${ev.engine || ''} ${ev.symbol || ''}`.trim();
-                    ship.targetX = 100; ship.targetY = 200;
-                }
-            }
-            else if (ev.event_type === 'fill_verified') {
-                document.getElementById('combat-status').textContent = `Fill verified: ${ev.engine || ''} ${ev.symbol || ''}`.trim();
-                explosions.push({x: ship.x + 100, y: ship.y, r: 0, c: '#4ade80'});
-            }
-            else if (ev.event_type === 'skip') {
-                document.getElementById('combat-status').textContent = `Skip detected: ${ev.reason || 'skip'}`;
-                obstacles.unshift({
-                    id: ev.id || `${ev.engine}-${ev.timestamp}-${Math.random()}`,
-                    x: tx,
-                    y: ty,
-                    label: `${ev.symbol || 'TARGET'} • ${ev.reason || 'skip'}`,
-                    reason: ev.reason || 'skip',
-                    alpha: 1
-                });
-                ship.targetX = Math.max(60, tx - 220);
-                ship.targetY = Math.max(50, ty - 70);
-                setTimeout(() => { ship.targetX = 100; ship.targetY = 200; }, 1400);
-            }
-            else if (ev.event_type === 'redeem' || ev.event_type === 'win' || ev.event_type === 'loss') {
-                document.getElementById('combat-status').textContent = `${ev.event_type}: ${ev.engine || ''} ${ev.symbol || ''}`.trim();
-                explosions.push({x: tx, y: ty, r: 0, c: ev.event_type === 'loss' ? '#f87171' : '#4ade80'});
-            }
+  <div class="event-feed">
+    <div class="feed-header">
+      <div class="feed-title">LIVE EVENT FEED</div>
+      <div class="feed-badge">REALTIME_SSE</div>
+    </div>
+    <div class="feed-scroll" id="feedScroll"></div>
+  </div>
+</div>
 
-            const stream = document.getElementById('tx-stream');
-            const card = document.createElement('div');
-            card.className = 'animate-event p-4 rounded-xl border border-yellow-400/10 bg-slate-900/40 flex flex-col gap-1';
-            const msg = ev.message || formatEventMessage(ev);
-            const liveTs = ev.live_timestamp || ev.timestamp || Date.now();
-            card.innerHTML = `
-                <div class="flex justify-between items-center text-[9px] font-black uppercase tracking-widest text-slate-500">
-                    <span>${ev.event_type}</span>
-                    <span>${new Date(liveTs).toLocaleTimeString()}</span>
-                </div>
-                <div class="text-[10px] font-black uppercase tracking-[0.25em] text-yellow-400">${[ev.engine, ev.symbol].filter(Boolean).join(' • ') || 'LIVE EVENT'}</div>
-                <div class="text-xs font-bold text-slate-200">${msg}</div>
-            `;
-            stream.prepend(card);
-            if (stream.children.length > 30) stream.lastChild.remove();
-        }
+<script>
+const canvas = document.getElementById('starfield');
+const ctx = canvas.getContext('2d');
+const laserCanvas = document.getElementById('laserCanvas');
+const lCtx = laserCanvas.getContext('2d');
+const tacoSprite = document.getElementById('tacoSprite');
+const winFlash = document.getElementById('winFlash');
+const winBanner = document.getElementById('winBanner');
+const winPnl = document.getElementById('winPnl');
+const galaxyContainer = document.getElementById('galaxyContainer');
+const killCounterEl = document.getElementById('killCounter');
+const logContainer = document.getElementById('logEntries');
+const feedScroll = document.getElementById('feedScroll');
+const positionsList = document.getElementById('positionsList');
+const seenEvents = new Set();
 
-        function animate() {
-            ctx.fillStyle = '#000'; ctx.fillRect(0, 0, canvas.width, canvas.height);
-            stars.forEach(s => { ctx.fillStyle = s.c; s.x -= s.s; if(s.x < 0) s.x = canvas.width; ctx.beginPath(); ctx.arc(s.x, s.y, s.s/2, 0, Math.PI*2); ctx.fill(); });
-            ship.x += (ship.targetX - ship.x) * 0.05; ship.y += (ship.targetY - ship.y) * 0.05;
-            
-            ship.lasers.forEach((l, i) => {
-                ctx.strokeStyle = '#FACC15'; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(l.x, l.y); ctx.lineTo(l.tx, l.ty); ctx.stroke();
-                l.x += (l.tx - l.x) * 0.3; if(Math.abs(l.x - l.tx) < 5) { ship.lasers.splice(i, 1); explosions.push({x: l.tx, y: l.ty, r: 0, c: '#FACC15'}); }
-            });
+let W;
+let H;
+let laserKills = 0;
+let activeLasers = [];
+let particles = [];
+let time = 0;
 
-            explosions.forEach((e, i) => {
-                ctx.strokeStyle = e.c; ctx.beginPath(); ctx.arc(e.x, e.y, e.r, 0, Math.PI*2); ctx.stroke(); e.r += 4;
-                if(e.r > 60) explosions.splice(i, 1);
-            });
+function resize() {
+  W = canvas.width = window.innerWidth;
+  H = canvas.height = window.innerHeight;
+  laserCanvas.width = W;
+  laserCanvas.height = H;
+}
+resize();
+window.addEventListener('resize', resize);
 
-            obstacles.forEach((o, i) => {
-                ctx.save();
-                ctx.globalAlpha = o.alpha;
-                ctx.fillStyle = '#64748b';
-                ctx.beginPath();
-                ctx.moveTo(o.x - 18, o.y + 14);
-                ctx.lineTo(o.x - 8, o.y - 10);
-                ctx.lineTo(o.x + 12, o.y - 14);
-                ctx.lineTo(o.x + 20, o.y + 8);
-                ctx.lineTo(o.x + 2, o.y + 18);
-                ctx.closePath();
-                ctx.fill();
-                ctx.font = 'bold 9px JetBrains Mono';
-                ctx.fillStyle = '#f8fafc';
-                ctx.fillText(o.label, o.x + 26, o.y + 5);
-                ctx.restore();
-                o.x -= 1.4;
-                o.alpha *= 0.998;
-                if (o.x < -180 || o.alpha < 0.2) obstacles.splice(i, 1);
-            });
+class Star {
+  constructor(layer) {
+    this.layer = layer;
+    this.reset();
+  }
+  reset() {
+    this.x = Math.random() * W;
+    this.y = Math.random() * H;
+    const sizes = [0.4, 0.8, 1.4];
+    const speeds = [0.08, 0.2, 0.4];
+    const alphas = [0.3, 0.5, 0.8];
+    this.size = sizes[this.layer] + Math.random() * 0.4;
+    this.speed = speeds[this.layer] + Math.random() * 0.05;
+    this.baseAlpha = alphas[this.layer];
+    this.alpha = this.baseAlpha;
+    this.twinkleSpeed = 0.005 + Math.random() * 0.02;
+    this.twinkleOffset = Math.random() * Math.PI * 2;
+    const colors = [[200,220,255],[255,240,220],[220,200,255],[200,255,240],[255,255,255]];
+    this.color = colors[Math.floor(Math.random() * colors.length)];
+  }
+  update(t) {
+    this.x -= this.speed;
+    if (this.x < -5) {
+      this.x = W + 5;
+      this.y = Math.random() * H;
+    }
+    this.alpha = this.baseAlpha + Math.sin(t * this.twinkleSpeed + this.twinkleOffset) * 0.2;
+  }
+  draw() {
+    const [r, g, b] = this.color;
+    ctx.beginPath();
+    ctx.arc(this.x, this.y, this.size, 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(${r},${g},${b},${this.alpha})`;
+    ctx.fill();
+    if (this.layer === 2 && this.alpha > 0.7) {
+      ctx.beginPath();
+      ctx.arc(this.x, this.y, this.size * 3, 0, Math.PI * 2);
+      ctx.fillStyle = `rgba(${r},${g},${b},${this.alpha * 0.1})`;
+      ctx.fill();
+    }
+  }
+}
 
-            targets.forEach((t, i) => {
-                ctx.fillStyle = t.type === 'cancelled' ? '#334155' : '#fbbf24';
-                ctx.beginPath(); t.type === 'cancelled' ? ctx.arc(t.x, t.y, 4, 0, Math.PI*2) : ctx.rect(t.x-6, t.y-6, 12, 12); ctx.fill();
-                ctx.font = 'bold 9px JetBrains Mono'; ctx.fillStyle = '#fff'; ctx.fillText(t.label, t.x + 20, t.y + 5);
-                t.x -= 2; if(t.x < -100) targets.splice(i, 1);
-            });
+class ShootingStar {
+  constructor() { this.active = false; }
+  fire() {
+    this.active = true;
+    this.x = W * 0.3 + Math.random() * W * 0.5;
+    this.y = Math.random() * H * 0.4;
+    this.angle = Math.PI * 0.75 + Math.random() * 0.3;
+    this.speed = 8 + Math.random() * 6;
+    this.length = 60 + Math.random() * 80;
+    this.life = 1;
+    this.decay = 0.015 + Math.random() * 0.01;
+  }
+  update() {
+    if (!this.active) return;
+    this.x += Math.cos(this.angle) * this.speed;
+    this.y += Math.sin(this.angle) * this.speed;
+    this.life -= this.decay;
+    if (this.life <= 0) this.active = false;
+  }
+  draw() {
+    if (!this.active) return;
+    const endX = this.x - Math.cos(this.angle) * this.length;
+    const endY = this.y - Math.sin(this.angle) * this.length;
+    const grad = ctx.createLinearGradient(this.x, this.y, endX, endY);
+    grad.addColorStop(0, `rgba(255,255,255,${this.life})`);
+    grad.addColorStop(1, 'rgba(255,255,255,0)');
+    ctx.beginPath();
+    ctx.moveTo(this.x, this.y);
+    ctx.lineTo(endX, endY);
+    ctx.strokeStyle = grad;
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+  }
+}
 
-            ctx.font = '36px serif'; ctx.fillText(ship.emoji, ship.x - 18, ship.y + 12);
-            requestAnimationFrame(animate);
-        }
+class LaserBeam {
+  constructor(startX, startY, targetX, targetY) {
+    this.sx = startX;
+    this.sy = startY;
+    this.tx = targetX;
+    this.ty = targetY;
+    this.progress = 0;
+    this.life = 1;
+    this.phase = 'extend';
+    this.holdTimer = 0;
+  }
+  update() {
+    if (this.phase === 'extend') {
+      this.progress += 0.08;
+      if (this.progress >= 1) {
+        this.progress = 1;
+        this.phase = 'hold';
+        spawnImpactParticles(this.tx, this.ty);
+      }
+    } else if (this.phase === 'hold') {
+      this.holdTimer++;
+      if (this.holdTimer > 12) this.phase = 'fade';
+    } else if (this.phase === 'fade') {
+      this.life -= 0.06;
+    }
+    return this.life > 0;
+  }
+  draw() {
+    const cx = this.sx + (this.tx - this.sx) * this.progress;
+    const cy = this.sy + (this.ty - this.sy) * this.progress;
+    const alpha = this.life;
 
-        function connectSSE() {
-            const source = new EventSource('/api/events/stream');
-            source.onmessage = (e) => {
-                try { handleEvent(JSON.parse(e.data)); } catch(err) { console.error("SSE Parse Error", err); }
-            };
-            source.onerror = () => { source.close(); setTimeout(connectSSE, 3000); };
-        }
+    lCtx.beginPath();
+    lCtx.moveTo(this.sx, this.sy);
+    lCtx.lineTo(cx, cy);
+    lCtx.strokeStyle = `rgba(0, 255, 136, ${alpha * 0.3})`;
+    lCtx.lineWidth = 14;
+    lCtx.stroke();
 
-        async function updateStats() {
-            try {
-                const rep = await fetch('/api/report').then(r => r.json()).catch(() => ({}));
-                const ext = await fetch('/api/stats/extended').then(r => r.json()).catch(() => ({}));
-                const sys = await fetch('/system').then(r => r.json()).catch(() => ({}));
-                const summ = await fetch('/api/dashboard/summary').then(r => r.json()).catch(() => ({}));
+    lCtx.beginPath();
+    lCtx.moveTo(this.sx, this.sy);
+    lCtx.lineTo(cx, cy);
+    lCtx.strokeStyle = `rgba(0, 255, 200, ${alpha * 0.6})`;
+    lCtx.lineWidth = 6;
+    lCtx.stroke();
 
-                if (rep.current_capital !== undefined) document.getElementById('stat-cap').textContent = '$' + Number(rep.current_capital || 0).toLocaleString();
-                if (ext.win_rate !== undefined) document.getElementById('stat-winrate').textContent = ext.win_rate + '%';
-                if (rep.streak !== undefined) document.getElementById('stat-streak').textContent = rep.streak;
-                if (sys.uptime) document.getElementById('stat-uptime').textContent = sys.uptime;
-                if (sys.cpu_temp_c) document.getElementById('top-temp').textContent = sys.cpu_temp_c.toFixed(1) + '°C';
+    lCtx.beginPath();
+    lCtx.moveTo(this.sx, this.sy);
+    lCtx.lineTo(cx, cy);
+    lCtx.strokeStyle = `rgba(255, 255, 255, ${alpha * 0.9})`;
+    lCtx.lineWidth = 2;
+    lCtx.stroke();
 
-                if (summ.positions) {
-                    const table = document.getElementById('pos-table'); table.innerHTML = '';
-                    summ.positions.forEach(p => {
-                        const tr = document.createElement('tr'); const upnl = p.unrealized_pnl || 0;
-                        tr.innerHTML = `<td class="px-8 py-4 font-bold text-zinc-300 text-xs uppercase">${p.symbol}</td><td class="px-8 py-4 text-zinc-500 mono text-[10px]">$${p.entry_price?.toFixed(3)}</td><td class="px-8 py-4 text-right mono font-black ${upnl >= 0 ? 'text-green-400' : 'text-red-400'} text-xs">${upnl >= 0 ? '+' : ''}${upnl.toFixed(2)}</td>`;
-                        table.appendChild(tr);
-                    });
-                    document.getElementById('pos-count').textContent = `${summ.positions.length} LOCKED`;
-                }
-                if (summ.event_history && document.getElementById('tx-stream').children.length === 0) {
-                    [...summ.event_history].slice(-12).reverse().forEach(ev => handleEvent(ev, { allowDuplicate: false }));
-                }
-            } catch(e) { console.error("Update Stats Error", e); }
-        }
+    if (this.phase === 'extend' || this.phase === 'hold') {
+      const grad = lCtx.createRadialGradient(this.sx, this.sy, 0, this.sx, this.sy, 30);
+      grad.addColorStop(0, `rgba(255,255,255,${alpha * 0.6})`);
+      grad.addColorStop(0.3, `rgba(0,255,136,${alpha * 0.5})`);
+      grad.addColorStop(1, 'rgba(0,255,136,0)');
+      lCtx.beginPath();
+      lCtx.arc(this.sx, this.sy, 30, 0, Math.PI * 2);
+      lCtx.fillStyle = grad;
+      lCtx.fill();
+    }
 
-        window.onload = () => { initGalaxy(); animate(); connectSSE(); setInterval(updateStats, 5000); updateStats(); };
-        window.onresize = initGalaxy;
-    </script>
+    if (this.progress >= 1) {
+      const impact = lCtx.createRadialGradient(this.tx, this.ty, 0, this.tx, this.ty, 40);
+      impact.addColorStop(0, `rgba(255,255,255,${alpha * 0.8})`);
+      impact.addColorStop(0.3, `rgba(0,255,136,${alpha * 0.5})`);
+      impact.addColorStop(1, 'rgba(0,255,136,0)');
+      lCtx.beginPath();
+      lCtx.arc(this.tx, this.ty, 40, 0, Math.PI * 2);
+      lCtx.fillStyle = impact;
+      lCtx.fill();
+    }
+  }
+}
+
+class Particle {
+  constructor(x, y) {
+    this.x = x;
+    this.y = y;
+    const angle = Math.random() * Math.PI * 2;
+    const speed = 2 + Math.random() * 6;
+    this.vx = Math.cos(angle) * speed;
+    this.vy = Math.sin(angle) * speed;
+    this.life = 1;
+    this.decay = 0.02 + Math.random() * 0.03;
+    this.size = 1 + Math.random() * 3;
+    this.isGreen = Math.random() > 0.3;
+  }
+  update() {
+    this.x += this.vx;
+    this.y += this.vy;
+    this.vx *= 0.96;
+    this.vy *= 0.96;
+    this.life -= this.decay;
+    return this.life > 0;
+  }
+  draw() {
+    const color = this.isGreen ? `rgba(0,255,136,${this.life})` : `rgba(255,255,255,${this.life})`;
+    lCtx.beginPath();
+    lCtx.arc(this.x, this.y, this.size * this.life, 0, Math.PI * 2);
+    lCtx.fillStyle = color;
+    lCtx.fill();
+  }
+}
+
+const stars = [];
+for (let i = 0; i < 180; i++) stars.push(new Star(0));
+for (let i = 0; i < 60; i++) stars.push(new Star(1));
+for (let i = 0; i < 25; i++) stars.push(new Star(2));
+const shootingStars = Array.from({ length: 3 }, () => new ShootingStar());
+
+setInterval(() => {
+  const s = shootingStars.find((star) => !star.active);
+  if (s && Math.random() < 0.4) s.fire();
+}, 2500);
+
+function spawnImpactParticles(x, y) {
+  for (let i = 0; i < 30; i++) particles.push(new Particle(x, y));
+}
+
+function impactPoint() {
+  const panel = document.getElementById('enginePanel').getBoundingClientRect();
+  const targetX = panel.right - 30 - Math.random() * 100;
+  const targetY = panel.top + 80 + Math.random() * (panel.height - 130);
+  return { targetX, targetY };
+}
+
+function moveTaco(yRatio) {
+  const top = Math.max(100, Math.min(window.innerHeight - 320, window.innerHeight * yRatio));
+  tacoSprite.style.top = `${top}px`;
+}
+
+function fireLaser(pnlText) {
+  const rect = tacoSprite.getBoundingClientRect();
+  const startX = rect.right;
+  const startY = rect.top + rect.height / 2;
+  const { targetX, targetY } = impactPoint();
+
+  tacoSprite.classList.add('charging');
+  setTimeout(() => {
+    tacoSprite.classList.remove('charging');
+    tacoSprite.classList.add('firing');
+    activeLasers.push(new LaserBeam(startX, startY, targetX, targetY));
+    galaxyContainer.classList.add('screen-shake');
+    setTimeout(() => galaxyContainer.classList.remove('screen-shake'), 400);
+    winFlash.classList.add('active');
+    setTimeout(() => winFlash.classList.remove('active'), 600);
+    winPnl.textContent = pnlText || '+$0.00';
+    winBanner.classList.add('active');
+    setTimeout(() => winBanner.classList.remove('active'), 1900);
+    laserKills++;
+    killCounterEl.textContent = `LASERS: ${laserKills}`;
+    setTimeout(() => tacoSprite.classList.remove('firing'), 150);
+  }, 300);
+}
+
+function animate() {
+  ctx.clearRect(0, 0, W, H);
+  lCtx.clearRect(0, 0, W, H);
+  time++;
+  for (const star of stars) { star.update(time); star.draw(); }
+  for (const s of shootingStars) { s.update(); s.draw(); }
+  activeLasers = activeLasers.filter((laser) => laser.update());
+  for (const laser of activeLasers) laser.draw();
+  particles = particles.filter((particle) => particle.update());
+  for (const particle of particles) particle.draw();
+  requestAnimationFrame(animate);
+}
+animate();
+
+function eventKey(ev) {
+  return ev.seq || ev.id || `${ev.event_type}-${ev.engine || ''}-${ev.order_id || ''}-${ev.timestamp || ''}`;
+}
+
+function formatClock(ts) {
+  const d = new Date(ts || Date.now());
+  return d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+
+function addLog(ev) {
+  const el = document.createElement('div');
+  el.className = `log-entry ${ev.event_type || 'skip'}`;
+  el.textContent = `${[ev.engine, ev.symbol].filter(Boolean).join(' • ')} • ${ev.reason || ev.event_type}`;
+  const panelRect = logContainer.getBoundingClientRect();
+  el.style.top = `${20 + Math.random() * Math.max(80, panelRect.height - 40)}px`;
+  el.style.right = '-300px';
+  el.style.setProperty('--dur', `${14 + Math.random() * 8}s`);
+  logContainer.appendChild(el);
+  el.addEventListener('animationend', () => el.remove());
+}
+
+function renderFeed(ev) {
+  const item = document.createElement('div');
+  item.className = `feed-item ${ev.event_type || 'skip'}`;
+  item.innerHTML = `
+    <div class="feed-item-header">
+      <span class="feed-type ${ev.event_type || 'skip'}">${(ev.event_type || 'event').replaceAll('_', ' ')}</span>
+      <span class="feed-time">${formatClock(ev.live_timestamp || ev.timestamp)}</span>
+    </div>
+    <div class="feed-pair">${[ev.engine, ev.symbol].filter(Boolean).join(' • ') || 'LIVE EVENT'}</div>
+    <div class="feed-msg">${ev.message || ev.reason || ev.event_type}</div>
+  `;
+  feedScroll.insertBefore(item, feedScroll.firstChild);
+  while (feedScroll.children.length > 30) feedScroll.removeChild(feedScroll.lastChild);
+}
+
+function processEvent(ev) {
+  if (!ev || !ev.event_type) return;
+  const key = eventKey(ev);
+  if (seenEvents.has(key)) return;
+  seenEvents.add(key);
+  addLog(ev);
+  renderFeed(ev);
+
+  if (ev.event_type === 'win' || ev.event_type === 'fill_verified' || ev.event_type === 'redeem') {
+    fireLaser(ev.pnl_text || ev.pnl_display || (ev.pnl_absolute !== undefined ? `${Number(ev.pnl_absolute) >= 0 ? '+' : ''}$${Math.abs(Number(ev.pnl_absolute)).toFixed(2)}` : '+$WIN'));
+  } else if (ev.event_type === 'skip') {
+    moveTaco(0.45 + Math.random() * 0.2);
+  } else if (ev.event_type === 'loss') {
+    galaxyContainer.classList.add('screen-shake');
+    setTimeout(() => galaxyContainer.classList.remove('screen-shake'), 250);
+  }
+}
+
+function renderPositions(positions) {
+  positionsList.innerHTML = '';
+  const rows = Array.isArray(positions) ? positions : [];
+  document.getElementById('positionsCount').textContent = `${rows.length} LOCKED`;
+  for (const p of rows.slice(0, 6)) {
+    const pnl = Number(p.unrealized_pnl || 0);
+    const row = document.createElement('div');
+    row.className = 'position-row';
+    row.innerHTML = `
+      <span class="position-name">${p.symbol || p.market || 'UNKNOWN'}</span>
+      <span class="position-price">$${Number(p.entry_price || 0).toFixed(3)}</span>
+      <span class="position-pnl ${pnl >= 0 ? 'gain' : 'loss'}">${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}</span>
+    `;
+    positionsList.appendChild(row);
+  }
+}
+
+async function updateStats() {
+  try {
+    const [report, summary, system, extended] = await Promise.all([
+      fetch('/api/report').then((r) => r.json()).catch(() => ({})),
+      fetch('/api/dashboard/summary').then((r) => r.json()).catch(() => ({})),
+      fetch('/system').then((r) => r.json()).catch(() => ({})),
+      fetch('/api/stats/extended').then((r) => r.json()).catch(() => ({})),
+    ]);
+
+    document.getElementById('portfolioValue').textContent = `$${Number(report.current_capital || 0).toFixed(2)}`;
+    document.getElementById('winRate').textContent = `${extended.win_rate || 0}%`;
+    document.getElementById('streak').textContent = report.streak || extended.streak || '0';
+    document.getElementById('uptime').textContent = system.uptime || '--';
+    if (system.cpu_temp_c !== undefined && system.cpu_temp_c !== null) {
+      document.getElementById('tempBadge').textContent = `🌡 ${Number(system.cpu_temp_c).toFixed(1)}°C`;
+    }
+    renderPositions(summary.positions || []);
+    if (Array.isArray(summary.event_history) && feedScroll.children.length === 0) {
+      summary.event_history.slice(-10).forEach(processEvent);
+    }
+  } catch (err) {
+    document.getElementById('engineStatus').textContent = 'DEGRADED';
+  }
+}
+
+function connectEvents() {
+  const source = new EventSource('/api/events/stream');
+  source.onopen = () => {
+    document.getElementById('engineStatus').textContent = 'STREAMING';
+  };
+  source.onmessage = (event) => {
+    try {
+      processEvent(JSON.parse(event.data));
+    } catch (err) {
+      console.error('event parse error', err);
+    }
+  };
+  source.onerror = () => {
+    document.getElementById('engineStatus').textContent = 'RECONNECTING';
+    source.close();
+    setTimeout(connectEvents, 3000);
+  };
+}
+
+tacoSprite.addEventListener('click', () => fireLaser('+$🌮'));
+
+updateStats();
+setInterval(updateStats, 5000);
+connectEvents();
+</script>
+
 </body>
 </html>
