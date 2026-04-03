@@ -52,9 +52,9 @@ Responsibilities:
 
 ### `api/`
 
-Legacy Flask API server files kept for compatibility with older local services and iOS-oriented endpoints.
+Compatibility Flask shim for older local services.
 
-Current production dashboard traffic is not sourced from this Flask service; it is proxied to the live report backend instead.
+It does not calculate trading state itself anymore. It simply proxies legacy API paths and SSE traffic to the live backend on `127.0.0.1:18791`, so older service units can continue working without keeping a second stale implementation in this repo.
 
 ### `terminal/`
 
