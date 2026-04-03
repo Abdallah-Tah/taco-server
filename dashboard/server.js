@@ -1,12 +1,14 @@
 import express from "express";
-import fs from "fs";
 import http from "http";
 import net from "net";
 import { Readable } from "stream";
+import path from "path";
+import { fileURLToPath } from "url";
 
 const PORT = process.env.PORT || 8080;
-const WORKSPACE_DIR = "/home/abdaltm86/.openclaw/workspace";
-const LIVE_API = "http://127.0.0.1:18791";
+const DASHBOARD_DIR = path.dirname(fileURLToPath(import.meta.url));
+const UI_DIR = process.env.UI_DIR || DASHBOARD_DIR;
+const LIVE_API = process.env.LIVE_API || "http://127.0.0.1:18791";
 const app = express();
 
 app.get("/api/events/stream", async (req, res) => {
@@ -51,7 +53,7 @@ app.all("/api/*", async (req, res) => {
   });
 });
 
-app.use(express.static(WORKSPACE_DIR));
+app.use(express.static(UI_DIR));
 
 app.get("/token", async (req, res) => {
   try {

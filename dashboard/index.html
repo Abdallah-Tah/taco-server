@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TacoClaw Live Trading Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;500;700&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+    <style>
+        :root { --bg: #020617; --surface: #0f172a; --banana: #FACC15; --banana-glow: rgba(250, 204, 21, 0.4); --border: rgba(250, 204, 21, 0.1); }
+        body { background-color: var(--bg); color: #f1f1f1; font-family: 'Space Grotesk', sans-serif; overflow: hidden; height: 100vh; }
+        .mono { font-family: 'JetBrains Mono', monospace; }
+        .glass { background: rgba(15, 23, 42, 0.85); backdrop-filter: blur(24px); border: 1px solid var(--border); }
+        .layout-grid { display: grid; grid-template-columns: 1fr 400px; grid-template-rows: 72px 1fr; height: 100vh; gap: 1px; background: rgba(250, 204, 21, 0.05); }
+        .nav-header { grid-column: 1 / -1; z-index: 100; }
+        .main-stage { grid-column: 1 / 2; overflow-y: auto; padding: 1.5rem; background: radial-gradient(circle at top left, #0f172a 0%, #020617 100%); }
+        .activity-sidebar { grid-column: 2 / 3; background: #020617; overflow-y: auto; border-left: 1px solid var(--border); }
+        .banana-card { background: var(--surface); border: 1px solid var(--border); padding: 1.25rem; border-radius: 1.25rem; }
+        .stat-label { font-size: 0.65rem; font-weight: 800; color: #64748b; text-transform: uppercase; letter-spacing: 0.2em; }
+        .stat-value { font-size: 1.75rem; font-weight: 700; line-height: 1; margin-top: 0.25rem; }
+        #galaxy-container { height: 450px; background: #000; border-radius: 2rem; position: relative; overflow: hidden; border: 1px solid rgba(250, 204, 21, 0.2); }
+        #galaxy-canvas { width: 100%; height: 100%; }
+        .galaxy-overlay { position: absolute; top: 1.5rem; left: 2rem; pointer-events: none; }
+        @keyframes fadeInRight { from { opacity: 0; transform: translateX(30px); } to { opacity: 1; transform: translateX(0); } }
+        .animate-event { animation: fadeInRight 0.4s ease-out forwards; }
+        ::-webkit-scrollbar { width: 4px; }
+        ::-webkit-scrollbar-thumb { background: #334155; border-radius: 10px; }
+    </style>
+</head>
+<body>
+    <div class="layout-grid">
+        <header class="nav-header glass flex items-center justify-between px-10">
+            <div class="flex items-center gap-5">
+                <div class="bg-yellow-400 p-2 rounded-xl shadow-[0_0_20px_rgba(250,204,21,0.4)]">
+                    <span class="text-2xl">🍌</span>
+                </div>
+                <div>
+                    <h1 class="font-black text-xl tracking-tighter text-white uppercase italic">Taco<span class="text-yellow-400">Claw</span> Live</h1>
+                    <div class="text-[9px] text-slate-500 font-bold uppercase tracking-[0.3em]">Real-Time Trading Activity</div>
+                </div>
+            </div>
+            <nav class="flex gap-10">
+                <a href="#" class="text-[10px] font-black text-white tracking-widest uppercase border-b-2 border-yellow-400 pb-1">Live Dashboard</a>
+                <a href="http://192.168.40.209:7681/" target="_blank" class="text-[10px] font-black text-zinc-500 tracking-widest uppercase hover:text-yellow-400">Terminal</a>
+                <a href="/system" target="_blank" class="text-[10px] font-black text-zinc-500 tracking-widest uppercase hover:text-white">Health</a>
+            </nav>
+            <div class="flex items-center gap-4">
+                <div class="text-right"><div class="text-[9px] text-slate-500 font-black uppercase">CORE TEMP</div><div class="text-sm font-black text-yellow-400" id="top-temp">--°C</div></div>
+                <button onclick="window.open('http://192.168.40.209:7681/', '_blank')" class="px-5 py-2 bg-yellow-400 text-black text-[10px] font-black uppercase rounded-lg">Shell</button>
+            </div>
+        </header>
+
+        <main class="main-stage">
+            <div id="galaxy-container" class="mb-6">
+                <div class="galaxy-overlay">
+                    <div class="flex items-center gap-2 mb-1"><span class="w-2 h-2 rounded-full bg-yellow-400 animate-ping"></span><h2 class="text-[10px] font-black uppercase tracking-[0.5em] text-yellow-400">Live Engine Activity</h2></div>
+                    <p class="text-[10px] text-slate-500 font-bold uppercase tracking-widest" id="combat-status">Waiting for live engine events...</p>
+                </div>
+                <canvas id="galaxy-canvas"></canvas>
+            </div>
+
+            <div class="grid grid-cols-4 gap-4 mb-6">
+                <div class="banana-card border-l-4 border-l-yellow-400"><div class="stat-label">Portfolio Value</div><div class="stat-value" id="stat-cap">$0.00</div></div>
+                <div class="banana-card border-l-4 border-l-emerald-400"><div class="stat-label">Win Rate</div><div class="stat-value text-emerald-400" id="stat-winrate">0%</div></div>
+                <div class="banana-card border-l-4 border-l-sky-400"><div class="stat-label">Current Streak</div><div class="stat-value text-sky-400" id="stat-streak">0</div></div>
+                <div class="banana-card border-l-4 border-l-purple-400"><div class="stat-label">System Uptime</div><div class="stat-value text-purple-400" id="stat-uptime">--</div></div>
+            </div>
+
+            <div class="glass rounded-2xl overflow-hidden shadow-2xl">
+                <div class="px-8 py-4 border-b border-yellow-400/10 flex justify-between items-center bg-yellow-400/5">
+                    <h2 class="text-[10px] font-black uppercase tracking-[0.3em] text-zinc-500">Open Positions</h2>
+                    <span class="text-[9px] font-bold text-yellow-400 px-3 py-1 bg-yellow-400/10 rounded-full" id="pos-count">0 LOCKED</span>
+                </div>
+                <table class="w-full text-left text-sm">
+                    <tbody id="pos-table" class="divide-y divide-white/5"></tbody>
+                </table>
+            </div>
+        </main>
+
+        <aside class="activity-sidebar flex flex-col">
+            <div class="p-6 border-b border-yellow-400/10 flex items-center justify-between sticky top-0 bg-[#020617] z-10"><h2 class="text-xs font-black uppercase tracking-[0.4em] text-yellow-400">Live Event Feed</h2><span class="text-[9px] text-slate-600 font-mono italic">REALTIME_SSE</span></div>
+            <div id="tx-stream" class="p-4 flex flex-col gap-3"></div>
+        </aside>
+    </div>
+
+    <script>
+        const canvas = document.getElementById('galaxy-canvas');
+        const ctx = canvas.getContext('2d');
+        let ship = { x: 100, y: 200, targetX: 100, targetY: 200, emoji: '🌮', lasers: [] };
+        let stars = [], targets = [], explosions = [], obstacles = [];
+        let seededHistory = new Set();
+
+        function initGalaxy() {
+            canvas.width = canvas.offsetWidth; canvas.height = canvas.offsetHeight;
+            stars = [];
+            for(let i=0; i<150; i++) stars.push({x: Math.random()*canvas.width, y: Math.random()*canvas.height, s: Math.random()*3, c: Math.random() > 0.8 ? '#FACC15' : '#fff'});
+        }
+
+        function formatEventMessage(ev) {
+            const head = [ev.engine, ev.symbol, ev.event_type].filter(Boolean).join(' | ');
+            const details = [];
+            if (ev.reason) details.push(`reason=${ev.reason}`);
+            if (ev.amount !== undefined && ev.amount !== null) details.push(`amount=${ev.amount}`);
+            if (ev.price !== undefined && ev.price !== null) details.push(`price=${ev.price}`);
+            if (ev.entry_price !== undefined && ev.entry_price !== null) details.push(`entry=${ev.entry_price}`);
+            if (ev.order_id) details.push(`order=${String(ev.order_id).slice(0, 10)}`);
+            return [head, details.join(' | ')].filter(Boolean).join(' :: ');
+        }
+
+        function handleEvent(ev, opts = {}) {
+            if (!ev || !ev.event_type) return;
+            const historyKey = ev.seq || ev.id || `${ev.event_type}-${ev.engine || ''}-${ev.order_id || ''}-${ev.timestamp || ''}`;
+            if (!opts.allowDuplicate && seededHistory.has(historyKey)) return;
+            seededHistory.add(historyKey);
+            const tx = canvas.width - 150;
+            const ty = 50 + Math.random()*(canvas.height-100);
+            
+            if (ev.event_type === 'order_placed') {
+                targets.push({ id: ev.order_id, x: tx, y: ty, label: `${ev.symbol} ${ev.side}`, type: 'placed', alpha: 1 });
+                ship.targetX = tx - 100; ship.targetY = ty;
+                document.getElementById('combat-status').textContent = `Order placed: ${ev.engine || ''} ${ev.symbol || ''}`.trim();
+                setTimeout(() => { ship.lasers.push({ x: ship.x + 20, y: ship.y, tx: tx, ty: ty }); }, 500);
+            } 
+            else if (ev.event_type === 'order_cancelled_fok') {
+                const target = targets.find(t => t.id === ev.order_id);
+                if (target) {
+                    target.type = 'cancelled';
+                    document.getElementById('combat-status').textContent = `Order cancelled / FOK fallback: ${ev.engine || ''} ${ev.symbol || ''}`.trim();
+                    ship.targetX = 100; ship.targetY = 200;
+                }
+            }
+            else if (ev.event_type === 'fill_verified') {
+                document.getElementById('combat-status').textContent = `Fill verified: ${ev.engine || ''} ${ev.symbol || ''}`.trim();
+                explosions.push({x: ship.x + 100, y: ship.y, r: 0, c: '#4ade80'});
+            }
+            else if (ev.event_type === 'skip') {
+                document.getElementById('combat-status').textContent = `Skip detected: ${ev.reason || 'skip'}`;
+                obstacles.unshift({
+                    id: ev.id || `${ev.engine}-${ev.timestamp}-${Math.random()}`,
+                    x: tx,
+                    y: ty,
+                    label: `${ev.symbol || 'TARGET'} • ${ev.reason || 'skip'}`,
+                    reason: ev.reason || 'skip',
+                    alpha: 1
+                });
+                ship.targetX = Math.max(60, tx - 220);
+                ship.targetY = Math.max(50, ty - 70);
+                setTimeout(() => { ship.targetX = 100; ship.targetY = 200; }, 1400);
+            }
+            else if (ev.event_type === 'redeem' || ev.event_type === 'win' || ev.event_type === 'loss') {
+                document.getElementById('combat-status').textContent = `${ev.event_type}: ${ev.engine || ''} ${ev.symbol || ''}`.trim();
+                explosions.push({x: tx, y: ty, r: 0, c: ev.event_type === 'loss' ? '#f87171' : '#4ade80'});
+            }
+
+            const stream = document.getElementById('tx-stream');
+            const card = document.createElement('div');
+            card.className = 'animate-event p-4 rounded-xl border border-yellow-400/10 bg-slate-900/40 flex flex-col gap-1';
+            const msg = ev.message || formatEventMessage(ev);
+            const liveTs = ev.live_timestamp || ev.timestamp || Date.now();
+            card.innerHTML = `
+                <div class="flex justify-between items-center text-[9px] font-black uppercase tracking-widest text-slate-500">
+                    <span>${ev.event_type}</span>
+                    <span>${new Date(liveTs).toLocaleTimeString()}</span>
+                </div>
+                <div class="text-[10px] font-black uppercase tracking-[0.25em] text-yellow-400">${[ev.engine, ev.symbol].filter(Boolean).join(' • ') || 'LIVE EVENT'}</div>
+                <div class="text-xs font-bold text-slate-200">${msg}</div>
+            `;
+            stream.prepend(card);
+            if (stream.children.length > 30) stream.lastChild.remove();
+        }
+
+        function animate() {
+            ctx.fillStyle = '#000'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+            stars.forEach(s => { ctx.fillStyle = s.c; s.x -= s.s; if(s.x < 0) s.x = canvas.width; ctx.beginPath(); ctx.arc(s.x, s.y, s.s/2, 0, Math.PI*2); ctx.fill(); });
+            ship.x += (ship.targetX - ship.x) * 0.05; ship.y += (ship.targetY - ship.y) * 0.05;
+            
+            ship.lasers.forEach((l, i) => {
+                ctx.strokeStyle = '#FACC15'; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(l.x, l.y); ctx.lineTo(l.tx, l.ty); ctx.stroke();
+                l.x += (l.tx - l.x) * 0.3; if(Math.abs(l.x - l.tx) < 5) { ship.lasers.splice(i, 1); explosions.push({x: l.tx, y: l.ty, r: 0, c: '#FACC15'}); }
+            });
+
+            explosions.forEach((e, i) => {
+                ctx.strokeStyle = e.c; ctx.beginPath(); ctx.arc(e.x, e.y, e.r, 0, Math.PI*2); ctx.stroke(); e.r += 4;
+                if(e.r > 60) explosions.splice(i, 1);
+            });
+
+            obstacles.forEach((o, i) => {
+                ctx.save();
+                ctx.globalAlpha = o.alpha;
+                ctx.fillStyle = '#64748b';
+                ctx.beginPath();
+                ctx.moveTo(o.x - 18, o.y + 14);
+                ctx.lineTo(o.x - 8, o.y - 10);
+                ctx.lineTo(o.x + 12, o.y - 14);
+                ctx.lineTo(o.x + 20, o.y + 8);
+                ctx.lineTo(o.x + 2, o.y + 18);
+                ctx.closePath();
+                ctx.fill();
+                ctx.font = 'bold 9px JetBrains Mono';
+                ctx.fillStyle = '#f8fafc';
+                ctx.fillText(o.label, o.x + 26, o.y + 5);
+                ctx.restore();
+                o.x -= 1.4;
+                o.alpha *= 0.998;
+                if (o.x < -180 || o.alpha < 0.2) obstacles.splice(i, 1);
+            });
+
+            targets.forEach((t, i) => {
+                ctx.fillStyle = t.type === 'cancelled' ? '#334155' : '#fbbf24';
+                ctx.beginPath(); t.type === 'cancelled' ? ctx.arc(t.x, t.y, 4, 0, Math.PI*2) : ctx.rect(t.x-6, t.y-6, 12, 12); ctx.fill();
+                ctx.font = 'bold 9px JetBrains Mono'; ctx.fillStyle = '#fff'; ctx.fillText(t.label, t.x + 20, t.y + 5);
+                t.x -= 2; if(t.x < -100) targets.splice(i, 1);
+            });
+
+            ctx.font = '36px serif'; ctx.fillText(ship.emoji, ship.x - 18, ship.y + 12);
+            requestAnimationFrame(animate);
+        }
+
+        function connectSSE() {
+            const source = new EventSource('/api/events/stream');
+            source.onmessage = (e) => {
+                try { handleEvent(JSON.parse(e.data)); } catch(err) { console.error("SSE Parse Error", err); }
+            };
+            source.onerror = () => { source.close(); setTimeout(connectSSE, 3000); };
+        }
+
+        async function updateStats() {
+            try {
+                const rep = await fetch('/api/report').then(r => r.json()).catch(() => ({}));
+                const ext = await fetch('/api/stats/extended').then(r => r.json()).catch(() => ({}));
+                const sys = await fetch('/system').then(r => r.json()).catch(() => ({}));
+                const summ = await fetch('/api/dashboard/summary').then(r => r.json()).catch(() => ({}));
+
+                if (rep.current_capital !== undefined) document.getElementById('stat-cap').textContent = '$' + Number(rep.current_capital || 0).toLocaleString();
+                if (ext.win_rate !== undefined) document.getElementById('stat-winrate').textContent = ext.win_rate + '%';
+                if (rep.streak !== undefined) document.getElementById('stat-streak').textContent = rep.streak;
+                if (sys.uptime) document.getElementById('stat-uptime').textContent = sys.uptime;
+                if (sys.cpu_temp_c) document.getElementById('top-temp').textContent = sys.cpu_temp_c.toFixed(1) + '°C';
+
+                if (summ.positions) {
+                    const table = document.getElementById('pos-table'); table.innerHTML = '';
+                    summ.positions.forEach(p => {
+                        const tr = document.createElement('tr'); const upnl = p.unrealized_pnl || 0;
+                        tr.innerHTML = `<td class="px-8 py-4 font-bold text-zinc-300 text-xs uppercase">${p.symbol}</td><td class="px-8 py-4 text-zinc-500 mono text-[10px]">$${p.entry_price?.toFixed(3)}</td><td class="px-8 py-4 text-right mono font-black ${upnl >= 0 ? 'text-green-400' : 'text-red-400'} text-xs">${upnl >= 0 ? '+' : ''}${upnl.toFixed(2)}</td>`;
+                        table.appendChild(tr);
+                    });
+                    document.getElementById('pos-count').textContent = `${summ.positions.length} LOCKED`;
+                }
+                if (summ.event_history && document.getElementById('tx-stream').children.length === 0) {
+                    [...summ.event_history].slice(-12).reverse().forEach(ev => handleEvent(ev, { allowDuplicate: false }));
+                }
+            } catch(e) { console.error("Update Stats Error", e); }
+        }
+
+        window.onload = () => { initGalaxy(); animate(); connectSSE(); setInterval(updateStats, 5000); updateStats(); };
+        window.onresize = initGalaxy;
+    </script>
+</body>
+</html>
