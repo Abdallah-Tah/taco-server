@@ -115,14 +115,27 @@ def run_redeem_check():
     return {"claimed": bool(claimed_items), "items": claimed_items, "claimed_total": claimed_total}
 
 
+def _redeem_prefix(title: str) -> str:
+    t = (title or '').lower()
+    if 'solana up or down' in t:
+        return '[SOL-REDEEM]'
+    if 'bitcoin up or down' in t:
+        return '[BTC-REDEEM]'
+    if 'ethereum up or down' in t:
+        return '[ETH-REDEEM]'
+    return '[REDEEM]'
+
+
 def send_telegram_cha_ching(item):
     """Send celebration notification for winning redeems."""
     title = item.get('title') or 'Polymarket redeem'
     value = float(item.get('value') or 0)
-    message = f"💰 CHA-CHING! Redeemed ${value:.2f} from {title}"
+    tx = item.get('txHash') or item.get('transactionHash') or 'n/a'
+    prefix = _redeem_prefix(title)
+    message = f"💰 CHA-CHING! {prefix} Redeemed ${value:.2f} from {title} | pnl=${value:.2f} tx={tx}"
     try:
         subprocess.run([
-            'openclaw', 'message', 'send',
+            '/home/abdaltm86/.local/bin/openclaw', 'message', 'send',
             '--channel', 'telegram',
             '--target', TELEGRAM_TARGET,
             '--message', message,
@@ -135,10 +148,12 @@ def send_telegram_loss(item):
     """Send quiet notification for losing redeems (no cha-ching)."""
     title = item.get('title') or 'Polymarket redeem'
     value = float(item.get('value') or 0)
-    message = f"❌ Lost position: {title} ($0.00)"
+    tx = item.get('txHash') or item.get('transactionHash') or 'n/a'
+    prefix = _redeem_prefix(title)
+    message = f"❌ {prefix} Lost position: {title} ($0.00) tx={tx}"
     try:
         subprocess.run([
-            'openclaw', 'message', 'send',
+            '/home/abdaltm86/.local/bin/openclaw', 'message', 'send',
             '--channel', 'telegram',
             '--target', TELEGRAM_TARGET,
             '--message', message,

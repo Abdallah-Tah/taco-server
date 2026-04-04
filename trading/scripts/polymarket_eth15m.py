@@ -68,7 +68,7 @@ def _int(key, default):
     except Exception:
         return int(default)
 
-TELEGRAM_TOKEN = ENV.get("TELEGRAM_TOKEN", "8457917317:AAGtnuRix7Ei-rslwVAbfFIFJSK0UIwi0d4")
+TELEGRAM_TOKEN = ENV.get("TELEGRAM_TOKEN", "8457917317:AAHGueV-SogZl14cW5uMmIACpaWuyzByXOo")
 CHAT_ID        = ENV.get("CHAT_ID",        "7520899464")
 POLY_WALLET    = ENV.get("POLY_WALLET",    "0x1a4c163a134D7154ebD5f7359919F9c439424f00")
 VENV_PY        = Path("/home/abdaltm86/.openclaw/workspace/trading/.polymarket-venv/bin/python3")
@@ -80,7 +80,7 @@ MAKER_CANCEL_SEC = _int("ETH15M_MAKER_CANCEL_SEC", 10)
 # FIX #2: Reduced offset from 0.002 -> 0.001
 MAKER_OFFSET = _float("ETH15M_MAKER_OFFSET", 0.001)
 MAKER_POLL_SEC = _int("ETH15M_MAKER_POLL_SEC", 10)
-MAKER_MIN_PRICE = _float("ETH15M_MAKER_MIN_PRICE", 0.50)
+MAKER_MIN_PRICE = _float("ETH15M_MAKER_MIN_PRICE", 0.38)
 # FIX #5: FOK fallback after N seconds of unfilled maker order
 MAKER_FOK_FALLBACK_SEC = _int("ETH15M_MAKER_FOK_FALLBACK_SEC", 60)
 # FIX #5: Allow retry after cancellation if >N seconds remain
@@ -103,7 +103,11 @@ SNIPE_MAX_PRICE = _float("ETH15M_SIGNAL_MAX_ENTRY_PRICE", _float("ETH15M_SNIPE_M
 SNIPE_DEFAULT   = _float("ETH15M_SNIPE_DEFAULT_SIZE", 5.00)
 SNIPE_STRONG    = _float("ETH15M_SNIPE_STRONG_SIZE", 7.50)
 SNIPE_STRONG_D  = _float("ETH15M_SNIPE_STRONG_DELTA", 0.10)  # percent
-SNIPE_WINDOW    = _int("ETH15M_SNIPE_WINDOW_SEC", 15)
+SNIPE_WINDOW    = _int("ETH15M_SNIPE_WINDOW_SEC", 45)
+MIN_ENTRY_SEC   = _int("ETH15M_MIN_ENTRY_SEC", 8)
+LATE_REVERSAL_SEC = _int("ETH15M_LATE_REVERSAL_SEC", 45)
+LATE_REVERSAL_MAX_PRICE = _float("ETH15M_LATE_REVERSAL_MAX_PRICE", 0.35)
+LATE_REVERSAL_CONFIRM_COUNT = _int("ETH15M_LATE_REVERSAL_CONFIRM_COUNT", 1)
 POLL_SEC        = _int("ETH15M_PRICE_POLL_SEC", 5)
 SCAN_SEC        = _int("ETH15M_SCAN_INTERVAL", 10)
 MAX_DAILY_LOSS  = _float("ETH15M_MAX_DAILY_LOSS", 15.00)
@@ -111,6 +115,7 @@ SERIES_ID       = "10216"
 SERIES_SLUG     = "eth-up-or-down-15m"
 # FIX #4: Softened momentum deceleration threshold
 MOMENTUM_DECEL_THRESHOLD = _float("ETH15M_MOMENTUM_DECEL_THRESHOLD", 0.30)
+MOMENTUM_MIN_MULTIPLIER = _float("ETH15M_MOMENTUM_MIN_MULTIPLIER", 1.0)
 # FIX #7: Relaxed 1h trend conflict threshold
 HOUR_TREND_THRESHOLD = _float("ETH15M_HOUR_TREND_THRESHOLD", 0.50)
 
@@ -155,16 +160,16 @@ def log(msg):
 def tg(msg):
     if DRY_RUN:
         return
+    log(f"[TG] Sending: {msg}")
     def _send():
         try:
-            cp = subprocess.run([
-                'openclaw', 'message', 'send',
-                '--channel', 'telegram',
-                '--target', str(CHAT_ID),
-                '--message', str(msg),
-            ], capture_output=True, text=True, timeout=15)
-            if cp.returncode != 0:
-                log(f"[TG-ERR] rc={cp.returncode} stderr={cp.stderr.strip()[:300]}")
+            r = requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                json={"chat_id": CHAT_ID, "text": msg},
+                timeout=10,
+            )
+            if r.status_code != 200:
+                log(f"[TG-ERR] code={r.status_code} response={r.text}")
         except Exception as e:
             log(f"[TG-ERR] {e}")
     threading.Thread(target=_send, daemon=True).start()
@@ -276,6 +281,21 @@ def load_state():
     _state.setdefault('diag_orders_placed', 0)
     _state.setdefault('diag_orders_filled', 0)
     _state.setdefault('diag_orders_cancelled', 0)
+
+def detect_late_reversal(prices, window_open, direction, seconds_remaining):
+    if direction != "UP" or seconds_remaining > LATE_REVERSAL_SEC:
+        return False
+    recent = [(t, p) for t, p in prices if t >= int(time.time()) - 90]
+    if len(recent) < 3 or not window_open:
+        return False
+    deltas = [((p - window_open) / window_open) * 100 for _, p in recent]
+    current_delta = deltas[-1]
+    min_delta = min(deltas)
+    if current_delta < (SNIPE_DELTA_MIN * 0.65):
+        return False
+    if min_delta > -(SNIPE_DELTA_MIN * 0.10):
+        return False
+    return (current_delta - min_delta) >= (SNIPE_DELTA_MIN * 0.90)
 
 # ── ETH price from Coinbase ────────────────────────────────────────────────────
 def get_eth_price():
@@ -407,12 +427,35 @@ def _current_window_open_iso():
     return datetime.fromtimestamp(window_ts, tz=timezone.utc).isoformat()
 
 
+def shadow_bucket(price: float) -> str:
+    lo = max(0.0, min(0.9, math.floor(float(price) * 10) / 10))
+    hi = min(1.0, lo + 0.1)
+    return f"{lo:.1f}-{hi:.1f}"
+
+
+def shadow_decision_eth(price: float) -> tuple[str, str]:
+    if price > 0.80:
+        return "filtered", "block_gt_0.80"
+    if 0.55 <= price <= 0.70:
+        return "kept", "allow_0.55_0.70"
+    return "filtered", "outside_0.55_0.70"
+
+
+def set_shadow_state_eth(price: float, context: str):
+    decision, reason = shadow_decision_eth(price)
+    bucket = shadow_bucket(price)
+    _state['shadow_decision'] = decision
+    _state['shadow_reason'] = reason
+    _state['shadow_bucket'] = bucket
+    _state['shadow_price'] = price
+    log(f"[ETH-SHADOW] {decision} context={context} bucket={bucket} price={price:.4f} expected_pnl=NA reason={reason}")
+
+
 def log_trade(engine, direction, size_usd, entry_price, pnl, exit_type, hold_sec, notes="", sec_remaining=None, price_bucket=None):
     import sqlite3
     try:
         conn = sqlite3.connect(str(JOURNAL_DB))
         c = conn.cursor()
-        trade_id = _current_trade_id(direction)
         timestamp_open = _current_window_open_iso()
         is_resolved = exit_type == "resolved"
         asset = _current_trade_slug()
@@ -422,16 +465,29 @@ def log_trade(engine, direction, size_usd, entry_price, pnl, exit_type, hold_sec
             full_notes = f"{full_notes} sec_rem={sec_remaining}"
         if price_bucket:
             full_notes = f"{full_notes} price_bucket={price_bucket}"
+        if _state.get('shadow_decision'):
+            full_notes = f"{full_notes} shadow={_state.get('shadow_decision')} shadow_bucket={_state.get('shadow_bucket')} shadow_price={_state.get('shadow_price')} shadow_reason={_state.get('shadow_reason')}"
         
         c.execute("""
             INSERT INTO trades (
-                id, engine, timestamp_open, timestamp_close, asset,
+                engine, timestamp_open, timestamp_close, asset,
                 category, direction, entry_price, exit_price,
                 position_size, position_size_usd, pnl_absolute, pnl_percent,
                 exit_type, hold_duration_seconds, regime, notes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(engine, asset, timestamp_open) DO UPDATE SET
+                timestamp_close=excluded.timestamp_close,
+                entry_price=excluded.entry_price,
+                exit_price=excluded.exit_price,
+                position_size=excluded.position_size,
+                position_size_usd=excluded.position_size_usd,
+                pnl_absolute=excluded.pnl_absolute,
+                pnl_percent=excluded.pnl_percent,
+                exit_type=excluded.exit_type,
+                hold_duration_seconds=excluded.hold_duration_seconds,
+                regime=excluded.regime,
+                notes=excluded.notes
         """, (
-            trade_id,
             engine, timestamp_open,
             datetime.now(timezone.utc).isoformat() if is_resolved else None,
             asset,
@@ -770,18 +826,22 @@ def check_maker_snipe(market, seconds_remaining):
     now_ts = int(time.time())
     cutoff_ts = now_ts - SIGNAL_CONFIRM_SEC
     recent_prices = [(t, p) for t, p in _state.get('eth_prices', []) if t >= cutoff_ts]
-    if len(recent_prices) < SIGNAL_CONFIRM_COUNT:
-        log(f"[ETH-MAKER] Confirm: only {len(recent_prices)}/{SIGNAL_CONFIRM_COUNT} samples, waiting")
+    late_reversal = detect_late_reversal(prices, _state['window_open_eth'], direction, seconds_remaining)
+    confirm_target = SIGNAL_CONFIRM_COUNT
+    if late_reversal:
+        confirm_target = min(confirm_target, LATE_REVERSAL_CONFIRM_COUNT)
+    if len(recent_prices) < confirm_target:
+        log(f"[ETH-MAKER] Confirm: only {len(recent_prices)}/{confirm_target} samples, waiting")
         return None
     confirmations = 0
-    for _, p in recent_prices[-SIGNAL_CONFIRM_COUNT:]:
+    for _, p in recent_prices[-confirm_target:]:
         d = (p - _state['window_open_eth']) / _state['window_open_eth'] * 100
         if (direction == 'UP' and d > SNIPE_DELTA_MIN) or (direction == 'DOWN' and d < -SNIPE_DELTA_MIN_DOWN):
             confirmations += 1
-    if confirmations < SIGNAL_CONFIRM_COUNT:
-        log(f"[ETH-MAKER] Confirm: {confirmations}/{SIGNAL_CONFIRM_COUNT}, skipping")
+    if confirmations < confirm_target:
+        log(f"[ETH-MAKER] Confirm: {confirmations}/{confirm_target}, skipping")
         return None
-    recent_avg = sum(p for _, p in recent_prices[-SIGNAL_CONFIRM_COUNT:]) / len(recent_prices[-SIGNAL_CONFIRM_COUNT:])
+    recent_avg = sum(p for _, p in recent_prices[-confirm_target:]) / len(recent_prices[-confirm_target:])
     momentum = (recent_avg - _state['window_open_eth']) / _state['window_open_eth'] * 100
 
     # FIX #4: Softened momentum deceleration threshold
@@ -792,15 +852,18 @@ def check_maker_snipe(market, seconds_remaining):
         second_half = recent[mid:]
         delta_first = (first_half[-1][1] - first_half[0][1]) / first_half[0][1] * 100
         delta_second = (second_half[-1][1] - second_half[0][1]) / second_half[0][1] * 100
-        if abs(delta_second) < abs(delta_first) * MOMENTUM_DECEL_THRESHOLD:
+        if abs(delta_second) < abs(delta_first) * MOMENTUM_DECEL_THRESHOLD and not late_reversal:
             log(f"[ETH-MAKER] momentum decelerating first={delta_first:+.4f}% second={delta_second:+.4f}% (threshold={MOMENTUM_DECEL_THRESHOLD}), skipping")
             return None
 
-    MOMENTUM_MIN = SNIPE_DELTA_MIN * 1.50
-    if abs(momentum) < MOMENTUM_MIN:
+    MOMENTUM_MIN = SNIPE_DELTA_MIN * MOMENTUM_MIN_MULTIPLIER
+    if abs(momentum) < MOMENTUM_MIN and not late_reversal:
         log(f"[ETH-MAKER] momentum={momentum:+.3f}% < {MOMENTUM_MIN:.3f}%, skipping (weak)")
         return None
-    log(f"[ETH-MAKER] CONFIRMED {confirmations}/{SIGNAL_CONFIRM_COUNT} | momentum={momentum:+.3f}%")
+    if late_reversal:
+        log(f"[ETH-MAKER] LATE REVERSAL detected | confirmed={confirmations}/{confirm_target} momentum={momentum:+.3f}%")
+    else:
+        log(f"[ETH-MAKER] CONFIRMED {confirmations}/{confirm_target} | momentum={momentum:+.3f}%")
 
     current_window_ts = _state.get("window_ts")
     if current_window_ts and peer_has_same_direction_fill("btc15m", current_window_ts, direction):
@@ -817,14 +880,15 @@ def check_maker_snipe(market, seconds_remaining):
     token_id = market['clob_token_id'][0] if direction == 'UP' else (market['clob_token_id'][1] if len(market['clob_token_id']) > 1 else '')
     token_price = market['yes_price'] if direction == 'UP' else market['no_price']
 
-    if seconds_remaining < 15:
-        log(f"[ETH-MAKER] FILTER: sec_remaining={seconds_remaining}s < 15s, skipping ultra-late entry")
+    if seconds_remaining < MIN_ENTRY_SEC:
+        log(f"[ETH-MAKER] FILTER: sec_remaining={seconds_remaining}s < {MIN_ENTRY_SEC}s, skipping ultra-late entry")
         return None
 
     # FIX #1: Raised max entry price
-    if token_price > SNIPE_MAX_PRICE:
+    price_cap = LATE_REVERSAL_MAX_PRICE if late_reversal else SNIPE_MAX_PRICE
+    if token_price > price_cap:
         price_bucket = "high"
-        log(f"[ETH-MAKER] FILTER: entry_price={token_price:.4f} > max {SNIPE_MAX_PRICE:.2f} (bucket={price_bucket}), skipping high price")
+        log(f"[ETH-MAKER] FILTER: entry_price={token_price:.4f} > max {price_cap:.2f} (bucket={price_bucket}), skipping high price")
         return None
     elif token_price >= 0.60:
         price_bucket = "mid"
@@ -847,6 +911,7 @@ def check_maker_snipe(market, seconds_remaining):
     limit_price = max(0.01, round(token_price - MAKER_OFFSET, 2))
     shares = max(5.0, math.floor((SNIPE_DEFAULT / max(limit_price, 0.01)) * 100) / 100)
     log(f"[ETH-MAKER] {direction} signal token_mid={token_price:.4f} limit={limit_price:.4f} shares={shares:.2f} dry={MAKER_DRY_RUN} attempt={_state.get('maker_attempt_count', 0)+1}")
+    set_shadow_state_eth(token_price, context='maker')
     r = maker_place_order('BUY', shares, limit_price, market['condition_id'], token_id)
     for line in (r.get('output') or '').splitlines():
         if line.strip() and ('[MAKER' in line or '[RESULT' in line or '[ATTEMPT' in line):
@@ -933,6 +998,7 @@ def check_snipe(market, seconds_remaining):
 
     # FIX #7: Relaxed 1h trend threshold
     prices = _state.get("eth_prices", [])
+    late_reversal = detect_late_reversal(prices, _state["window_open_eth"], direction, seconds_remaining)
     hour_ago_ts = int(time.time()) - 3600
     hour_ago_prices = [p for t, p in prices if t <= hour_ago_ts + 60 and t >= hour_ago_ts - 60]
     if hour_ago_prices:
@@ -952,7 +1018,7 @@ def check_snipe(market, seconds_remaining):
         second_half = recent[mid:]
         delta_first = (first_half[-1][1] - first_half[0][1]) / first_half[0][1] * 100
         delta_second = (second_half[-1][1] - second_half[0][1]) / second_half[0][1] * 100
-        if abs(delta_second) < abs(delta_first) * MOMENTUM_DECEL_THRESHOLD:
+        if abs(delta_second) < abs(delta_first) * MOMENTUM_DECEL_THRESHOLD and not late_reversal:
             log(f"[ETH-SNIPE] momentum decelerating first={delta_first:+.4f}% second={delta_second:+.4f}% (threshold={MOMENTUM_DECEL_THRESHOLD}), skipping")
             return None
 
@@ -964,14 +1030,15 @@ def check_snipe(market, seconds_remaining):
     token_id = market["clob_token_id"][0] if direction == "UP" else (market["clob_token_id"][1] if len(market["clob_token_id"]) > 1 else "")
     price    = market["yes_price"] if direction == "UP" else market["no_price"]
 
-    if seconds_remaining < 15:
-        log(f"[ETH-SNIPE] FILTER: sec_remaining={seconds_remaining}s < 15s, skipping ultra-late entry")
+    if seconds_remaining < MIN_ENTRY_SEC:
+        log(f"[ETH-SNIPE] FILTER: sec_remaining={seconds_remaining}s < {MIN_ENTRY_SEC}s, skipping ultra-late entry")
         return None
 
     # FIX #1: Raised max entry
-    if price > SNIPE_MAX_PRICE:
+    price_cap = LATE_REVERSAL_MAX_PRICE if late_reversal else SNIPE_MAX_PRICE
+    if price > price_cap:
         price_bucket = "high"
-        log(f"[ETH-SNIPE] FILTER: entry_price={price:.4f} > max {SNIPE_MAX_PRICE:.2f} (bucket={price_bucket}), skipping high price")
+        log(f"[ETH-SNIPE] FILTER: entry_price={price:.4f} > max {price_cap:.2f} (bucket={price_bucket}), skipping high price")
         return None
     elif price >= 0.60:
         price_bucket = "mid"
@@ -990,7 +1057,11 @@ def check_snipe(market, seconds_remaining):
         shares = 5
         size = shares * price
 
-    log(f"[ETH-SNIPE] {direction} signal! ETH delta={delta_pct:+.3f}% size=${size:.2f} price={price:.4f} shares={shares:.2f}")
+    if late_reversal:
+        log(f"[ETH-SNIPE] LATE REVERSAL signal! ETH delta={delta_pct:+.3f}% size=${size:.2f} price={price:.4f} shares={shares:.2f}")
+    else:
+        log(f"[ETH-SNIPE] {direction} signal! ETH delta={delta_pct:+.3f}% size=${size:.2f} price={price:.4f} shares={shares:.2f}")
+    set_shadow_state_eth(price, context='snipe')
     r = place_order("BUY", shares, price, market["condition_id"], token_id)
     for line in (r.get("output") or "").splitlines():
         if any(tag in line for tag in ("[ATTEMPT]", "[RESULT]", "Book best", "FILL")):
@@ -1128,7 +1199,7 @@ def main():
         # Strategy B: Snipe / Maker Snipe
         if MAKER_ENABLED:
             check_maker_snipe(market, sec_rem)
-        elif sec_rem <= SNIPE_WINDOW and sec_rem > 5:
+        if sec_rem <= SNIPE_WINDOW and sec_rem > 5:
             check_snipe(market, sec_rem)
 
         # Sleep

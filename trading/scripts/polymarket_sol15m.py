@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-polymarket_sol15m.py — BTC 15-Minute Polymarket Engine
-======================================================
+polymarket_sol15m.py — Solana 15-Minute Polymarket Engine
+=========================================================
 Two strategies:
   A) Binary Arb      — buy UP+DOWN when combined < $0.98, guaranteed profit
-  B) Late Snipe      — directional bet near window close based on BTC delta
+  B) Late Snipe      — directional bet near window close based on SOL delta
 
 Dry run by default. Set DRY_RUN=false to go live.
 """
@@ -54,7 +54,7 @@ def _int(key, default):
     except Exception:
         return int(default)
 
-TELEGRAM_TOKEN = ENV.get("TELEGRAM_TOKEN", "8457917317:AAGtnuRix7Ei-rslwVAbfFIFJSK0UIwi0d4")
+TELEGRAM_TOKEN = ENV.get("TELEGRAM_TOKEN", "8457917317:AAHGueV-SogZl14cW5uMmIACpaWuyzByXOo")
 CHAT_ID        = ENV.get("CHAT_ID",        "7520899464")
 POLY_WALLET    = ENV.get("POLY_WALLET",    "0x1a4c163a134D7154ebD5f7359919F9c439424f00")
 VENV_PY        = Path("/home/abdaltm86/.openclaw/workspace/trading/.polymarket-venv/bin/python3")
@@ -119,16 +119,16 @@ def log(msg):
 def tg(msg):
     if DRY_RUN:
         return
+    log(f"[TG] Sending: {msg}")
     def _send():
         try:
-            cp = subprocess.run([
-                'openclaw', 'message', 'send',
-                '--channel', 'telegram',
-                '--target', str(CHAT_ID),
-                '--message', str(msg),
-            ], capture_output=True, text=True, timeout=15)
-            if cp.returncode != 0:
-                log(f"[TG-ERR] rc={cp.returncode} stderr={cp.stderr.strip()[:300]}")
+            r = requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                json={"chat_id": CHAT_ID, "text": msg},
+                timeout=10,
+            )
+            if r.status_code != 200:
+                log(f"[TG-ERR] code={r.status_code} response={r.text}")
         except Exception as e:
             log(f"[TG-ERR] {e}")
     threading.Thread(target=_send, daemon=True).start()
@@ -155,8 +155,8 @@ def load_state():
             _state = json.load(f)
     _state.setdefault('maker_seen_fills', [])
 
-# ── BTC price from Coinbase ────────────────────────────────────────────────────
-def get_btc_price():
+# ── SOL price from Coinbase ────────────────────────────────────────────────────
+def get_sol_price():
     try:
         r = requests.get(
             "https://api.exchange.coinbase.com/products/SOL-USD/ticker",
@@ -164,7 +164,7 @@ def get_btc_price():
         )
         return float(r.json()["price"])
     except Exception as e:
-        log(f"BTC price error: {e}")
+        log(f"SOL price error: {e}")
         return None
 
 # ── Find current market slug ──────────────────────────────────────────────────
@@ -216,6 +216,10 @@ def get_clob_prices(condition_id):
     return {}
 
 # ── Place order via polymarket_executor ───────────────────────────────────────
+def _market_label(market):
+    return market.get('question') or market.get('slug') or 'sol-updown'
+
+
 def place_order(side, shares, price, condition_id, token_id):
     """Use aggressive FOK buy orders for immediate 15m fills and verify them."""
     import subprocess
@@ -241,6 +245,7 @@ def place_order(side, shares, price, condition_id, token_id):
                 fill = (data.get('fill_check') or {})
                 payload['filled'] = bool(fill.get('filled'))
                 payload['filled_size'] = fill.get('filled_size', 0)
+                payload['fill_check'] = fill
                 payload['posted'] = data
                 break
     except Exception:
@@ -253,6 +258,7 @@ def log_trade(engine, direction, size_usd, entry_price, pnl, exit_type, hold_sec
     try:
         conn = sqlite3.connect(str(JOURNAL_DB))
         c = conn.cursor()
+        ts_open = datetime.now(timezone.utc).isoformat()
         c.execute("""
             INSERT INTO trades (
                 engine, timestamp_open, timestamp_close, asset,
@@ -260,8 +266,20 @@ def log_trade(engine, direction, size_usd, entry_price, pnl, exit_type, hold_sec
                 position_size, position_size_usd, pnl_absolute, pnl_percent,
                 exit_type, hold_duration_seconds, regime, notes
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(engine, asset, timestamp_open) DO UPDATE SET
+                timestamp_close=excluded.timestamp_close,
+                entry_price=excluded.entry_price,
+                exit_price=excluded.exit_price,
+                position_size=excluded.position_size,
+                position_size_usd=excluded.position_size_usd,
+                pnl_absolute=excluded.pnl_absolute,
+                pnl_percent=excluded.pnl_percent,
+                exit_type=excluded.exit_type,
+                hold_duration_seconds=excluded.hold_duration_seconds,
+                regime=excluded.regime,
+                notes=excluded.notes
         """, (
-            engine, datetime.now(timezone.utc).isoformat(),
+            engine, ts_open,
             datetime.now(timezone.utc).isoformat() if exit_type else None,
             "sol-15m",
             "sol-updown",
@@ -382,7 +400,8 @@ def check_maker_snipe(market, seconds_remaining):
             _state['maker_done'] = True
             _state['snipe_done'] = True
             save_state()
-            tg(f"[SOL-MAKER] FILLED order {oid}")
+            market_ref = _state.get('maker_market_ref', 'sol-updown')
+            tg(f"[SOL-MAKER] FILL CONFIRMED order={oid} dir={_state.get('maker_side','UP')} entry={_state.get('maker_price',0):.4f} size=${_state.get('maker_shares',0)*_state.get('maker_price',0):.2f} shares={_state.get('maker_shares',0):.2f} market={market_ref}")
             log_trade("sol15m", _state.get('maker_side', 'UP'), 
                 _state.get('maker_shares', 0) * _state.get('maker_price', 0),
                 _state.get('maker_price', 0), 0, 'filled',
@@ -396,7 +415,10 @@ def check_maker_snipe(market, seconds_remaining):
                 seen = set(_state.get('maker_seen_fills', []))
                 if fill_key not in seen:
                     log(f"[SOL-MAKER] fill verified via activity/trades size={vf.get('filled_size')}")
-                    tg(f"[SOL-MAKER] FILL VERIFIED {vf.get('filled_size')} shares")
+                    market_ref = _state.get('maker_market_ref', 'sol-updown')
+                    txs = vf.get('tx_hashes') or []
+                    tx = txs[0] if txs else 'n/a'
+                    tg(f"[SOL-MAKER] FILL VERIFIED dir={_state.get('maker_side','UP')} entry={_state.get('maker_price',0):.4f} size=${vf.get('filled_size',0)*_state.get('maker_price',0):.2f} shares={vf.get('filled_size',0):.2f} market={market_ref} tx={tx}")
                     # Log verified fill to journal
                     log_trade("sol15m", _state.get('maker_side', 'UP'),
                         vf.get('filled_size', 0) * _state.get('maker_price', 0),
@@ -412,7 +434,8 @@ def check_maker_snipe(market, seconds_remaining):
         if seconds_remaining <= MAKER_CANCEL_SEC and st.get('status') in ('open', 'partially_filled'):
             maker_cancel_order(oid)
             log(f"[SOL-MAKER] cancel by deadline order_id={oid} sec_rem={seconds_remaining}")
-            tg(f"[SOL-MAKER] ORDER CANCELLED: {oid} | sec_rem={seconds_remaining}")
+            market_ref = _state.get('maker_market_ref', 'sol-updown')
+            tg(f"[SOL-MAKER] ORDER CANCELLED: order={oid} dir={_state.get('maker_side','UP')} entry={_state.get('maker_price',0):.4f} size=${_state.get('maker_shares',0)*_state.get('maker_price',0):.2f} shares={_state.get('maker_shares',0):.2f} market={market_ref} sec_rem={seconds_remaining}")
             _state['maker_done'] = True
             save_state()
             return False
@@ -421,7 +444,7 @@ def check_maker_snipe(market, seconds_remaining):
     if seconds_remaining > MAKER_START_SEC or seconds_remaining <= MAKER_CANCEL_SEC:
         return None
 
-    base_price = get_btc_price()
+    base_price = get_sol_price()
     if base_price is None:
         return None
     if not _state.get('window_open_sol'):
@@ -481,11 +504,12 @@ def check_maker_snipe(market, seconds_remaining):
     _state['maker_side'] = direction
     _state['maker_price'] = limit_price
     _state['maker_shares'] = shares
+    _state['maker_market_ref'] = _market_label(market)
     _state['maker_last_poll'] = int(time.time())
     _state['maker_done'] = False
     save_state()
     # Send Telegram notification for order placement
-    tg(f"[SOL-MAKER] ORDER PLACED: {direction} {shares:.2f} shares @ {limit_price:.4f} | Order: {r.get('order_id') or (r.get('posted') or {}).get('order_id') or ''}")
+    tg(f"[SOL-MAKER] ORDER PLACED: dir={direction} entry={limit_price:.4f} size=${shares*limit_price:.2f} shares={shares:.2f} market={_market_label(market)} order={r.get('order_id') or (r.get('posted') or {}).get('order_id') or ''}")
     return r.get('success')
 
 # ── Strategy A: Arb check ─────────────────────────────────────────────────────
@@ -562,16 +586,16 @@ def check_snipe(market, seconds_remaining):
     if seconds_remaining > SNIPE_WINDOW or seconds_remaining < 5:
         return None
 
-    btc_price = get_btc_price()
-    if btc_price is None:
+    sol_price = get_sol_price()
+    if sol_price is None:
         return None
 
     if not _state["window_open_sol"]:
-        log(f"[SNIPE] No window_open_sol recorded, skipping. SOL={btc_price}")
+        log(f"[SNIPE] No window_open_sol recorded, skipping. SOL={sol_price}")
         return None
 
-    delta_pct = (btc_price - _state["window_open_sol"]) / _state["window_open_sol"] * 100
-    log(f"[SNIPE] BTC now={btc_price} window_open={_state['window_open_sol']} delta={delta_pct:+.3f}%")
+    delta_pct = (sol_price - _state["window_open_sol"]) / _state["window_open_sol"] * 100
+    log(f"[SNIPE] SOL now={sol_price} window_open={_state['window_open_sol']} delta={delta_pct:+.3f}%")
 
     direction = None
     if delta_pct > SNIPE_DELTA_MIN:
@@ -597,7 +621,8 @@ def check_snipe(market, seconds_remaining):
         shares = 5
         size = shares * price
 
-    log(f"[SNIPE] {direction} signal! BTC delta={delta_pct:+.3f}% size=${size:.2f} price={price:.4f} shares={shares:.2f}")
+    log(f"[SNIPE] {direction} signal! SOL delta={delta_pct:+.3f}% size=${size:.2f} price={price:.4f} shares={shares:.2f}")
+    tg(f"[SOL-SNIPE] ORDER PLACED: dir={direction} entry={price:.4f} size=${size:.2f} shares={shares:.2f} market={_market_label(market)}")
     r = place_order("BUY", shares, price, market["condition_id"], token_id)
     # Log executor output so [ATTEMPT]/[RESULT] lines are visible
     for line in (r.get("output") or "").splitlines():
@@ -612,13 +637,16 @@ def check_snipe(market, seconds_remaining):
     if os.getenv("SOL15M_ONE_SHOT_TEST") == "1":
         _state["snipe_done"] = True
         save_state()
-        log("[SNIPE] ONE_SHOT_TEST active — stopping after first BTC attempt in this window")
+        log("[SNIPE] ONE_SHOT_TEST active — stopping after first SOL attempt in this window")
 
     if not r.get('filled') and not DRY_RUN:
         log(f"[SNIPE] No fill confirmed — not counting this trade as real")
-        tg(f"[BTC-SNIPE] NO FILL confirmed | {notes}")
+        tg(f"[SOL-SNIPE] ORDER CANCELLED: {notes} market={_market_label(market)}")
         return False
-    tg(f"[BTC-SNIPE] FILL CONFIRMED {r.get('filled_size', shares):.2f} shares | {notes}")
+    fill = r.get('fill_check') or {}
+    txs = fill.get('tx_hashes') or []
+    tx = txs[0] if txs else 'n/a'
+    tg(f"[SOL-SNIPE] FILL VERIFIED dir={direction} entry={price:.4f} size=${size:.2f} shares={r.get('filled_size', shares):.2f} market={_market_label(market)} tx={tx}")
 
     _state["snipe_done"]        = True
     _state["prev_snipe_side"]  = direction
@@ -629,12 +657,12 @@ def check_snipe(market, seconds_remaining):
 
 # ── New window setup ──────────────────────────────────────────────────────────
 def setup_new_window(slug, window_ts):
-    btc_price = get_btc_price()
-    if btc_price is None:
-        btc_price = _state.get("window_open_sol", 0.0)
+    sol_price = get_sol_price()
+    if sol_price is None:
+        sol_price = _state.get("window_open_sol", 0.0)
 
     _state["window_ts"]       = window_ts
-    _state["window_open_sol"] = btc_price
+    _state["window_open_sol"] = sol_price
     _state["arb_done"]        = False
     _state["snipe_done"]      = False
     _state["maker_order_id"]  = ""
@@ -644,12 +672,12 @@ def setup_new_window(slug, window_ts):
     _state["maker_shares"]    = 0.0
     _state["maker_done"]      = False
     _state["maker_last_poll"] = 0
-    _state["sol_prices"]      = [(int(time.time()), btc_price)]
+    _state["sol_prices"]      = [(int(time.time()), sol_price)]
     _state["prev_slug"]       = slug
     save_state()
     trigger_post_resolution_tasks()
 
-    log(f"[NEW WINDOW] ts={window_ts} SOL={btc_price} slug={slug}")
+    log(f"[NEW WINDOW] ts={window_ts} SOL={sol_price} slug={slug}")
     # Window start — no telegram noise
 
 # ── Daily loss check ───────────────────────────────────────────────────────────
@@ -724,10 +752,10 @@ def main():
 
         log(f"[CYCLE] {market['question'][:60]} | YES={market['yes_price']:.3f} NO={market['no_price']:.3f} | {sec_rem}s left")
 
-        # Record BTC price
-        btc = get_btc_price()
-        if btc:
-            _state["sol_prices"].append((int(time.time()), btc))
+        # Record SOL price
+        sol = get_sol_price()
+        if sol:
+            _state["sol_prices"].append((int(time.time()), sol))
             # Keep last window's prices only
             cutoff = window_ts
             _state["sol_prices"] = [(t, p) for t, p in _state["sol_prices"] if t >= cutoff]

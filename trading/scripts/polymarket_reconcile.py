@@ -281,32 +281,101 @@ def sync_journal(rows):
     for r in rows:
         if r['status'] not in ('RESOLVED_WON', 'RESOLVED_LOST'):
             continue
-        stable = f"{r['engine']}:{r['slug']}:{r['side']}"
-        trade_id = hashlib.sha256(stable.encode()).hexdigest()[:32]
         ts_open = r['time']
         ts_close = datetime.fromtimestamp((int(datetime.fromisoformat(ts_open).timestamp()) - (int(datetime.fromisoformat(ts_open).timestamp()) % WINDOW_SEC)) + WINDOW_SEC, tz=timezone.utc).isoformat()
         exit_price = 1.0 if r['status'] == 'RESOLVED_WON' else 0.0
         pnl = float(r['realized_pnl'] or 0.0)
         pnl_pct = (pnl / r['total_cost'] * 100) if r['total_cost'] else 0.0
-        c.execute("SELECT id FROM trades WHERE id=?", (trade_id,))
+        notes = f"market-reconciled {r['status']} fill_count={r['fill_count']}"
+        if r.get('redeem_tx'):
+            notes += f" redeem_tx={r['redeem_tx']}"
+        c.execute("SELECT id FROM trades WHERE engine=? AND asset=? AND timestamp_open=?", (r['engine'], r['slug'], ts_open))
         existing = c.fetchone()
         if existing:
-            # Update existing trade with resolution data
             c.execute("""
                 UPDATE trades SET timestamp_close=?, entry_price=?, exit_price=?, position_size=?, position_size_usd=?,
                     pnl_absolute=?, pnl_percent=?, exit_type=?, hold_duration_seconds=?, notes=?
                 WHERE id=?
-            """, (ts_close, r['entry_price_avg'], exit_price, r['total_shares'], r['total_cost'], pnl, pnl_pct, 'resolved', WINDOW_SEC, f"market-reconciled {r['status']} fill_count={r['fill_count']}", existing[0]))
+            """, (ts_close, r['entry_price_avg'], exit_price, r['total_shares'], r['total_cost'], pnl, pnl_pct, 'resolved', WINDOW_SEC, notes, existing[0]))
         else:
             c.execute("""
                 INSERT INTO trades (
-                    id, engine, timestamp_open, timestamp_close, asset, category, direction,
+                    engine, timestamp_open, timestamp_close, asset, category, direction,
                     entry_price, exit_price, position_size, position_size_usd, pnl_absolute,
                     pnl_percent, exit_type, hold_duration_seconds, regime, notes
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (trade_id, r['engine'], ts_open, ts_close, r['slug'], 'poly-15m', r['side'], r['entry_price_avg'], exit_price, r['total_shares'], r['total_cost'], pnl, pnl_pct, 'resolved', WINDOW_SEC, 'normal', f"market-reconciled {r['status']} fill_count={r['fill_count']}"))
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (r['engine'], ts_open, ts_close, r['slug'], 'poly-15m', r['side'], r['entry_price_avg'], exit_price, r['total_shares'], r['total_cost'], pnl, pnl_pct, 'resolved', WINDOW_SEC, 'normal', notes))
     conn.commit()
     conn.close()
+
+
+def _send_redeem_notification(title, value, tx, slug=None):
+    prefix = '[REDEEM]'
+    tl = (title or '').lower()
+    if 'solana up or down' in tl:
+        prefix = '[SOL-REDEEM]'
+    elif 'bitcoin up or down' in tl:
+        prefix = '[BTC-REDEEM]'
+    elif 'ethereum up or down' in tl:
+        prefix = '[ETH-REDEEM]'
+
+    extra = ''
+    if slug:
+        try:
+            conn = sqlite3.connect(str(JOURNAL_DB))
+            c = conn.cursor()
+            c.execute("SELECT engine, direction, entry_price, position_size_usd, position_size, pnl_absolute FROM trades WHERE asset=? AND engine IN ('btc15m','eth15m','sol15m','xrp15m') ORDER BY timestamp_open DESC LIMIT 1", (slug,))
+            row = c.fetchone()
+            conn.close()
+            if row:
+                engine, direction, entry_price, size_usd, shares, pnl = row
+                outcome = 'WIN' if float(pnl or 0) > 0 else 'LOSS' if float(pnl or 0) < 0 else 'FLAT'
+                extra = f" engine={str(engine).upper()} dir={direction} entry={float(entry_price or 0):.4f} size=${float(size_usd or 0):.2f} shares={float(shares or 0):.2f} outcome={outcome} pnl=${float(pnl or 0):.2f}"
+        except Exception:
+            pass
+    message = f"💰 CHA-CHING! {prefix} Redeemed ${float(value or 0):.2f} from {title}{extra} tx={tx}"
+    try:
+        subprocess.run([
+            '/home/abdaltm86/.local/bin/openclaw', 'message', 'send',
+            '--channel', 'telegram',
+            '--target', str(load_secrets().get('CHAT_ID', '7520899464')),
+            '--message', message,
+        ], check=False, capture_output=True, text=True, timeout=20)
+    except Exception:
+        pass
+
+
+def backfill_redeem_rows(user):
+    activity = fetch_user_activity(user)
+    conn = sqlite3.connect(str(JOURNAL_DB))
+    c = conn.cursor()
+    inserted = 0
+    for a in activity:
+        if a.get('type') != 'REDEEM':
+            continue
+        tx = a.get('transactionHash') or ''
+        if not tx:
+            continue
+        c.execute("SELECT 1 FROM trades WHERE engine='polymarket_redeem' AND notes LIKE ? LIMIT 1", (f'%tx={tx}%',))
+        if c.fetchone():
+            continue
+        ts = datetime.fromtimestamp(int(a.get('timestamp') or 0), tz=timezone.utc).isoformat()
+        title = (a.get('title') or '')[:200]
+        val = float(a.get('usdcSize') or 0)
+        condition = a.get('conditionId') or ''
+        notes = f"condition={condition} tx={tx} slug={a.get('slug') or ''}"
+        c.execute("""
+            INSERT INTO trades (
+                engine, timestamp_open, timestamp_close, asset, category, direction,
+                entry_price, exit_price, position_size, position_size_usd, pnl_absolute,
+                pnl_percent, exit_type, hold_duration_seconds, regime, notes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, ('polymarket_redeem', ts, ts, title, 'redeem', 'REDEEM', 0.0, 0.0, 0.0, 0.0, val, 0.0, 'redeemed', 0, 'normal', notes))
+        _send_redeem_notification(title, val, tx, slug=a.get('slug') or '')
+        inserted += 1
+    conn.commit()
+    conn.close()
+    return inserted
 
 
 def summarize(rows):
@@ -330,12 +399,17 @@ def main():
     json_mode = '--json' in sys.argv
     no_sync = '--no-sync' in sys.argv
     rows = reconcile()
+    inserted_redeems = 0
     if not no_sync:
         sync_journal(rows)
+        s = load_secrets()
+        user = s.get('POLYMARKET_FUNDER', '').lower()
+        if user:
+            inserted_redeems = backfill_redeem_rows(user)
     summary = summarize(rows)
     posted_stats = load_posted_order_stats()
     if json_mode:
-        print(json.dumps({'rows': rows, 'summary': summary, 'posted_stats': posted_stats}, indent=2))
+        print(json.dumps({'rows': rows, 'summary': summary, 'posted_stats': posted_stats, 'inserted_redeems': inserted_redeems}, indent=2))
         return
 
     print('| Time | Engine | Slug | Side | Fill Count | Shares | Cost | Redeem | Realized P&L | Status |')
@@ -343,7 +417,7 @@ def main():
     for r in rows:
         print(f"| {r['time']} | {r['engine']} | {r['slug']} | {r['side']} | {r['fill_count']} | {r['total_shares']:.4f} | {r['total_cost']:.4f} | {float(r['redeem_received'] or 0):.4f} | {float(r['realized_pnl'] or 0):+.4f} | {r['status']} |")
     print()
-    print(json.dumps({'summary': summary, 'posted_stats': posted_stats}, indent=2))
+    print(json.dumps({'summary': summary, 'posted_stats': posted_stats, 'inserted_redeems': inserted_redeems}, indent=2))
 
 
 if __name__ == '__main__':

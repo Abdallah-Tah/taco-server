@@ -73,7 +73,7 @@ def _int(key, default):
     except Exception:
         return int(default)
 
-TELEGRAM_TOKEN = ENV.get("TELEGRAM_TOKEN", "8457917317:AAGtnuRix7Ei-rslwVAbfFIFJSK0UIwi0d4")
+TELEGRAM_TOKEN = ENV.get("TELEGRAM_TOKEN", "8457917317:AAHGueV-SogZl14cW5uMmIACpaWuyzByXOo")
 CHAT_ID        = ENV.get("CHAT_ID",        "7520899464")
 POLY_WALLET    = ENV.get("POLY_WALLET",    "0x1a4c163a134D7154ebD5f7359919F9c439424f00")
 VENV_PY        = Path("/home/abdaltm86/.openclaw/workspace/trading/.polymarket-venv/bin/python3")
@@ -123,6 +123,7 @@ SERIES_ID       = "10192"
 SERIES_SLUG     = "btc-up-or-down-15m"
 # FIX #4: Softened momentum deceleration threshold (was 0.5 implicitly)
 MOMENTUM_DECEL_THRESHOLD = _float("BTC15M_MOMENTUM_DECEL_THRESHOLD", 0.30)
+MOMENTUM_MIN_MULTIPLIER = _float("BTC15M_MOMENTUM_MIN_MULTIPLIER", 1.0)
 
 # ── State ─────────────────────────────────────────────────────────────────────
 _state = {
@@ -171,16 +172,16 @@ def log(msg):
 def tg(msg):
     if DRY_RUN:
         return
+    log(f"[TG] Sending: {msg}")
     def _send():
         try:
-            cp = subprocess.run([
-                'openclaw', 'message', 'send',
-                '--channel', 'telegram',
-                '--target', str(CHAT_ID),
-                '--message', str(msg),
-            ], capture_output=True, text=True, timeout=15)
-            if cp.returncode != 0:
-                log(f"[TG-ERR] rc={cp.returncode} stderr={cp.stderr.strip()[:300]}")
+            r = requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                json={"chat_id": CHAT_ID, "text": msg},
+                timeout=10,
+            )
+            if r.status_code != 200:
+                log(f"[TG-ERR] code={r.status_code} response={r.text}")
         except Exception as e:
             log(f"[TG-ERR] {e}")
     threading.Thread(target=_send, daemon=True).start()
@@ -417,12 +418,77 @@ def _current_window_open_iso():
     return datetime.fromtimestamp(window_ts, tz=timezone.utc).isoformat()
 
 
+def _current_maker_family_id(direction):
+    window_ts = int(_state.get("window_ts") or 0)
+    if not window_ts:
+        return f"btc-unknown-{direction or 'UNKNOWN'}"
+    family_ts = datetime.fromtimestamp(window_ts, tz=timezone.utc).strftime('%Y-%m-%dT%H:%MZ')
+    return f"{family_ts}-{direction or 'UNKNOWN'}"
+
+
+def shadow_bucket(price: float) -> str:
+    lo = max(0.0, min(0.9, math.floor(float(price) * 10) / 10))
+    hi = min(1.0, lo + 0.1)
+    return f"{lo:.1f}-{hi:.1f}"
+
+
+def shadow_decision_btc(price: float) -> tuple[str, str]:
+    if price > 0.70:
+        return "filtered", "block_gt_0.70"
+    if 0.45 <= price <= 0.62:
+        return "kept", "allow_0.45_0.62"
+    return "filtered", "outside_0.45_0.62"
+
+
+def set_shadow_state_btc(price: float, context: str):
+    decision, reason = shadow_decision_btc(price)
+    bucket = shadow_bucket(price)
+    _state['shadow_decision'] = decision
+    _state['shadow_reason'] = reason
+    _state['shadow_bucket'] = bucket
+    _state['shadow_price'] = price
+    log(f"[BTC-SHADOW] {decision} context={context} bucket={bucket} price={price:.4f} expected_pnl=NA reason={reason}")
+
+
+def get_book_metrics(token_id, submitted_price):
+    """Best-effort orderbook snapshot for maker observability only.
+    Returns best_bid/best_ask/spread/distance_to_ask; never raises.
+    """
+    try:
+        r = requests.get(
+            "https://clob.polymarket.com/book",
+            params={"token_id": token_id},
+            timeout=10,
+        )
+        r.raise_for_status()
+        ob = r.json() or {}
+        bids = [float(x.get("price", 0) or 0) for x in (ob.get("bids") or []) if float(x.get("price", 0) or 0) > 0]
+        asks = [float(x.get("price", 0) or 0) for x in (ob.get("asks") or []) if float(x.get("price", 0) or 0) > 0]
+        best_bid = max(bids) if bids else None
+        best_ask = min(asks) if asks else None
+        spread = round(best_ask - best_bid, 4) if best_bid is not None and best_ask is not None else None
+        distance_to_ask = round(best_ask - submitted_price, 4) if best_ask is not None else None
+        return {
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "spread": spread,
+            "distance_to_ask": distance_to_ask,
+        }
+    except Exception as e:
+        return {
+            "best_bid": None,
+            "best_ask": None,
+            "spread": None,
+            "distance_to_ask": None,
+            "error": str(e),
+        }
+
+
 def log_trade(engine, direction, size_usd, entry_price, pnl, exit_type, hold_sec, notes="", sec_remaining=None, price_bucket=None):
     import sqlite3
     try:
         conn = sqlite3.connect(str(JOURNAL_DB))
         c = conn.cursor()
-        trade_id = _current_trade_id(direction)
         timestamp_open = _current_window_open_iso()
         is_resolved = exit_type == "resolved"
         asset = _current_trade_slug()
@@ -433,16 +499,29 @@ def log_trade(engine, direction, size_usd, entry_price, pnl, exit_type, hold_sec
             full_notes = f"{full_notes} sec_rem={sec_remaining}"
         if price_bucket:
             full_notes = f"{full_notes} price_bucket={price_bucket}"
+        if _state.get('shadow_decision'):
+            full_notes = f"{full_notes} shadow={_state.get('shadow_decision')} shadow_bucket={_state.get('shadow_bucket')} shadow_price={_state.get('shadow_price')} shadow_reason={_state.get('shadow_reason')}"
         
         c.execute("""
             INSERT INTO trades (
-                id, engine, timestamp_open, timestamp_close, asset,
+                engine, timestamp_open, timestamp_close, asset,
                 category, direction, entry_price, exit_price,
                 position_size, position_size_usd, pnl_absolute, pnl_percent,
                 exit_type, hold_duration_seconds, regime, notes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(engine, asset, timestamp_open) DO UPDATE SET
+                timestamp_close=excluded.timestamp_close,
+                entry_price=excluded.entry_price,
+                exit_price=excluded.exit_price,
+                position_size=excluded.position_size,
+                position_size_usd=excluded.position_size_usd,
+                pnl_absolute=excluded.pnl_absolute,
+                pnl_percent=excluded.pnl_percent,
+                exit_type=excluded.exit_type,
+                hold_duration_seconds=excluded.hold_duration_seconds,
+                regime=excluded.regime,
+                notes=excluded.notes
         """, (
-            trade_id,
             engine, timestamp_open,
             datetime.now(timezone.utc).isoformat() if is_resolved else None,
             asset,
@@ -818,7 +897,7 @@ def check_maker_snipe(market, seconds_remaining):
             return None
     
     # Require momentum to be meaningfully above the noise floor
-    MOMENTUM_MIN = SNIPE_DELTA_MIN * 1.50
+    MOMENTUM_MIN = SNIPE_DELTA_MIN * MOMENTUM_MIN_MULTIPLIER
     if abs(momentum) < MOMENTUM_MIN:
         log(f"[BTC-MAKER] momentum={momentum:+.3f}% < {MOMENTUM_MIN:.3f}%, skipping (weak)")
         return None
@@ -862,8 +941,28 @@ def check_maker_snipe(market, seconds_remaining):
     # FIX #2: More competitive limit price (reduced offset)
     limit_price = max(0.01, round(token_price - MAKER_OFFSET, 2))
     shares = max(5.0, math.floor((SNIPE_DEFAULT / max(limit_price, 0.01)) * 100) / 100)
-    log(f"[BTC-MAKER] {direction} signal token_mid={token_price:.4f} limit={limit_price:.4f} shares={shares:.2f} dry={MAKER_DRY_RUN} attempt={_state.get('maker_attempt_count', 0)+1}")
-    r = maker_place_order('BUY', shares, limit_price, market['condition_id'], token_id)
+    attempt_num = _state.get('maker_attempt_count', 0) + 1
+    family_id = _current_maker_family_id(direction)
+    side_label = 'BUY YES' if direction == 'UP' else 'BUY NO'
+    token_id_mid = token_id
+    token_id_book = token_id
+    token_id_order = token_id
+    book = get_book_metrics(token_id_book, limit_price)
+    log(f"[BTC-MAKER] {direction} signal token_mid={token_price:.4f} limit={limit_price:.4f} shares={shares:.2f} dry={MAKER_DRY_RUN} attempt={attempt_num} family={family_id}")
+    set_shadow_state_btc(token_price, context='maker')
+    log(f"[BTC-MAKER] TOKENS side={side_label} token_id_mid={token_id_mid} token_id_book={token_id_book} token_id_order={token_id_order} attempt={attempt_num} family={family_id}")
+    if book.get('error'):
+        log(f"[BTC-MAKER] BOOK mid={token_price:.4f} bid=NA ask=NA spread=NA submitted={limit_price:.4f} distance_to_ask=NA attempt={attempt_num} family={family_id} error={book.get('error')}")
+    else:
+        bid_str = f"{book['best_bid']:.4f}" if book.get('best_bid') is not None else 'NA'
+        ask_str = f"{book['best_ask']:.4f}" if book.get('best_ask') is not None else 'NA'
+        spread_str = f"{book['spread']:.4f}" if book.get('spread') is not None else 'NA'
+        dta_str = f"{book['distance_to_ask']:.4f}" if book.get('distance_to_ask') is not None else 'NA'
+        log(f"[BTC-MAKER] BOOK mid={token_price:.4f} bid={bid_str} ask={ask_str} spread={spread_str} submitted={limit_price:.4f} distance_to_ask={dta_str} attempt={attempt_num} family={family_id}")
+        if book.get('best_ask') is not None and abs(float(book['best_ask']) - float(token_price)) > 0.10:
+            log(f"[BTC-MAKER] ABORT: mid/book mismatch side={side_label} token_mid={token_price:.4f} best_ask={float(book['best_ask']):.4f} submitted={limit_price:.4f} token_id_mid={token_id_mid} token_id_book={token_id_book} token_id_order={token_id_order} attempt={attempt_num} family={family_id}")
+            return None
+    r = maker_place_order('BUY', shares, limit_price, market['condition_id'], token_id_order)
     for line in (r.get('output') or '').splitlines():
         if line.strip() and ('[MAKER' in line or '[RESULT' in line or '[ATTEMPT' in line):
             log(f"[EXEC] {line.strip()}")
@@ -879,6 +978,16 @@ def check_maker_snipe(market, seconds_remaining):
     _state['maker_last_poll'] = int(time.time())
     _state['maker_placed_ts'] = int(time.time())  # FIX #5: track placement time
     _state['maker_done'] = False
+    _state['maker_attempt_number'] = attempt_num
+    _state['maker_family_id'] = family_id
+    _state['maker_side_label'] = side_label
+    _state['maker_token_id_mid'] = token_id_mid
+    _state['maker_token_id_book'] = token_id_book
+    _state['maker_token_id_order'] = token_id_order
+    _state['maker_book_bid'] = book.get('best_bid')
+    _state['maker_book_ask'] = book.get('best_ask')
+    _state['maker_book_spread'] = book.get('spread')
+    _state['maker_distance_to_ask'] = book.get('distance_to_ask')
     _state['diag_orders_placed'] = _state.get('diag_orders_placed', 0) + 1
     save_state()
     tg(f"[BTC-MAKER] ORDER PLACED: {direction} {shares:.2f} shares @ {limit_price:.4f} | Order: {r.get('order_id') or (r.get('posted') or {}).get('order_id') or ''}")
@@ -1024,6 +1133,7 @@ def check_snipe(market, seconds_remaining):
         size = shares * price
 
     log(f"[SNIPE] {direction} signal! BTC delta={delta_pct:+.3f}% size=${size:.2f} price={price:.4f} shares={shares:.2f}")
+    set_shadow_state_btc(price, context='snipe')
     r = place_order("BUY", shares, price, market["condition_id"], token_id)
     for line in (r.get("output") or "").splitlines():
         if any(tag in line for tag in ("[ATTEMPT]", "[RESULT]", "Book best", "FILL")):
@@ -1172,7 +1282,7 @@ def main():
         # Strategy B: Snipe / Maker Snipe
         if MAKER_ENABLED:
             check_maker_snipe(market, sec_rem)
-        elif sec_rem <= SNIPE_WINDOW and sec_rem > 5:
+        if sec_rem <= SNIPE_WINDOW and sec_rem > 5:
             check_snipe(market, sec_rem)
 
         # Sleep
