@@ -32,6 +32,7 @@ import json
 import hashlib
 import math
 import os
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -194,7 +195,7 @@ def notify_recent_resolutions():
         conn = sqlite3.connect(str(JOURNAL_DB))
         cur = conn.cursor()
         cur.execute("""
-            SELECT id, asset, side, pnl_absolute
+            SELECT id, asset, direction, pnl_absolute
             FROM trades
             WHERE engine='btc15m' AND exit_type='resolved'
             ORDER BY timestamp_close DESC
@@ -209,10 +210,10 @@ def notify_recent_resolutions():
     seen = set(_state.get("notified_resolved_ids", []))
     notified = list(_state.get("notified_resolved_ids", []))
     new_rows = [row for row in reversed(rows) if row[0] and row[0] not in seen]
-    for trade_id, asset, side, pnl_abs in new_rows:
+    for trade_id, asset, direction, pnl_abs in new_rows:
         pnl_abs = float(pnl_abs or 0.0)
         outcome = "WIN" if pnl_abs >= 0 else "LOST"
-        tg(f"[BTC-15M] {outcome}: {side or '?'} {asset or ''} | P&L ${pnl_abs:+.2f}")
+        tg(f"[BTC-15M] {outcome}: {direction or '?'} {asset or ''} | P&L ${pnl_abs:+.2f}")
         notified.append(trade_id)
 
     if new_rows:
@@ -225,12 +226,19 @@ def trigger_post_resolution_tasks():
     if DRY_RUN:
         return
     try:
+        reconcile_started = time.time()
         # Run reconcile first to update the journal
-        reconcile_proc = subprocess.Popen([str(VENV_PY), str(WORK_DIR / 'scripts' / 'polymarket_reconcile.py')], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        reconcile_proc = subprocess.Popen(
+            [str(VENV_PY), str(WORK_DIR / 'scripts' / 'polymarket_reconcile.py'), '--fast-post-resolution'],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
         
         try:
             # Wait for reconcile to finish.
-            reconcile_proc.wait(timeout=30)
+            reconcile_proc.wait(timeout=25)
+            elapsed = time.time() - reconcile_started
+            log(f"[POST-RESOLUTION] Reconcile completed rc={reconcile_proc.returncode} elapsed={elapsed:.2f}s")
             
             notify_recent_resolutions()
 
@@ -416,6 +424,71 @@ def _current_window_open_iso():
     if not window_ts:
         return datetime.now(timezone.utc).isoformat()
     return datetime.fromtimestamp(window_ts, tz=timezone.utc).isoformat()
+
+
+def _edge_event_id(signal_type: str, side: str, seconds_remaining: int | None) -> str:
+    seed = f"btc15m:{_current_trade_slug()}:{signal_type}:{side or ''}:{seconds_remaining}:{time.time_ns()}"
+    return hashlib.sha256(seed.encode()).hexdigest()
+
+
+def write_edge_event(
+    market,
+    *,
+    signal_type: str,
+    side: str = "",
+    intended_entry_price: float | None = None,
+    decision: str = "",
+    skip_reason: str = "",
+    execution_status: str = "",
+    seconds_remaining: int | None = None,
+    shadow_decision: str = "",
+    shadow_skip_reason: str = "",
+    actual_fill_price: float | None = None,
+):
+    try:
+        conn = sqlite3.connect(str(JOURNAL_DB))
+        conn.execute("PRAGMA busy_timeout = 5000")
+        conn.execute(
+            """
+            INSERT INTO edge_events (
+                id, engine, asset, timestamp_et, market_slug, market_id, side, signal_type,
+                seconds_remaining, model_p_yes, model_p_no, regime_ok, skip_reason,
+                intended_entry_price, actual_fill_price, slippage, decision, shadow_decision,
+                shadow_skip_reason, execution_status, regime
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                _edge_event_id(signal_type, side, seconds_remaining),
+                "btc15m",
+                "BTC",
+                datetime.now(timezone.utc).astimezone().isoformat(),
+                _current_trade_slug(),
+                str(market.get("id") or ""),
+                side,
+                signal_type,
+                seconds_remaining,
+                float(market.get("yes_price") or 0.0),
+                float(market.get("no_price") or 0.0),
+                1,
+                skip_reason or None,
+                float(intended_entry_price or 0.0) if intended_entry_price is not None else None,
+                float(actual_fill_price or 0.0) if actual_fill_price is not None else None,
+                (
+                    float(actual_fill_price) - float(intended_entry_price)
+                    if actual_fill_price is not None and intended_entry_price is not None
+                    else None
+                ),
+                decision or None,
+                shadow_decision or None,
+                shadow_skip_reason or None,
+                execution_status or None,
+                "normal",
+            ),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log(f"[BTC-EDGE] write error: {e}")
 
 
 def _current_maker_family_id(direction):
@@ -833,6 +906,14 @@ def check_maker_snipe(market, seconds_remaining):
     if _state.get('maker_done') or oid:
         return None
     if seconds_remaining > MAKER_START_SEC or seconds_remaining <= MAKER_CANCEL_SEC:
+        write_edge_event(
+            market,
+            signal_type="maker",
+            decision="skip_time",
+            skip_reason="outside_maker_window",
+            execution_status="skipped",
+            seconds_remaining=seconds_remaining,
+        )
         return None
 
     base_price = get_btc_price()
@@ -850,6 +931,14 @@ def check_maker_snipe(market, seconds_remaining):
     else:
         direction = None
     if not direction:
+        write_edge_event(
+            market,
+            signal_type="maker",
+            decision="skip_no_signal",
+            skip_reason="delta_below_threshold",
+            execution_status="skipped",
+            seconds_remaining=seconds_remaining,
+        )
         return None
 
     # ── 1-HOUR TREND FILTER ──
@@ -905,6 +994,16 @@ def check_maker_snipe(market, seconds_remaining):
     current_window_ts = _state.get("window_ts")
     if current_window_ts and peer_has_same_direction_fill("eth15m", current_window_ts, direction):
         log(f"[BTC-MAKER] CORRELATION BLOCK: ETH already filled {direction} in window {current_window_ts}, skipping")
+        write_edge_event(
+            market,
+            signal_type="maker",
+            side=direction,
+            intended_entry_price=market['yes_price'] if direction == 'UP' else market['no_price'],
+            decision="skip_correlation",
+            skip_reason="peer_same_direction_fill",
+            execution_status="blocked",
+            seconds_remaining=seconds_remaining,
+        )
         return None
     token_id = market['clob_token_id'][0] if direction == 'UP' else (market['clob_token_id'][1] if len(market['clob_token_id']) > 1 else '')
     token_price = market['yes_price'] if direction == 'UP' else market['no_price']
@@ -912,12 +1011,35 @@ def check_maker_snipe(market, seconds_remaining):
     # ── FILTERS: sec_remaining and entry_price ──
     if seconds_remaining < 15:
         log(f"[BTC-MAKER] FILTER: sec_remaining={seconds_remaining}s < 15s, skipping ultra-late entry")
+        write_edge_event(
+            market,
+            signal_type="maker",
+            side=direction,
+            intended_entry_price=token_price,
+            decision="skip_time",
+            skip_reason="late_entry",
+            execution_status="skipped",
+            seconds_remaining=seconds_remaining,
+        )
         return None
     
     # FIX #1: Price bucket classification with raised max
     if token_price > SIGNAL_MAX_ENTRY_PRICE:
         price_bucket = "high"
         log(f"[BTC-MAKER] FILTER: entry_price={token_price:.4f} > max {SIGNAL_MAX_ENTRY_PRICE:.2f} (bucket={price_bucket}), skipping high price")
+        set_shadow_state_btc(token_price, context='maker')
+        write_edge_event(
+            market,
+            signal_type="maker",
+            side=direction,
+            intended_entry_price=token_price,
+            decision="skip_no_edge",
+            skip_reason="entry_price_above_max",
+            execution_status="skipped",
+            seconds_remaining=seconds_remaining,
+            shadow_decision=_state.get('shadow_decision', ''),
+            shadow_skip_reason=_state.get('shadow_reason', ''),
+        )
         return None
     elif token_price >= 0.60:
         price_bucket = "mid"
@@ -926,6 +1048,19 @@ def check_maker_snipe(market, seconds_remaining):
     else:
         price_bucket = "low"
         log(f"[BTC-MAKER] FILTER: entry_price={token_price:.4f} < min {SIGNAL_MIN_ENTRY_PRICE:.2f} (bucket={price_bucket}), skipping low price")
+        set_shadow_state_btc(token_price, context='maker')
+        write_edge_event(
+            market,
+            signal_type="maker",
+            side=direction,
+            intended_entry_price=token_price,
+            decision="skip_no_edge",
+            skip_reason="entry_price_below_min",
+            execution_status="skipped",
+            seconds_remaining=seconds_remaining,
+            shadow_decision=_state.get('shadow_decision', ''),
+            shadow_skip_reason=_state.get('shadow_reason', ''),
+        )
         return None
     
     log(f"[BTC-MAKER] PRICE_BUCKET: {price_bucket} (price={token_price:.4f})")
@@ -950,6 +1085,17 @@ def check_maker_snipe(market, seconds_remaining):
     book = get_book_metrics(token_id_book, limit_price)
     log(f"[BTC-MAKER] {direction} signal token_mid={token_price:.4f} limit={limit_price:.4f} shares={shares:.2f} dry={MAKER_DRY_RUN} attempt={attempt_num} family={family_id}")
     set_shadow_state_btc(token_price, context='maker')
+    write_edge_event(
+        market,
+        signal_type="maker",
+        side=direction,
+        intended_entry_price=token_price,
+        decision="place_yes",
+        execution_status="pending" if DRY_RUN else "posted",
+        seconds_remaining=seconds_remaining,
+        shadow_decision=_state.get('shadow_decision', ''),
+        shadow_skip_reason=_state.get('shadow_reason', ''),
+    )
     log(f"[BTC-MAKER] TOKENS side={side_label} token_id_mid={token_id_mid} token_id_book={token_id_book} token_id_order={token_id_order} attempt={attempt_num} family={family_id}")
     if book.get('error'):
         log(f"[BTC-MAKER] BOOK mid={token_price:.4f} bid=NA ask=NA spread=NA submitted={limit_price:.4f} distance_to_ask=NA attempt={attempt_num} family={family_id} error={book.get('error')}")
@@ -1092,11 +1238,29 @@ def check_snipe(market, seconds_remaining):
         direction = "DOWN"
     else:
         log(f"[SNIPE] Delta {delta_pct:+.3f}% — no valid signal (DOWN_ENABLED={DOWN_ENABLED})")
+        write_edge_event(
+            market,
+            signal_type="snipe",
+            decision="skip_no_signal",
+            skip_reason="delta_below_threshold",
+            execution_status="skipped",
+            seconds_remaining=seconds_remaining,
+        )
         return None
 
     current_window_ts = _state.get("window_ts")
     if current_window_ts and peer_has_same_direction_fill("eth15m", current_window_ts, direction):
         log(f"[BTC-SNIPE] CORRELATION BLOCK: ETH already filled {direction} in window {current_window_ts}, skipping")
+        write_edge_event(
+            market,
+            signal_type="snipe",
+            side=direction,
+            intended_entry_price=market["yes_price"] if direction == "UP" else market["no_price"],
+            decision="skip_correlation",
+            skip_reason="peer_same_direction_fill",
+            execution_status="blocked",
+            seconds_remaining=seconds_remaining,
+        )
         return None
 
     token_id = market["clob_token_id"][0] if direction == "UP" else (market["clob_token_id"][1] if len(market["clob_token_id"]) > 1 else "")
@@ -1104,12 +1268,35 @@ def check_snipe(market, seconds_remaining):
 
     if seconds_remaining < 15:
         log(f"[SNIPE] FILTER: sec_remaining={seconds_remaining}s < 15s, skipping ultra-late entry")
+        write_edge_event(
+            market,
+            signal_type="snipe",
+            side=direction,
+            intended_entry_price=price,
+            decision="skip_time",
+            skip_reason="late_entry",
+            execution_status="skipped",
+            seconds_remaining=seconds_remaining,
+        )
         return None
     
     # FIX #1: Price bucket classification with raised max
     if price > SIGNAL_MAX_ENTRY_PRICE:
         price_bucket = "high"
         log(f"[SNIPE] FILTER: entry_price={price:.4f} > max {SIGNAL_MAX_ENTRY_PRICE:.2f} (bucket={price_bucket}), skipping high price")
+        set_shadow_state_btc(price, context='snipe')
+        write_edge_event(
+            market,
+            signal_type="snipe",
+            side=direction,
+            intended_entry_price=price,
+            decision="skip_no_edge",
+            skip_reason="entry_price_above_max",
+            execution_status="skipped",
+            seconds_remaining=seconds_remaining,
+            shadow_decision=_state.get('shadow_decision', ''),
+            shadow_skip_reason=_state.get('shadow_reason', ''),
+        )
         return None
     elif price >= 0.60:
         price_bucket = "mid"
@@ -1118,6 +1305,19 @@ def check_snipe(market, seconds_remaining):
     else:
         price_bucket = "low"
         log(f"[SNIPE] FILTER: entry_price={price:.4f} < floor {SIGNAL_MIN_ENTRY_PRICE:.2f} (bucket={price_bucket}), skipping low price")
+        set_shadow_state_btc(price, context='snipe')
+        write_edge_event(
+            market,
+            signal_type="snipe",
+            side=direction,
+            intended_entry_price=price,
+            decision="skip_no_edge",
+            skip_reason="entry_price_below_min",
+            execution_status="skipped",
+            seconds_remaining=seconds_remaining,
+            shadow_decision=_state.get('shadow_decision', ''),
+            shadow_skip_reason=_state.get('shadow_reason', ''),
+        )
         return None
 
     log(f"[SNIPE] PRICE_BUCKET: {price_bucket} (price={price:.4f})")
@@ -1134,6 +1334,17 @@ def check_snipe(market, seconds_remaining):
 
     log(f"[SNIPE] {direction} signal! BTC delta={delta_pct:+.3f}% size=${size:.2f} price={price:.4f} shares={shares:.2f}")
     set_shadow_state_btc(price, context='snipe')
+    write_edge_event(
+        market,
+        signal_type="snipe",
+        side=direction,
+        intended_entry_price=price,
+        decision="place_yes",
+        execution_status="pending" if DRY_RUN else "posted",
+        seconds_remaining=seconds_remaining,
+        shadow_decision=_state.get('shadow_decision', ''),
+        shadow_skip_reason=_state.get('shadow_reason', ''),
+    )
     r = place_order("BUY", shares, price, market["condition_id"], token_id)
     for line in (r.get("output") or "").splitlines():
         if any(tag in line for tag in ("[ATTEMPT]", "[RESULT]", "Book best", "FILL")):

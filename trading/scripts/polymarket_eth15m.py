@@ -27,6 +27,7 @@ import json
 import hashlib
 import os
 import math
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -182,7 +183,7 @@ def notify_recent_resolutions():
         conn = sqlite3.connect(str(JOURNAL_DB))
         cur = conn.cursor()
         cur.execute("""
-            SELECT id, asset, side, pnl_absolute
+            SELECT id, asset, direction, pnl_absolute
             FROM trades
             WHERE engine='eth15m' AND exit_type='resolved'
             ORDER BY timestamp_close DESC
@@ -197,10 +198,10 @@ def notify_recent_resolutions():
     seen = set(_state.get("notified_resolved_ids", []))
     notified = list(_state.get("notified_resolved_ids", []))
     new_rows = [row for row in reversed(rows) if row[0] and row[0] not in seen]
-    for trade_id, asset, side, pnl_abs in new_rows:
+    for trade_id, asset, direction, pnl_abs in new_rows:
         pnl_abs = float(pnl_abs or 0.0)
         outcome = "WIN" if pnl_abs >= 0 else "LOST"
-        tg(f"[ETH-15M] {outcome}: {side or '?'} {asset or ''} | P&L ${pnl_abs:+.2f}")
+        tg(f"[ETH-15M] {outcome}: {direction or '?'} {asset or ''} | P&L ${pnl_abs:+.2f}")
         notified.append(trade_id)
 
     if new_rows:
@@ -212,9 +213,16 @@ def trigger_post_resolution_tasks():
     if DRY_RUN:
         return
     try:
-        reconcile_proc = subprocess.Popen([str(VENV_PY), str(WORK_DIR / 'scripts' / 'polymarket_reconcile.py')], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        reconcile_started = time.time()
+        reconcile_proc = subprocess.Popen(
+            [str(VENV_PY), str(WORK_DIR / 'scripts' / 'polymarket_reconcile.py'), '--fast-post-resolution'],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
         try:
-            reconcile_proc.wait(timeout=30)
+            reconcile_proc.wait(timeout=25)
+            elapsed = time.time() - reconcile_started
+            log(f"[ETH-POST-RESOLUTION] Reconcile completed rc={reconcile_proc.returncode} elapsed={elapsed:.2f}s")
             notify_recent_resolutions()
             check_consecutive_losses()
         except subprocess.TimeoutExpired:
@@ -425,6 +433,71 @@ def _current_window_open_iso():
     if not window_ts:
         return datetime.now(timezone.utc).isoformat()
     return datetime.fromtimestamp(window_ts, tz=timezone.utc).isoformat()
+
+
+def _edge_event_id(signal_type: str, side: str, seconds_remaining: int | None) -> str:
+    seed = f"eth15m:{_current_trade_slug()}:{signal_type}:{side or ''}:{seconds_remaining}:{time.time_ns()}"
+    return hashlib.sha256(seed.encode()).hexdigest()
+
+
+def write_edge_event(
+    market,
+    *,
+    signal_type: str,
+    side: str = "",
+    intended_entry_price: float | None = None,
+    decision: str = "",
+    skip_reason: str = "",
+    execution_status: str = "",
+    seconds_remaining: int | None = None,
+    shadow_decision: str = "",
+    shadow_skip_reason: str = "",
+    actual_fill_price: float | None = None,
+):
+    try:
+        conn = sqlite3.connect(str(JOURNAL_DB))
+        conn.execute("PRAGMA busy_timeout = 5000")
+        conn.execute(
+            """
+            INSERT INTO edge_events (
+                id, engine, asset, timestamp_et, market_slug, market_id, side, signal_type,
+                seconds_remaining, model_p_yes, model_p_no, regime_ok, skip_reason,
+                intended_entry_price, actual_fill_price, slippage, decision, shadow_decision,
+                shadow_skip_reason, execution_status, regime
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                _edge_event_id(signal_type, side, seconds_remaining),
+                "eth15m",
+                "ETH",
+                datetime.now(timezone.utc).astimezone().isoformat(),
+                _current_trade_slug(),
+                str(market.get("id") or ""),
+                side,
+                signal_type,
+                seconds_remaining,
+                float(market.get("yes_price") or 0.0),
+                float(market.get("no_price") or 0.0),
+                1,
+                skip_reason or None,
+                float(intended_entry_price or 0.0) if intended_entry_price is not None else None,
+                float(actual_fill_price or 0.0) if actual_fill_price is not None else None,
+                (
+                    float(actual_fill_price) - float(intended_entry_price)
+                    if actual_fill_price is not None and intended_entry_price is not None
+                    else None
+                ),
+                decision or None,
+                shadow_decision or None,
+                shadow_skip_reason or None,
+                execution_status or None,
+                "normal",
+            ),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log(f"[ETH-EDGE] write error: {e}")
 
 
 def shadow_bucket(price: float) -> str:
@@ -791,6 +864,14 @@ def check_maker_snipe(market, seconds_remaining):
     if _state.get('maker_done') or oid:
         return None
     if seconds_remaining > MAKER_START_SEC or seconds_remaining <= MAKER_CANCEL_SEC:
+        write_edge_event(
+            market,
+            signal_type="maker",
+            decision="skip_time",
+            skip_reason="outside_maker_window",
+            execution_status="skipped",
+            seconds_remaining=seconds_remaining,
+        )
         return None
 
     base_price = get_eth_price()
@@ -808,6 +889,14 @@ def check_maker_snipe(market, seconds_remaining):
     else:
         direction = None
     if not direction:
+        write_edge_event(
+            market,
+            signal_type="maker",
+            decision="skip_no_signal",
+            skip_reason="delta_below_threshold",
+            execution_status="skipped",
+            seconds_remaining=seconds_remaining,
+        )
         return None
 
     # FIX #7: Relaxed 1h trend filter threshold
@@ -868,6 +957,16 @@ def check_maker_snipe(market, seconds_remaining):
     current_window_ts = _state.get("window_ts")
     if current_window_ts and peer_has_same_direction_fill("btc15m", current_window_ts, direction):
         log(f"[ETH-MAKER] CORRELATION BLOCK: BTC already filled {direction} in window {current_window_ts}, skipping")
+        write_edge_event(
+            market,
+            signal_type="maker",
+            side=direction,
+            intended_entry_price=market['yes_price'] if direction == 'UP' else market['no_price'],
+            decision="skip_correlation",
+            skip_reason="peer_same_direction_fill",
+            execution_status="blocked",
+            seconds_remaining=seconds_remaining,
+        )
         return None
     # FIX #15: Stagger ETH entry — wait 20s into maker window before placing, so BTC fills first
     # and the correlation block can detect it. Prevents both engines entering same direction simultaneously.
@@ -875,6 +974,15 @@ def check_maker_snipe(market, seconds_remaining):
     maker_window_elapsed = (MAKER_START_SEC - seconds_remaining)
     if maker_window_elapsed < CORRELATION_STAGGER_SEC:
         log(f"[ETH-MAKER] CORRELATION STAGGER: waiting {CORRELATION_STAGGER_SEC - maker_window_elapsed:.0f}s for BTC to fill first")
+        write_edge_event(
+            market,
+            signal_type="maker",
+            side=direction,
+            decision="skip_time",
+            skip_reason="correlation_stagger",
+            execution_status="skipped",
+            seconds_remaining=seconds_remaining,
+        )
         return None
 
     token_id = market['clob_token_id'][0] if direction == 'UP' else (market['clob_token_id'][1] if len(market['clob_token_id']) > 1 else '')
@@ -882,6 +990,16 @@ def check_maker_snipe(market, seconds_remaining):
 
     if seconds_remaining < MIN_ENTRY_SEC:
         log(f"[ETH-MAKER] FILTER: sec_remaining={seconds_remaining}s < {MIN_ENTRY_SEC}s, skipping ultra-late entry")
+        write_edge_event(
+            market,
+            signal_type="maker",
+            side=direction,
+            intended_entry_price=token_price,
+            decision="skip_time",
+            skip_reason="late_entry",
+            execution_status="skipped",
+            seconds_remaining=seconds_remaining,
+        )
         return None
 
     # FIX #1: Raised max entry price
@@ -889,6 +1007,19 @@ def check_maker_snipe(market, seconds_remaining):
     if token_price > price_cap:
         price_bucket = "high"
         log(f"[ETH-MAKER] FILTER: entry_price={token_price:.4f} > max {price_cap:.2f} (bucket={price_bucket}), skipping high price")
+        set_shadow_state_eth(token_price, context='maker')
+        write_edge_event(
+            market,
+            signal_type="maker",
+            side=direction,
+            intended_entry_price=token_price,
+            decision="skip_no_edge",
+            skip_reason="entry_price_above_max",
+            execution_status="skipped",
+            seconds_remaining=seconds_remaining,
+            shadow_decision=_state.get('shadow_decision', ''),
+            shadow_skip_reason=_state.get('shadow_reason', ''),
+        )
         return None
     elif token_price >= 0.60:
         price_bucket = "mid"
@@ -897,6 +1028,19 @@ def check_maker_snipe(market, seconds_remaining):
     else:
         price_bucket = "low"
         log(f"[ETH-MAKER] FILTER: entry_price={token_price:.4f} < min {SNIPE_MIN_PRICE:.2f} (bucket={price_bucket}), skipping low price")
+        set_shadow_state_eth(token_price, context='maker')
+        write_edge_event(
+            market,
+            signal_type="maker",
+            side=direction,
+            intended_entry_price=token_price,
+            decision="skip_no_edge",
+            skip_reason="entry_price_below_min",
+            execution_status="skipped",
+            seconds_remaining=seconds_remaining,
+            shadow_decision=_state.get('shadow_decision', ''),
+            shadow_skip_reason=_state.get('shadow_reason', ''),
+        )
         return None
 
     log(f"[ETH-MAKER] PRICE_BUCKET: {price_bucket} (price={token_price:.4f})")
@@ -912,6 +1056,17 @@ def check_maker_snipe(market, seconds_remaining):
     shares = max(5.0, math.floor((SNIPE_DEFAULT / max(limit_price, 0.01)) * 100) / 100)
     log(f"[ETH-MAKER] {direction} signal token_mid={token_price:.4f} limit={limit_price:.4f} shares={shares:.2f} dry={MAKER_DRY_RUN} attempt={_state.get('maker_attempt_count', 0)+1}")
     set_shadow_state_eth(token_price, context='maker')
+    write_edge_event(
+        market,
+        signal_type="maker",
+        side=direction,
+        intended_entry_price=token_price,
+        decision="place_yes",
+        execution_status="pending" if DRY_RUN else "posted",
+        seconds_remaining=seconds_remaining,
+        shadow_decision=_state.get('shadow_decision', ''),
+        shadow_skip_reason=_state.get('shadow_reason', ''),
+    )
     r = maker_place_order('BUY', shares, limit_price, market['condition_id'], token_id)
     for line in (r.get('output') or '').splitlines():
         if line.strip() and ('[MAKER' in line or '[RESULT' in line or '[ATTEMPT' in line):
@@ -994,6 +1149,14 @@ def check_snipe(market, seconds_remaining):
         direction = "DOWN"
     else:
         log(f"[ETH-SNIPE] Delta {delta_pct:+.3f}% — no valid signal (DOWN_ENABLED={DOWN_ENABLED})")
+        write_edge_event(
+            market,
+            signal_type="snipe",
+            decision="skip_no_signal",
+            skip_reason="delta_below_threshold",
+            execution_status="skipped",
+            seconds_remaining=seconds_remaining,
+        )
         return None
 
     # FIX #7: Relaxed 1h trend threshold
@@ -1025,6 +1188,16 @@ def check_snipe(market, seconds_remaining):
     current_window_ts = _state.get("window_ts")
     if current_window_ts and peer_has_same_direction_fill("btc15m", current_window_ts, direction):
         log(f"[ETH-SNIPE] CORRELATION BLOCK: BTC already filled {direction} in window {current_window_ts}, skipping")
+        write_edge_event(
+            market,
+            signal_type="snipe",
+            side=direction,
+            intended_entry_price=market["yes_price"] if direction == "UP" else market["no_price"],
+            decision="skip_correlation",
+            skip_reason="peer_same_direction_fill",
+            execution_status="blocked",
+            seconds_remaining=seconds_remaining,
+        )
         return None
 
     token_id = market["clob_token_id"][0] if direction == "UP" else (market["clob_token_id"][1] if len(market["clob_token_id"]) > 1 else "")
@@ -1032,6 +1205,16 @@ def check_snipe(market, seconds_remaining):
 
     if seconds_remaining < MIN_ENTRY_SEC:
         log(f"[ETH-SNIPE] FILTER: sec_remaining={seconds_remaining}s < {MIN_ENTRY_SEC}s, skipping ultra-late entry")
+        write_edge_event(
+            market,
+            signal_type="snipe",
+            side=direction,
+            intended_entry_price=price,
+            decision="skip_time",
+            skip_reason="late_entry",
+            execution_status="skipped",
+            seconds_remaining=seconds_remaining,
+        )
         return None
 
     # FIX #1: Raised max entry
@@ -1039,6 +1222,19 @@ def check_snipe(market, seconds_remaining):
     if price > price_cap:
         price_bucket = "high"
         log(f"[ETH-SNIPE] FILTER: entry_price={price:.4f} > max {price_cap:.2f} (bucket={price_bucket}), skipping high price")
+        set_shadow_state_eth(price, context='snipe')
+        write_edge_event(
+            market,
+            signal_type="snipe",
+            side=direction,
+            intended_entry_price=price,
+            decision="skip_no_edge",
+            skip_reason="entry_price_above_max",
+            execution_status="skipped",
+            seconds_remaining=seconds_remaining,
+            shadow_decision=_state.get('shadow_decision', ''),
+            shadow_skip_reason=_state.get('shadow_reason', ''),
+        )
         return None
     elif price >= 0.60:
         price_bucket = "mid"
@@ -1047,6 +1243,19 @@ def check_snipe(market, seconds_remaining):
     else:
         price_bucket = "low"
         log(f"[ETH-SNIPE] FILTER: entry_price={price:.4f} < floor {SNIPE_MIN_PRICE:.2f} (bucket={price_bucket}), skipping low price")
+        set_shadow_state_eth(price, context='snipe')
+        write_edge_event(
+            market,
+            signal_type="snipe",
+            side=direction,
+            intended_entry_price=price,
+            decision="skip_no_edge",
+            skip_reason="entry_price_below_min",
+            execution_status="skipped",
+            seconds_remaining=seconds_remaining,
+            shadow_decision=_state.get('shadow_decision', ''),
+            shadow_skip_reason=_state.get('shadow_reason', ''),
+        )
         return None
 
     log(f"[ETH-SNIPE] PRICE_BUCKET: {price_bucket} (price={price:.4f})")
@@ -1062,6 +1271,17 @@ def check_snipe(market, seconds_remaining):
     else:
         log(f"[ETH-SNIPE] {direction} signal! ETH delta={delta_pct:+.3f}% size=${size:.2f} price={price:.4f} shares={shares:.2f}")
     set_shadow_state_eth(price, context='snipe')
+    write_edge_event(
+        market,
+        signal_type="snipe",
+        side=direction,
+        intended_entry_price=price,
+        decision="place_yes",
+        execution_status="pending" if DRY_RUN else "posted",
+        seconds_remaining=seconds_remaining,
+        shadow_decision=_state.get('shadow_decision', ''),
+        shadow_skip_reason=_state.get('shadow_reason', ''),
+    )
     r = place_order("BUY", shares, price, market["condition_id"], token_id)
     for line in (r.get("output") or "").splitlines():
         if any(tag in line for tag in ("[ATTEMPT]", "[RESULT]", "Book best", "FILL")):

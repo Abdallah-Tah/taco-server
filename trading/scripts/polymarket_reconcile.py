@@ -23,6 +23,11 @@ VENV = ROOT / '.polymarket-venv' / 'bin' / 'python3'
 EXECUTOR = ROOT / 'scripts' / 'polymarket_executor.py'
 WINDOW_SEC = 900
 LOCAL_TZ = ZoneInfo('America/New_York')
+REQUEST_TIMEOUT_POSITIONS = 8
+REQUEST_TIMEOUT_TRADES = 8
+REQUEST_TIMEOUT_ACTIVITY = 8
+REQUEST_TIMEOUT_MARKET = 5
+SUBPROCESS_TIMEOUT_ORDERS = 10
 
 
 def load_secrets():
@@ -36,11 +41,11 @@ def load_secrets():
     return data
 
 
-def load_positions(user):
+def load_positions(user, timeout=REQUEST_TIMEOUT_POSITIONS):
     if not user:
         return []
     try:
-        r = requests.get(POSITIONS_API.format(user=user), timeout=20)
+        r = requests.get(POSITIONS_API.format(user=user), timeout=timeout)
         return r.json() if r.status_code == 200 else []
     except Exception:
         return []
@@ -66,29 +71,32 @@ def sync_live_positions_file(live_positions):
             'cash_pnl': float(p.get('cashPnl') or 0),
             'redeemable': bool(p.get('redeemable')),
         }
-    (ROOT / '.poly_positions.json').write_text(json.dumps(clean, indent=2))
+    try:
+        (ROOT / '.poly_positions.json').write_text(json.dumps(clean, indent=2))
+    except Exception:
+        pass
     return clean
 
 
-def fetch_user_trades(user):
+def fetch_user_trades(user, timeout=REQUEST_TIMEOUT_TRADES):
     try:
-        r = requests.get(TRADES_API, params={'user': user, 'limit': 1000, 'offset': 0, 'takerOnly': 'false'}, timeout=30)
+        r = requests.get(TRADES_API, params={'user': user, 'limit': 1000, 'offset': 0, 'takerOnly': 'false'}, timeout=timeout)
         return r.json() if r.status_code == 200 else []
     except Exception:
         return []
 
 
-def fetch_user_activity(user):
+def fetch_user_activity(user, timeout=REQUEST_TIMEOUT_ACTIVITY):
     try:
-        r = requests.get(ACTIVITY_API, params={'user': user, 'limit': 1000, 'offset': 0}, timeout=30)
+        r = requests.get(ACTIVITY_API, params={'user': user, 'limit': 1000, 'offset': 0}, timeout=timeout)
         return r.json() if r.status_code == 200 else []
     except Exception:
         return []
 
 
-def fetch_market_result(slug):
+def fetch_market_result(slug, timeout=REQUEST_TIMEOUT_MARKET):
     try:
-        r = requests.get(GAMMA.format(slug=slug), timeout=15)
+        r = requests.get(GAMMA.format(slug=slug), timeout=timeout)
         data = r.json() if r.status_code == 200 else []
         if not data:
             return None
@@ -114,9 +122,9 @@ def fetch_market_result(slug):
         return None
 
 
-def load_open_orders():
+def load_open_orders(timeout=SUBPROCESS_TIMEOUT_ORDERS):
     try:
-        res = subprocess.run([str(VENV), str(EXECUTOR), 'orders'], capture_output=True, text=True, timeout=30)
+        res = subprocess.run([str(VENV), str(EXECUTOR), 'orders'], capture_output=True, text=True, timeout=timeout)
         return json.loads(res.stdout)
     except Exception:
         return []
@@ -151,14 +159,20 @@ def load_posted_order_stats():
     return stats
 
 
-def reconcile():
+def reconcile(fast_post_resolution=False):
     s = load_secrets()
     user = s.get('POLYMARKET_FUNDER', '').lower()
-    live_positions = load_positions(user)
-    sync_live_positions_file(live_positions)
-    open_orders = load_open_orders()
+    live_positions = [] if fast_post_resolution else load_positions(user)
+    if not fast_post_resolution:
+        sync_live_positions_file(live_positions)
+    open_orders = [] if fast_post_resolution else load_open_orders()
     trades = fetch_user_trades(user)
     activity = fetch_user_activity(user)
+    if fast_post_resolution:
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        cutoff_ts = now_ts - 86400
+        trades = [t for t in trades if int(t.get('timestamp') or 0) >= cutoff_ts]
+        activity = [a for a in activity if int(a.get('timestamp') or 0) >= cutoff_ts]
 
     # Deduplicate raw trade fills.
     seen = set()
@@ -172,6 +186,20 @@ def reconcile():
             continue
         seen.add(key)
         uniq_trades.append(t)
+    if fast_post_resolution:
+        recent_slugs = []
+        seen_recent = set()
+        for t in sorted(uniq_trades, key=lambda x: int(x.get('timestamp') or 0), reverse=True):
+            slug = str(t.get('slug') or '')
+            if slug in seen_recent:
+                continue
+            seen_recent.add(slug)
+            recent_slugs.append(slug)
+            if len(recent_slugs) >= 32:
+                break
+        recent_slug_set = set(recent_slugs)
+        uniq_trades = [t for t in uniq_trades if str(t.get('slug') or '') in recent_slug_set]
+        activity = [a for a in activity if str(a.get('slug') or '') in recent_slug_set]
 
     # Aggregate fills by economic position: (engine, slug, side)
     grouped = {}
@@ -398,7 +426,8 @@ def summarize(rows):
 def main():
     json_mode = '--json' in sys.argv
     no_sync = '--no-sync' in sys.argv
-    rows = reconcile()
+    fast_post_resolution = '--fast-post-resolution' in sys.argv
+    rows = reconcile(fast_post_resolution=fast_post_resolution)
     inserted_redeems = 0
     if not no_sync:
         sync_journal(rows)
@@ -407,7 +436,9 @@ def main():
         if user:
             inserted_redeems = backfill_redeem_rows(user)
     summary = summarize(rows)
-    posted_stats = load_posted_order_stats()
+    posted_stats = {'btc15m': {'posted_orders': 0, 'filled_orders': 0}, 'eth15m': {'posted_orders': 0, 'filled_orders': 0}}
+    if not fast_post_resolution:
+        posted_stats = load_posted_order_stats()
     if json_mode:
         print(json.dumps({'rows': rows, 'summary': summary, 'posted_stats': posted_stats, 'inserted_redeems': inserted_redeems}, indent=2))
         return
