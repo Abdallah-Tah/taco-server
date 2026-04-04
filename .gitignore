@@ -24,6 +24,16 @@ secrets.env
 .poly_*.json
 *.log
 
+# Journals / databases
+journal.db
+scripts/journal.db
+trading/journal.db
+trading/journal.db-shm
+trading/journal.db-wal
+trading/coinbase_journal.db
+*.db-shm
+*.db-wal
+
 # OS
 .DS_Store
 Thumbs.db
