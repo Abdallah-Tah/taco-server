@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+export HISTTIMEFORMAT='%F %T '
+export HISTSIZE=10000
+export HISTFILESIZE=20000
+export PROMPT_COMMAND='history -a; history -n'
+alias last='history | tail -20'
+alias traderlog='tail -f /tmp/taco_trader.log'
+alias gwrestart='systemctl --user restart openclaw-gateway.service'
+alias gwstatus='systemctl --user status openclaw-gateway.service | sed -n "1,12p"'
+alias models='ollama list'
+alias menu='/home/abdaltm86/.local/bin/taco-menu'
+alias ocstatus='openclaw status'
+alias traderps='ps aux | grep taco_trader.py | grep -v grep'
+alias sysinfo='echo --- Memory ---; free -h; echo; echo --- Disk ---; df -h /; echo; uptime'
+alias files='/home/abdaltm86/.local/bin/mobile-files'
+alias fm='ranger /home/abdaltm86/.openclaw/workspace'
+alias logs='cd /tmp && ls -lt *.log 2>/dev/null | head -20'
+alias snaps='cd /home/abdaltm86/.openclaw/workspace/skills/blink-cam/snapshots && ls -lt | head -30'
+clear
+cat <<'EOF'
+🌮 Full Shell Mode
+Shortcuts: menu | gwrestart | gwstatus | models | traderlog | traderps | sysinfo | last | files | fm | logs | snaps
+EOF
+exec bash -i

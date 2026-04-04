@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -e
+SESSION="mobile"
+START="/home/abdaltm86/Documents/taco-servers/terminal/taco-menu"
+if tmux has-session -t "$SESSION" 2>/dev/null; then
+  exec tmux attach -t "$SESSION"
+else
+  exec tmux new-session -s "$SESSION" "$START"
+fi
