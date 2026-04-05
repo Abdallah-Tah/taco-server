@@ -59,6 +59,24 @@ COMPAT_HISTORY_LIMIT = 40
 EVENT_BACKLOG_LIMIT = 60
 EVENT_POLL_SEC = 0.5
 
+DEDUPE_TRADES_CTE = """
+WITH ranked_trades AS (
+    SELECT
+        rowid AS _rowid,
+        trades.*,
+        ROW_NUMBER() OVER (
+            PARTITION BY engine, asset, timestamp_open, direction
+            ORDER BY rowid DESC
+        ) AS lifecycle_rn
+    FROM trades
+),
+dedup_trades AS (
+    SELECT *
+    FROM ranked_trades
+    WHERE engine NOT IN ('btc15m', 'eth15m') OR lifecycle_rn = 1
+)
+"""
+
 
 COMMAND_MAP = {
     "/short-report": ("short", "Short trading report"),
@@ -357,11 +375,12 @@ def get_recent_trades(limit: int = 40) -> list[dict[str, Any]]:
     conn = _db()
     try:
         rows = conn.execute(
-            """
-            SELECT rowid, engine, asset, direction, entry_price, exit_price, position_size_usd,
+            DEDUPE_TRADES_CTE
+            + """
+            SELECT _rowid AS rowid, engine, asset, direction, entry_price, exit_price, position_size_usd,
                    pnl_absolute, pnl_percent, exit_type, timestamp_open, timestamp_close
-            FROM trades
-            ORDER BY COALESCE(timestamp_close, timestamp_open) DESC, rowid DESC
+            FROM dedup_trades
+            ORDER BY COALESCE(timestamp_close, timestamp_open) DESC, _rowid DESC
             LIMIT ?
             """,
             (limit,),
@@ -382,11 +401,12 @@ def get_stats_extended() -> dict[str, Any]:
     conn = _db()
     try:
         rows = conn.execute(
-            """
+            DEDUPE_TRADES_CTE
+            + """
             SELECT pnl_absolute
-            FROM trades
+            FROM dedup_trades
             WHERE timestamp_close IS NOT NULL
-            ORDER BY timestamp_close DESC, rowid DESC
+            ORDER BY timestamp_close DESC, _rowid DESC
             LIMIT 500
             """
         ).fetchall()
@@ -451,12 +471,13 @@ def get_latest_sale() -> dict[str, Any]:
     conn = _db()
     try:
         row = conn.execute(
-            """
+            DEDUPE_TRADES_CTE
+            + """
             SELECT engine, asset, direction, entry_price, exit_price,
                    position_size_usd, pnl_absolute, exit_type, timestamp_close
-            FROM trades
+            FROM dedup_trades
             WHERE timestamp_close IS NOT NULL
-            ORDER BY timestamp_close DESC, rowid DESC
+            ORDER BY timestamp_close DESC, _rowid DESC
             LIMIT 1
             """
         ).fetchone()
@@ -469,12 +490,13 @@ def get_redeemed() -> list[dict[str, Any]] | dict[str, str]:
     conn = _db()
     try:
         rows = conn.execute(
-            """
+            DEDUPE_TRADES_CTE
+            + """
             SELECT engine, asset, direction, entry_price, exit_price,
                    position_size_usd, pnl_absolute, exit_type, timestamp_close
-            FROM trades
+            FROM dedup_trades
             WHERE timestamp_close IS NOT NULL
-            ORDER BY timestamp_close DESC, rowid DESC
+            ORDER BY timestamp_close DESC, _rowid DESC
             LIMIT 10
             """
         ).fetchall()

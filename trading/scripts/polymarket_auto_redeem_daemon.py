@@ -126,11 +126,20 @@ def _redeem_prefix(title: str) -> str:
     return '[REDEEM]'
 
 
+def _normalize_tx_hash(tx_hash):
+    tx = str(tx_hash or '').strip().lower()
+    if tx.startswith('0x'):
+        tx = tx[2:]
+    if not tx:
+        return ''
+    return f'0x{tx}'
+
+
 def send_telegram_cha_ching(item):
     """Send celebration notification for winning redeems."""
     title = item.get('title') or 'Polymarket redeem'
     value = float(item.get('value') or 0)
-    tx = item.get('txHash') or item.get('transactionHash') or 'n/a'
+    tx = _normalize_tx_hash(item.get('txHash') or item.get('transactionHash')) or 'n/a'
     prefix = _redeem_prefix(title)
     message = f"💰 CHA-CHING! {prefix} Redeemed ${value:.2f} from {title} | pnl=${value:.2f} tx={tx}"
     try:
@@ -148,7 +157,7 @@ def send_telegram_loss(item):
     """Send quiet notification for losing redeems (no cha-ching)."""
     title = item.get('title') or 'Polymarket redeem'
     value = float(item.get('value') or 0)
-    tx = item.get('txHash') or item.get('transactionHash') or 'n/a'
+    tx = _normalize_tx_hash(item.get('txHash') or item.get('transactionHash')) or 'n/a'
     prefix = _redeem_prefix(title)
     message = f"❌ {prefix} Lost position: {title} ($0.00) tx={tx}"
     try:

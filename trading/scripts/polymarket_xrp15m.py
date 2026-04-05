@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-polymarket_xrp15m.py — BTC 15-Minute Polymarket Engine
+polymarket_xrp15m.py — XRP 15-Minute Polymarket Engine
 ======================================================
 Two strategies:
   A) Binary Arb      — buy UP+DOWN when combined < $0.98, guaranteed profit
-  B) Late Snipe      — directional bet near window close based on BTC delta
+  B) Late Snipe      — directional bet near window close based on XRP delta
 
 Dry run by default. Set DRY_RUN=false to go live.
 """
@@ -19,6 +19,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
+
+from polymarket_clob_pricing import fetch_book, choose_buy_price
 
 # ── Paths & creds ──────────────────────────────────────────────────────────────
 WORK_DIR      = Path("/home/abdaltm86/.openclaw/workspace/trading")
@@ -71,6 +73,7 @@ ARB_THRESHOLD   = _float("XRP15M_ARB_THRESHOLD", 0.98)
 ARB_SIZE        = _float("XRP15M_ARB_SIZE", 10.00)
 SNIPE_DELTA_MIN = _float("XRP15M_SNIPE_DELTA_MIN", 0.025)
 SNIPE_MAX_PRICE = _float("XRP15M_SNIPE_MAX_PRICE", 0.90)
+EXEC_SPREAD_CAP = _float("XRP15M_EXEC_SPREAD_CAP", 0.10)
 # Signal confirmation (improved filtering)
 SIGNAL_CONFIRM_COUNT   = _int("XRP15M_SIGNAL_CONFIRM_COUNT", 2)   # consecutive polls needed
 SIGNAL_CONFIRM_SEC     = _int("XRP15M_SIGNAL_CONFIRM_SEC", 15)     # max age of confirm samples
@@ -83,7 +86,7 @@ POLL_SEC        = _int("XRP15M_PRICE_POLL_SEC", 5)
 SCAN_SEC        = _int("XRP15M_SCAN_INTERVAL", 10)
 MAX_DAILY_LOSS  = _float("XRP15M_MAX_DAILY_LOSS", 15.00)
 SERIES_ID       = "10192"
-SERIES_SLUG     = "btc-up-or-down-15m"
+SERIES_SLUG     = "xrp-updown-15m"
 
 # ── State ─────────────────────────────────────────────────────────────────────
 _state = {
@@ -151,8 +154,8 @@ def load_state():
             _state = json.load(f)
     _state.setdefault('maker_seen_fills', [])
 
-# ── BTC price from Coinbase ────────────────────────────────────────────────────
-def get_btc_price():
+# ── XRP price from Coinbase ────────────────────────────────────────────────────
+def get_xrp_price():
     try:
         r = requests.get(
             "https://api.exchange.coinbase.com/products/XRP-USD/ticker",
@@ -160,8 +163,43 @@ def get_btc_price():
         )
         return float(r.json()["price"])
     except Exception as e:
-        log(f"BTC price error: {e}")
+        log(f"XRP price error: {e}")
         return None
+
+
+def get_book_metrics(token_id, submitted_price):
+    """CLOB book snapshot used as execution-pricing truth."""
+    book = fetch_book(token_id)
+    distance_to_ask = round(book["best_ask"] - submitted_price, 4) if book.get("best_ask") is not None else None
+    return {
+        "best_bid": book.get("best_bid"),
+        "best_ask": book.get("best_ask"),
+        "midpoint": book.get("midpoint"),
+        "spread": book.get("spread"),
+        "distance_to_ask": distance_to_ask,
+        "tick": book.get("tick", 0.01),
+        "bids": book.get("bids", []),
+        "asks": book.get("asks", []),
+        "error": book.get("error"),
+    }
+
+
+
+def get_exec_buy_context(market, direction, mode, price_cap, submitted_hint=0.0):
+    token_id = market['clob_token_id'][0] if direction == 'UP' else (market['clob_token_id'][1] if len(market['clob_token_id']) > 1 else '')
+    gamma_price = market['yes_price'] if direction == 'UP' else market['no_price']
+    book = get_book_metrics(token_id, submitted_hint)
+    clob_ref_price = book.get('midpoint') if book.get('midpoint') is not None else (book.get('best_ask') if book.get('best_ask') is not None else book.get('best_bid'))
+    submitted_price, abort_reason = choose_buy_price(book, price_cap=price_cap, mode=mode, spread_cap=EXEC_SPREAD_CAP, maker_offset=MAKER_OFFSET)
+    return {
+        'token_id': token_id,
+        'gamma_price': gamma_price,
+        'clob_ref_price': clob_ref_price,
+        'submitted_price': submitted_price,
+        'abort_reason': abort_reason,
+        'book': book,
+        'side_label': 'BUY YES' if direction == 'UP' else 'BUY NO',
+    }
 
 # ── Find current market slug ──────────────────────────────────────────────────
 def get_current_slug():
@@ -182,6 +220,7 @@ def get_market(slug):
             outcome_prices = json.loads(m["outcomePrices"])
             return {
                 "id":           m["id"],
+                "slug":         m.get("slug") or slug,
                 "question":     m["question"],
                 "condition_id": m["conditionId"],
                 "clob_token_id": json.loads(m.get("clobTokenIds", "[]")),
@@ -366,7 +405,7 @@ def check_maker_snipe(market, seconds_remaining):
     if seconds_remaining > MAKER_START_SEC or seconds_remaining <= MAKER_CANCEL_SEC:
         return None
 
-    base_price = get_btc_price()
+    base_price = get_xrp_price()
     if base_price is None:
         return None
     if not _state.get('window_open_xrp'):
@@ -400,17 +439,30 @@ def check_maker_snipe(market, seconds_remaining):
         log(f"[XRP-MAKER] momentum={momentum:+.3f}% < {MOMENTUM_MIN:.3f}%, skipping (weak)")
         return None
     log(f"[XRP-MAKER] CONFIRMED {confirmations}/{SIGNAL_CONFIRM_COUNT} | momentum={momentum:+.3f}%")
-    token_id = market['clob_token_id'][0] if direction == 'UP' else (market['clob_token_id'][1] if len(market['clob_token_id']) > 1 else '')
-    token_price = market['yes_price'] if direction == 'UP' else market['no_price']
+    ctx = get_exec_buy_context(market, direction, mode='maker', price_cap=SIGNAL_MAX_ENTRY_PRICE, submitted_hint=0.0)
+    token_id = ctx['token_id']
+    token_price = ctx['clob_ref_price']
+    gamma_price = ctx['gamma_price']
+    book = ctx['book']
+    bid_str = f"{book['best_bid']:.4f}" if book.get('best_bid') is not None else 'NA'
+    ask_str = f"{book['best_ask']:.4f}" if book.get('best_ask') is not None else 'NA'
+    mid_str = f"{book['midpoint']:.4f}" if book.get('midpoint') is not None else 'NA'
+    spread_str = f"{book['spread']:.4f}" if book.get('spread') is not None else 'NA'
+    if token_price is None:
+        log(f"[XRP-MAKER] ABORT: pricing_source=CLOB slug={market.get('slug','')} side={direction} token_id={token_id} gamma_price={gamma_price} clob_best_bid={bid_str} clob_best_ask={ask_str} clob_midpoint={mid_str} submitted_price=NA spread={spread_str} abort_reason=missing_clob_reference")
+        return None
     if token_price < MAKER_MIN_PRICE:
-        log(f"[XRP-MAKER] token_mid={token_price:.4f} < min {MAKER_MIN_PRICE:.4f}, skipping")
+        log(f"[XRP-MAKER] ABORT: pricing_source=CLOB slug={market.get('slug','')} side={direction} token_id={token_id} gamma_price={gamma_price:.4f} clob_best_bid={bid_str} clob_best_ask={ask_str} clob_midpoint={mid_str} submitted_price=NA spread={spread_str} abort_reason=below_maker_min")
         return None
     if token_price > SIGNAL_MAX_ENTRY_PRICE:
-        log(f"[XRP-MAKER] entry={token_price:.4f} > max {SIGNAL_MAX_ENTRY_PRICE:.4f}, skipping {direction} signal")
+        log(f"[XRP-MAKER] ABORT: pricing_source=CLOB slug={market.get('slug','')} side={direction} token_id={token_id} gamma_price={gamma_price:.4f} clob_best_bid={bid_str} clob_best_ask={ask_str} clob_midpoint={mid_str} submitted_price=NA spread={spread_str} abort_reason=slippage_cap_exceeded:{token_price:.4f}>{SIGNAL_MAX_ENTRY_PRICE:.4f}")
         return None
-    limit_price = max(0.01, round(token_price - MAKER_OFFSET, 2))
+    limit_price = ctx['submitted_price']
+    if ctx['abort_reason']:
+        log(f"[XRP-MAKER] ABORT: pricing_source=CLOB slug={market.get('slug','')} side={ctx['side_label']} token_id={token_id} gamma_price={gamma_price:.4f} clob_best_bid={bid_str} clob_best_ask={ask_str} clob_midpoint={mid_str} submitted_price=NA spread={spread_str} abort_reason={ctx['abort_reason']}")
+        return None
     shares = max(5.0, math.floor((SNIPE_DEFAULT / max(limit_price, 0.01)) * 100) / 100)
-    log(f"[XRP-MAKER] {direction} signal token_mid={token_price:.4f} limit={limit_price:.4f} shares={shares:.2f} dry={MAKER_DRY_RUN}")
+    log(f"[XRP-MAKER] pricing_source=CLOB slug={market.get('slug','')} side={ctx['side_label']} token_id={token_id} gamma_price={gamma_price:.4f} clob_best_bid={bid_str} clob_best_ask={ask_str} clob_midpoint={mid_str} submitted_price={limit_price:.4f} spread={spread_str} shares={shares:.2f} dry={MAKER_DRY_RUN}")
     r = maker_place_order('BUY', shares, limit_price, market['condition_id'], token_id)
     for line in (r.get('output') or '').splitlines():
         if line.strip() and ('[MAKER' in line or '[RESULT' in line or '[ATTEMPT' in line):
@@ -468,16 +520,16 @@ def check_snipe(market, seconds_remaining):
     if seconds_remaining > SNIPE_WINDOW or seconds_remaining < 5:
         return None
 
-    btc_price = get_btc_price()
-    if btc_price is None:
+    xrp_price = get_xrp_price()
+    if xrp_price is None:
         return None
 
     if not _state["window_open_xrp"]:
-        log(f"[SNIPE] No window_open_xrp recorded, skipping. XRP={btc_price}")
+        log(f"[SNIPE] No window_open_xrp recorded, skipping. XRP={xrp_price}")
         return None
 
-    delta_pct = (btc_price - _state["window_open_xrp"]) / _state["window_open_xrp"] * 100
-    log(f"[SNIPE] BTC now={btc_price} window_open={_state['window_open_xrp']} delta={delta_pct:+.3f}%")
+    delta_pct = (xrp_price - _state["window_open_xrp"]) / _state["window_open_xrp"] * 100
+    log(f"[SNIPE] XRP now={xrp_price} window_open={_state['window_open_xrp']} delta={delta_pct:+.3f}%")
 
     direction = None
     if delta_pct > SNIPE_DELTA_MIN:
@@ -488,23 +540,29 @@ def check_snipe(market, seconds_remaining):
         log(f"[SNIPE] Delta {delta_pct:+.3f}% too small, skipping")
         return None
 
-    # Pick token
-    token_id = market["clob_token_id"][0] if direction == "UP" else (market["clob_token_id"][1] if len(market["clob_token_id"]) > 1 else "")
-    price    = market["yes_price"] if direction == "UP" else market["no_price"]
-
-    if price > SNIPE_MAX_PRICE:
-        log(f"[SNIPE] Price {price:.4f} > max {SNIPE_MAX_PRICE}, skipping")
+    ctx = get_exec_buy_context(market, direction, mode='taker', price_cap=SNIPE_MAX_PRICE, submitted_hint=0.0)
+    token_id = ctx['token_id']
+    price = ctx['clob_ref_price']
+    submitted_price = ctx['submitted_price']
+    gamma_price = ctx['gamma_price']
+    book = ctx['book']
+    bid_str = f"{book['best_bid']:.4f}" if book.get('best_bid') is not None else 'NA'
+    ask_str = f"{book['best_ask']:.4f}" if book.get('best_ask') is not None else 'NA'
+    mid_str = f"{book['midpoint']:.4f}" if book.get('midpoint') is not None else 'NA'
+    spread_str = f"{book['spread']:.4f}" if book.get('spread') is not None else 'NA'
+    if price is None or ctx['abort_reason']:
+        log(f"[XRP-SNIPE] ABORT: pricing_source=CLOB slug={market.get('slug','')} side={ctx['side_label']} token_id={token_id} gamma_price={gamma_price:.4f} clob_best_bid={bid_str} clob_best_ask={ask_str} clob_midpoint={mid_str} submitted_price=NA spread={spread_str} abort_reason={ctx['abort_reason'] or 'missing_clob_reference'}")
         return None
 
     size = SNIPE_STRONG if abs(delta_pct) >= SNIPE_STRONG_D * 100 else SNIPE_DEFAULT
-    shares = size / price
+    shares = size / submitted_price
     # Ensure minimum 5 shares for Polymarket
     if shares < 5:
         shares = 5
-        size = shares * price
+        size = shares * submitted_price
 
-    log(f"[SNIPE] {direction} signal! BTC delta={delta_pct:+.3f}% size=${size:.2f} price={price:.4f} shares={shares:.2f}")
-    r = place_order("BUY", shares, price, market["condition_id"], token_id)
+    log(f"[XRP-SNIPE] pricing_source=CLOB slug={market.get('slug','')} side={ctx['side_label']} token_id={token_id} gamma_price={gamma_price:.4f} clob_best_bid={bid_str} clob_best_ask={ask_str} clob_midpoint={mid_str} submitted_price={submitted_price:.4f} spread={spread_str}")
+    r = place_order("BUY", shares, submitted_price, market["condition_id"], token_id)
     # Log executor output so [ATTEMPT]/[RESULT] lines are visible
     for line in (r.get("output") or "").splitlines():
         if any(tag in line for tag in ("[ATTEMPT]", "[RESULT]", "Book best", "FILL")):
@@ -513,34 +571,34 @@ def check_snipe(market, seconds_remaining):
         for line in r["error"].splitlines():
             if line.strip():
                 log(f"[EXEC-ERR] {line.strip()}")
-    notes = f"snipe {direction} delta={delta_pct:+.3f}% price={price:.4f} size=${size:.2f}"
+    notes = f"snipe {direction} delta={delta_pct:+.3f}% submitted_price={submitted_price:.4f} clob_midpoint={price:.4f} gamma_price={gamma_price:.4f} size=${size:.2f}"
     log(f"[SNIPE] Result: {r.get('success')} filled={r.get('filled')}. {notes}")
     if os.getenv("XRP15M_ONE_SHOT_TEST") == "1":
         _state["snipe_done"] = True
         save_state()
-        log("[SNIPE] ONE_SHOT_TEST active — stopping after first BTC attempt in this window")
+        log("[SNIPE] ONE_SHOT_TEST active — stopping after first XRP attempt in this window")
 
     if not r.get('filled') and not DRY_RUN:
         log(f"[SNIPE] No fill confirmed — not counting this trade as real")
-        tg(f"[BTC-SNIPE] NO FILL confirmed | {notes}")
+        tg(f"[XRP-SNIPE] NO FILL confirmed | {notes}")
         return False
-    tg(f"[BTC-SNIPE] FILL CONFIRMED {r.get('filled_size', shares):.2f} shares | {notes}")
+    tg(f"[XRP-SNIPE] FILL CONFIRMED {r.get('filled_size', shares):.2f} shares | {notes}")
 
     _state["snipe_done"]        = True
     _state["prev_snipe_side"]  = direction
-    _state["prev_snipe_price"] = price
+    _state["prev_snipe_price"] = submitted_price
     _state["prev_snipe_size"]  = size
     save_state()
     return True
 
 # ── New window setup ──────────────────────────────────────────────────────────
 def setup_new_window(slug, window_ts):
-    btc_price = get_btc_price()
-    if btc_price is None:
-        btc_price = _state.get("window_open_xrp", 0.0)
+    xrp_price = get_xrp_price()
+    if xrp_price is None:
+        xrp_price = _state.get("window_open_xrp", 0.0)
 
     _state["window_ts"]       = window_ts
-    _state["window_open_xrp"] = btc_price
+    _state["window_open_xrp"] = xrp_price
     _state["arb_done"]        = False
     _state["snipe_done"]      = False
     _state["maker_order_id"]  = ""
@@ -550,12 +608,12 @@ def setup_new_window(slug, window_ts):
     _state["maker_shares"]    = 0.0
     _state["maker_done"]      = False
     _state["maker_last_poll"] = 0
-    _state["xrp_prices"]      = [(int(time.time()), btc_price)]
+    _state["xrp_prices"]      = [(int(time.time()), xrp_price)]
     _state["prev_slug"]       = slug
     save_state()
     trigger_post_resolution_tasks()
 
-    log(f"[NEW WINDOW] ts={window_ts} XRP={btc_price} slug={slug}")
+    log(f"[NEW WINDOW] ts={window_ts} XRP={xrp_price} slug={slug}")
     # Window start — no telegram noise
 
 # ── Daily loss check ───────────────────────────────────────────────────────────
@@ -607,10 +665,10 @@ def main():
 
         log(f"[CYCLE] {market['question'][:60]} | YES={market['yes_price']:.3f} NO={market['no_price']:.3f} | {sec_rem}s left")
 
-        # Record BTC price
-        btc = get_btc_price()
-        if btc:
-            _state["xrp_prices"].append((int(time.time()), btc))
+        # Record XRP price
+        xrp = get_xrp_price()
+        if xrp:
+            _state["xrp_prices"].append((int(time.time()), xrp))
             # Keep last window's prices only
             cutoff = window_ts
             _state["xrp_prices"] = [(t, p) for t, p in _state["xrp_prices"] if t >= cutoff]

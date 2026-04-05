@@ -79,9 +79,9 @@ check_engine() {
 
   log "$name DOWN — restarting"
   if [ "$mode" = "shell" ]; then
-    nohup "$TRADING/scripts/$script" >> "$logfile" 2>&1 &
+    nohup env -u BTC15M_SIGNAL_MAX_ENTRY_PRICE -u ETH15M_SIGNAL_MAX_ENTRY_PRICE "$TRADING/scripts/$script" >> "$logfile" 2>&1 &
   else
-    nohup "$VENV" "$TRADING/scripts/$script" >> "$logfile" 2>&1 &
+    nohup env -u BTC15M_SIGNAL_MAX_ENTRY_PRICE -u ETH15M_SIGNAL_MAX_ENTRY_PRICE "$VENV" "$TRADING/scripts/$script" >> "$logfile" 2>&1 &
   fi
   local newpid=$!
   echo "$newpid" > "$pidfile"

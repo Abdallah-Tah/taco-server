@@ -10,7 +10,6 @@ import json
 import logging
 import os
 import signal
-import sqlite3
 import sys
 import time
 import uuid
@@ -21,10 +20,13 @@ from typing import Optional
 
 import requests
 from coinbase.rest import RESTClient
+from journal import journal_close as shared_journal_close
+from journal import journal_open as shared_journal_open
+from journal import open_journal
 
 ROOT = Path.home() / '.openclaw' / 'workspace' / 'trading'
 SECRETS = Path.home() / '.config' / 'openclaw' / 'secrets.env'
-JOURNAL_DB = ROOT / 'journal.db'
+JOURNAL_DB = Path(os.environ.get('COINBASE_JOURNAL_DB', str(ROOT / 'coinbase_journal.db')))
 LOG_PATH = Path('/tmp/coinbase_momentum.log')
 PID_PATH = Path('/tmp/coinbase_momentum.pid')
 STATE_PATH = ROOT / '.coinbase_momentum_state.json'
@@ -142,6 +144,7 @@ class Bot:
         self.running = True
         self.secrets = self._load_secrets()
         self.client = self._client()
+        self.journal = open_journal(JOURNAL_DB, 'coinbase_momentum')
         self.grid = {}
         self.grid_anchor = {}
         self.last_reset = {}
@@ -195,53 +198,32 @@ class Bot:
 
     def _journal_open(self, pair: str, side: str, entry_price: float, amount: float, usd_size: float, notes: str) -> str:
         trade_id = str(uuid.uuid4())
-        conn = sqlite3.connect(str(JOURNAL_DB))
-        conn.execute(
-            """
-            INSERT INTO trades (
-                id, engine, timestamp_open, asset, category, direction,
-                entry_price, position_size, position_size_usd, regime, notes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                trade_id,
-                'coinbase_momentum',
-                datetime.now(timezone.utc).isoformat(),
-                pair,
-                'coinbase-grid',
-                side,
-                entry_price,
-                amount,
-                usd_size,
-                'normal',
-                notes,
-            ),
+        return shared_journal_open(
+            self.journal,
+            trade_id=trade_id,
+            engine='coinbase_momentum',
+            asset=pair,
+            category='coinbase-grid',
+            direction=side,
+            entry_price=entry_price,
+            position_size=amount,
+            position_size_usd=usd_size,
+            regime='normal',
+            notes=notes,
         )
-        conn.commit()
-        conn.close()
-        return trade_id
 
     def _journal_close(self, trade_id: str, exit_price: float, pnl_abs: float, pnl_pct: float, exit_type: str, hold_seconds: int, notes: str):
-        conn = sqlite3.connect(str(JOURNAL_DB))
-        conn.execute(
-            """
-            UPDATE trades
-            SET timestamp_close=?, exit_price=?, pnl_absolute=?, pnl_percent=?, exit_type=?, hold_duration_seconds=?, notes=?
-            WHERE id=?
-            """,
-            (
-                datetime.now(timezone.utc).isoformat(),
-                exit_price,
-                pnl_abs,
-                pnl_pct,
-                exit_type,
-                hold_seconds,
-                notes,
-                trade_id,
-            ),
+        shared_journal_close(
+            self.journal,
+            trade_id=trade_id,
+            exit_price=exit_price,
+            pnl_absolute=pnl_abs,
+            pnl_percent=pnl_pct,
+            exit_type=exit_type,
+            hold_duration_seconds=hold_seconds,
+            timestamp_close=datetime.now(timezone.utc).isoformat(),
+            notes=notes,
         )
-        conn.commit()
-        conn.close()
 
     def get_product_price(self, pair: str) -> float:
         product = self.client.get_product(pair)
@@ -350,6 +332,7 @@ class Bot:
             except Exception as e:
                 log.exception('[CB-GRID] loop error: %s', e)
             time.sleep(CB_POLL_INTERVAL)
+        self.journal.close()
 
 
 if __name__ == '__main__':

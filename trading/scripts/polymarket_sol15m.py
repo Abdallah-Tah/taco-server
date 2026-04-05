@@ -20,10 +20,16 @@ from pathlib import Path
 
 import requests
 import atexit
+import hashlib
+from journal import journal_close as shared_journal_close
+from journal import journal_open as shared_journal_open
+from journal import open_journal
+from polymarket_clob_pricing import fetch_book, choose_buy_price
 
 # ── Paths & creds ──────────────────────────────────────────────────────────────
 WORK_DIR      = Path("/home/abdaltm86/.openclaw/workspace/trading")
 JOURNAL_DB    = WORK_DIR / "journal.db"
+SHARED_JOURNAL_DB = Path(os.environ.get("SOL15M_JOURNAL_DB", str(WORK_DIR / "sol15m_journal.db")))
 CREDS_FILE    = Path("/home/abdaltm86/.config/openclaw/secrets.env")
 POSITIONS_F  = WORK_DIR / ".poly_sol15m_positions.json"
 STATE_F       = WORK_DIR / ".poly_sol15m_state.json"
@@ -54,11 +60,16 @@ def _int(key, default):
     except Exception:
         return int(default)
 
+
+def _bool(key, default):
+    return str(os.environ.get(key, ENV.get(key, str(default)))).lower() in ("1", "true", "yes", "on")
+
 TELEGRAM_TOKEN = ENV.get("TELEGRAM_TOKEN", "8457917317:AAHGueV-SogZl14cW5uMmIACpaWuyzByXOo")
 CHAT_ID        = ENV.get("CHAT_ID",        "7520899464")
 POLY_WALLET    = ENV.get("POLY_WALLET",    "0x1a4c163a134D7154ebD5f7359919F9c439424f00")
 VENV_PY        = Path("/home/abdaltm86/.openclaw/workspace/trading/.polymarket-venv/bin/python3")
 DRY_RUN        = os.environ.get("SOL15M_DRY_RUN",  ENV.get("SOL15M_DRY_RUN",  "true")).lower() != "false"
+USE_SHARED_JOURNAL = _bool("SOL15M_SHARED_JOURNAL", False)
 MAKER_ENABLED  = os.environ.get("SOL15M_MAKER_ENABLED", ENV.get("SOL15M_MAKER_ENABLED", "false")).lower() == "true"
 MAKER_DRY_RUN  = os.environ.get("SOL15M_MAKER_DRY_RUN", ENV.get("SOL15M_MAKER_DRY_RUN", "true")).lower() != "false"
 MAKER_START_SEC = _int("SOL15M_MAKER_START_SEC", 300)
@@ -71,8 +82,9 @@ MAKER_MIN_PRICE = _float("SOL15M_MAKER_MIN_PRICE", 0.01)
 WINDOW_SEC      = _int("SOL15M_WINDOW_SEC", 900)          # 15 minutes
 ARB_THRESHOLD   = _float("SOL15M_ARB_THRESHOLD", 0.98)
 ARB_SIZE        = _float("SOL15M_ARB_SIZE", 10.00)
-SNIPE_DELTA_MIN = _float("SOL15M_SNIPE_DELTA_MIN", 0.025)
+SNIPE_DELTA_MIN = _float("SOL15M_SNIPE_DELTA_MIN", 0.05)
 SNIPE_MAX_PRICE = _float("SOL15M_SNIPE_MAX_PRICE", 0.90)
+EXEC_SPREAD_CAP = _float("SOL15M_EXEC_SPREAD_CAP", 0.10)
 # Signal confirmation (improved filtering)
 SIGNAL_CONFIRM_COUNT   = _int("SOL15M_SIGNAL_CONFIRM_COUNT", 2)   # consecutive polls needed
 SIGNAL_CONFIRM_SEC     = _int("SOL15M_SIGNAL_CONFIRM_SEC", 15)     # max age of confirm samples
@@ -167,11 +179,62 @@ def get_sol_price():
         log(f"SOL price error: {e}")
         return None
 
+
+def get_book_metrics(token_id, submitted_price):
+    book = fetch_book(token_id)
+    distance_to_ask = round(book['best_ask'] - submitted_price, 4) if book.get('best_ask') is not None else None
+    return {
+        'best_bid': book.get('best_bid'),
+        'best_ask': book.get('best_ask'),
+        'midpoint': book.get('midpoint'),
+        'tick': book.get('tick', 0.01),
+        'spread': book.get('spread'),
+        'distance_to_ask': distance_to_ask,
+        'bids': book.get('bids', []),
+        'asks': book.get('asks', []),
+        'error': book.get('error'),
+    }
+
+
+def get_exec_buy_context(market, direction, mode, price_cap, submitted_hint=0.0):
+    token_id = market['clob_token_id'][0] if direction == 'UP' else (market['clob_token_id'][1] if len(market['clob_token_id']) > 1 else '')
+    gamma_price = market['yes_price'] if direction == 'UP' else market['no_price']
+    book = get_book_metrics(token_id, submitted_hint)
+    clob_ref_price = book.get('midpoint') if book.get('midpoint') is not None else (book.get('best_ask') if book.get('best_ask') is not None else book.get('best_bid'))
+    submitted_price, abort_reason = choose_buy_price(book, price_cap=price_cap, mode=mode, spread_cap=EXEC_SPREAD_CAP, maker_offset=MAKER_OFFSET)
+    return {
+        'token_id': token_id,
+        'gamma_price': gamma_price,
+        'clob_ref_price': clob_ref_price,
+        'submitted_price': submitted_price,
+        'abort_reason': abort_reason,
+        'book': book,
+        'side_label': 'BUY YES' if direction == 'UP' else 'BUY NO',
+    }
+
 # ── Find current market slug ──────────────────────────────────────────────────
 def get_current_slug():
     now = int(time.time())
     window_ts = now - (now % WINDOW_SEC)
     return f"sol-updown-15m-{window_ts}", window_ts
+
+
+def _current_trade_slug():
+    window_ts = int(_state.get("window_ts") or 0)
+    return f"sol-updown-15m-{window_ts}" if window_ts else "sol-15m"
+
+
+def _current_trade_id(direction):
+    slug = _current_trade_slug()
+    stable = f"sol15m:{slug}:{direction or 'UNKNOWN'}"
+    return hashlib.sha256(stable.encode()).hexdigest()[:32]
+
+
+def _current_window_open_iso():
+    window_ts = int(_state.get("window_ts") or 0)
+    if not window_ts:
+        return datetime.now(timezone.utc).isoformat()
+    return datetime.fromtimestamp(window_ts, tz=timezone.utc).isoformat()
 
 # ── Gamma API: get market info ────────────────────────────────────────────────
 def get_market(slug):
@@ -254,11 +317,49 @@ def place_order(side, shares, price, condition_id, token_id):
 
 # ── Journal logging ───────────────────────────────────────────────────────────
 def log_trade(engine, direction, size_usd, entry_price, pnl, exit_type, hold_sec, notes=""):
-    import sqlite3
     try:
+        ts_open = _current_window_open_iso()
+        trade_id = _current_trade_id(direction)
+        asset = _current_trade_slug()
+        is_resolved = bool(exit_type)
+
+        if USE_SHARED_JOURNAL:
+            conn = open_journal(SHARED_JOURNAL_DB, "sol15m")
+            try:
+                if is_resolved:
+                    shared_journal_close(
+                        conn,
+                        trade_id=trade_id,
+                        exit_price=entry_price,
+                        pnl_absolute=pnl or 0.0,
+                        pnl_percent=(pnl / size_usd * 100) if size_usd else 0.0,
+                        exit_type=exit_type,
+                        hold_duration_seconds=hold_sec or 0,
+                        timestamp_close=datetime.now(timezone.utc).isoformat(),
+                        notes=notes,
+                    )
+                else:
+                    shared_journal_open(
+                        conn,
+                        trade_id=trade_id,
+                        engine=engine,
+                        asset=asset,
+                        category="sol-updown",
+                        direction=direction,
+                        entry_price=entry_price,
+                        position_size=size_usd / entry_price if entry_price else 0,
+                        position_size_usd=size_usd,
+                        regime="normal",
+                        notes=notes,
+                        timestamp_open=ts_open,
+                    )
+            finally:
+                conn.close()
+            return
+
+        import sqlite3
         conn = sqlite3.connect(str(JOURNAL_DB))
         c = conn.cursor()
-        ts_open = datetime.now(timezone.utc).isoformat()
         c.execute("""
             INSERT INTO trades (
                 engine, timestamp_open, timestamp_close, asset,
@@ -281,7 +382,7 @@ def log_trade(engine, direction, size_usd, entry_price, pnl, exit_type, hold_sec
         """, (
             engine, ts_open,
             datetime.now(timezone.utc).isoformat() if exit_type else None,
-            "sol-15m",
+            asset,
             "sol-updown",
             direction, entry_price, entry_price if not exit_type else entry_price,
             size_usd / entry_price if entry_price else 0,
@@ -478,17 +579,30 @@ def check_maker_snipe(market, seconds_remaining):
         log(f"[SOL-MAKER] momentum={momentum:+.3f}% < {MOMENTUM_MIN:.3f}%, skipping (weak)")
         return None
     log(f"[SOL-MAKER] CONFIRMED {confirmations}/{SIGNAL_CONFIRM_COUNT} | momentum={momentum:+.3f}%")
-    token_id = market['clob_token_id'][0] if direction == 'UP' else (market['clob_token_id'][1] if len(market['clob_token_id']) > 1 else '')
-    token_price = market['yes_price'] if direction == 'UP' else market['no_price']
+    ctx = get_exec_buy_context(market, direction, mode='maker', price_cap=SIGNAL_MAX_ENTRY_PRICE, submitted_hint=0.0)
+    token_id = ctx['token_id']
+    token_price = ctx['clob_ref_price']
+    gamma_price = ctx['gamma_price']
+    book = ctx['book']
+    if token_price is None:
+        log(f"[SOL-MAKER] ABORT: pricing_source=CLOB slug={market.get('slug','')} side={direction} token_id={token_id} gamma_price={gamma_price} abort_reason=missing_clob_reference")
+        return None
     if token_price < MAKER_MIN_PRICE:
-        log(f"[SOL-MAKER] token_mid={token_price:.4f} < min {MAKER_MIN_PRICE:.4f}, skipping")
+        log(f"[SOL-MAKER] ABORT: pricing_source=CLOB slug={market.get('slug','')} side={direction} token_id={token_id} clob_price={token_price:.4f} gamma_price={gamma_price:.4f} abort_reason=below_maker_min")
         return None
     if token_price > SIGNAL_MAX_ENTRY_PRICE:
-        log(f"[SOL-MAKER] entry={token_price:.4f} > max {SIGNAL_MAX_ENTRY_PRICE:.4f}, skipping {direction} signal")
+        log(f"[SOL-MAKER] FILTER: pricing_source=CLOB entry={token_price:.4f} gamma_price={gamma_price:.4f} > max {SIGNAL_MAX_ENTRY_PRICE:.4f}, skipping {direction} signal")
         return None
-    limit_price = max(0.01, round(token_price - MAKER_OFFSET, 2))
+    limit_price = ctx['submitted_price']
+    bid_str = f"{book['best_bid']:.4f}" if book.get('best_bid') is not None else 'NA'
+    ask_str = f"{book['best_ask']:.4f}" if book.get('best_ask') is not None else 'NA'
+    mid_str = f"{book['midpoint']:.4f}" if book.get('midpoint') is not None else 'NA'
+    spread_str = f"{book['spread']:.4f}" if book.get('spread') is not None else 'NA'
+    if ctx['abort_reason']:
+        log(f"[SOL-MAKER] ABORT: pricing_source=CLOB slug={market.get('slug','')} side={ctx['side_label']} token_id={token_id} gamma_price={gamma_price:.4f} clob_best_bid={bid_str} clob_best_ask={ask_str} clob_midpoint={mid_str} submitted_price=NA spread={spread_str} abort_reason={ctx['abort_reason']}")
+        return None
     shares = max(5.0, math.floor((SNIPE_DEFAULT / max(limit_price, 0.01)) * 100) / 100)
-    log(f"[SOL-MAKER] {direction} signal token_mid={token_price:.4f} limit={limit_price:.4f} shares={shares:.2f} dry={MAKER_DRY_RUN}")
+    log(f"[SOL-MAKER] pricing_source=CLOB slug={market.get('slug','')} side={ctx['side_label']} token_id={token_id} gamma_price={gamma_price:.4f} clob_best_bid={bid_str} clob_best_ask={ask_str} clob_midpoint={mid_str} submitted_price={limit_price:.4f} spread={spread_str} shares={shares:.2f} dry={MAKER_DRY_RUN}")
     r = maker_place_order('BUY', shares, limit_price, market['condition_id'], token_id)
     if MAKER_DRY_RUN and r.get('success'):
         _track_dry_fill(direction, shares, limit_price, notes='maker_dry')
@@ -608,22 +722,30 @@ def check_snipe(market, seconds_remaining):
 
     # Pick token
     token_id = market["clob_token_id"][0] if direction == "UP" else (market["clob_token_id"][1] if len(market["clob_token_id"]) > 1 else "")
-    price    = market["yes_price"] if direction == "UP" else market["no_price"]
-
-    if price > SNIPE_MAX_PRICE:
-        log(f"[SNIPE] Price {price:.4f} > max {SNIPE_MAX_PRICE}, skipping")
+    ctx = get_exec_buy_context(market, direction, mode='taker', price_cap=SNIPE_MAX_PRICE, submitted_hint=0.0)
+    token_id = ctx['token_id']
+    price = ctx['clob_ref_price']
+    gamma_price = ctx['gamma_price']
+    book = ctx['book']
+    bid_str = f"{book['best_bid']:.4f}" if book.get('best_bid') is not None else 'NA'
+    ask_str = f"{book['best_ask']:.4f}" if book.get('best_ask') is not None else 'NA'
+    mid_str = f"{book['midpoint']:.4f}" if book.get('midpoint') is not None else 'NA'
+    spread_str = f"{book['spread']:.4f}" if book.get('spread') is not None else 'NA'
+    if price is None or ctx['abort_reason']:
+        log(f"[SOL-SNIPE] ABORT: pricing_source=CLOB slug={market.get('slug','')} side={ctx['side_label']} token_id={token_id} gamma_price={gamma_price:.4f} clob_best_bid={bid_str} clob_best_ask={ask_str} clob_midpoint={mid_str} submitted_price=NA spread={spread_str} abort_reason={ctx['abort_reason'] or 'missing_clob_reference'}")
         return None
 
+    submitted_price = ctx['submitted_price']
     size = SNIPE_STRONG if abs(delta_pct) >= SNIPE_STRONG_D * 100 else SNIPE_DEFAULT
-    shares = size / price
+    shares = size / submitted_price
     # Ensure minimum 5 shares for Polymarket
     if shares < 5:
         shares = 5
         size = shares * price
 
-    log(f"[SNIPE] {direction} signal! SOL delta={delta_pct:+.3f}% size=${size:.2f} price={price:.4f} shares={shares:.2f}")
-    tg(f"[SOL-SNIPE] ORDER PLACED: dir={direction} entry={price:.4f} size=${size:.2f} shares={shares:.2f} market={_market_label(market)}")
-    r = place_order("BUY", shares, price, market["condition_id"], token_id)
+    log(f"[SOL-SNIPE] pricing_source=CLOB slug={market.get('slug','')} side={ctx['side_label']} token_id={token_id} gamma_price={gamma_price:.4f} clob_best_bid={bid_str} clob_best_ask={ask_str} clob_midpoint={mid_str} submitted_price={submitted_price:.4f} spread={spread_str}")
+    tg(f"[SOL-SNIPE] ORDER PLACED: dir={direction} entry={submitted_price:.4f} size=${size:.2f} shares={shares:.2f} market={_market_label(market)}")
+    r = place_order("BUY", shares, submitted_price, market["condition_id"], token_id)
     # Log executor output so [ATTEMPT]/[RESULT] lines are visible
     for line in (r.get("output") or "").splitlines():
         if any(tag in line for tag in ("[ATTEMPT]", "[RESULT]", "Book best", "FILL")):
@@ -640,7 +762,10 @@ def check_snipe(market, seconds_remaining):
         log("[SNIPE] ONE_SHOT_TEST active — stopping after first SOL attempt in this window")
 
     if not r.get('filled') and not DRY_RUN:
-        log(f"[SNIPE] No fill confirmed — not counting this trade as real")
+        # Prevent duplicate no-fill retries in the same window.
+        _state["snipe_done"] = True
+        save_state()
+        log(f"[SNIPE] No fill confirmed — stopping further snipe attempts this window")
         tg(f"[SOL-SNIPE] ORDER CANCELLED: {notes} market={_market_label(market)}")
         return False
     fill = r.get('fill_check') or {}

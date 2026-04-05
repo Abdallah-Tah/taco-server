@@ -64,11 +64,21 @@ def fetch_redeemables():
     return [p for p in positions if p.get('redeemable') is True and p.get('conditionId')]
 
 
+def _normalize_tx_hash(tx_hash):
+    tx = str(tx_hash or '').strip().lower()
+    if tx.startswith('0x'):
+        tx = tx[2:]
+    if not tx:
+        return ''
+    return f'0x{tx}'
+
+
 def log_redeem_to_journal(title, condition_id, value, tx_hash, status):
     conn = sqlite3.connect(str(JOURNAL_DB))
     c = conn.cursor()
     tid = f"redeem_{condition_id}_{int(time.time())}"
     now = datetime.now(timezone.utc).isoformat()
+    tx_canon = _normalize_tx_hash(tx_hash)
     c.execute(
         """
         INSERT INTO trades (
@@ -80,7 +90,7 @@ def log_redeem_to_journal(title, condition_id, value, tx_hash, status):
         (
             'polymarket_redeem', now, now, title[:200], 'redeem', 'REDEEM',
             0.0, 0.0, 0.0, 0.0, float(value or 0.0), 0.0,
-            status, 0, 'normal', f'condition={condition_id} tx={tx_hash}'
+            status, 0, 'normal', f'condition={condition_id} tx={tx_canon or tx_hash}'
         )
     )
     conn.commit()

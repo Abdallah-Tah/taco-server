@@ -27,7 +27,6 @@ import json
 import logging
 import os
 import signal
-import sqlite3
 import sys
 import time
 import uuid
@@ -37,10 +36,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from journal import journal_close as shared_journal_close
+from journal import journal_open as shared_journal_open
+from journal import open_journal
+
 WORK_DIR = Path('/home/abdaltm86/.openclaw/workspace/trading')
 SECRETS = Path('/home/abdaltm86/.config/openclaw/secrets.env')
 CDP_KEY_FILE = Path('/home/abdaltm86/.config/openclaw/cdp_api_key.json')
-JOURNAL_DB = WORK_DIR / 'journal.db'
+JOURNAL_DB = Path(os.environ.get('COINBASE_JOURNAL_DB', str(WORK_DIR / 'coinbase_journal.db')))
 LOG_PATH = Path('/tmp/coinbase_alt_scalper.log')
 STATE_PATH = WORK_DIR / '.coinbase_alt_scalper_state.json'
 
@@ -92,13 +95,15 @@ PAIRS            = _list('CB_SCALPER_PAIRS', 'SOL-USD,DOGE-USD')
 SIZE_USD         = _float('CB_SCALPER_SIZE_USD', 11.00)
 TAKE_PROFIT_PCT  = _float('CB_SCALPER_TAKE_PROFIT', 3.0)
 STOP_LOSS_PCT    = _float('CB_SCALPER_STOP_LOSS', 2.0)
-DIP_THRESHOLD    = _float('CB_SCALPER_DIP_THRESHOLD', 0.5)   # min dip % to consider (lowered from 1.5%)
-RECOVERY_PCT     = _float('CB_SCALPER_RECOVERY_PCT', 0.15)   # min bounce from low to trigger buy (lowered from 0.3%)
+DIP_THRESHOLD    = _float('CB_SCALPER_DIP_THRESHOLD', 1.5)   # min dip % to consider
+RECOVERY_PCT     = _float('CB_SCALPER_RECOVERY_PCT', 0.3)    # min bounce from low to trigger buy
 POLL_SEC         = _int('CB_SCALPER_POLL_SEC', 15)
 COOLDOWN_SEC     = _int('CB_SCALPER_COOLDOWN_SEC', 300)       # wait after a trade before next
 MAX_DAILY_TRADES = _int('CB_SCALPER_MAX_DAILY_TRADES', 10)
 PRICE_WINDOW_SEC = _int('CB_SCALPER_PRICE_WINDOW', 300)       # 5 min rolling window
 MAX_POSITIONS    = _int('CB_SCALPER_MAX_POSITIONS', 1)         # max simultaneous positions per pair
+# Cache USD balance to avoid API rate limits
+BALANCE_CACHE_SEC = _int('CB_SCALPER_BALANCE_CACHE', 60)      # cache balance for 60s
 
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
@@ -135,11 +140,14 @@ class Scalper:
     def __init__(self):
         self.running = True
         self.client = self._init_client()
+        self.journal = open_journal(JOURNAL_DB, 'coinbase_scalper')
         self.positions: dict[str, Position] = {}      # pair -> Position
         self.price_history: dict[str, deque] = {}     # pair -> deque of (ts, price)
         self.daily_trades = 0
         self.daily_reset = ''
         self.last_trade_time: dict[str, float] = {}   # pair -> timestamp
+        self._balance_cache = 0.0
+        self._balance_cache_ts = 0.0
         self._load_state()
         signal.signal(signal.SIGTERM, lambda *_: setattr(self, 'running', False))
         signal.signal(signal.SIGINT, lambda *_: setattr(self, 'running', False))
@@ -192,6 +200,10 @@ class Scalper:
             return None
 
     def get_usd_balance(self) -> float:
+        """Get USD balance with caching to avoid rate limits."""
+        now = time.time()
+        if now - self._balance_cache_ts < BALANCE_CACHE_SEC and self._balance_cache > 0:
+            return self._balance_cache
         try:
             resp = self.client.get_accounts(limit=50)
             accounts = resp.get('accounts', []) if isinstance(resp, dict) else (getattr(resp, 'accounts', []) or [])
@@ -200,10 +212,12 @@ class Scalper:
                 bal = acct.get('available_balance', {}) if isinstance(acct, dict) else getattr(acct, 'available_balance', {})
                 val = bal.get('value') if isinstance(bal, dict) else getattr(bal, 'value', '0')
                 if currency == 'USD':
-                    return float(val or 0)
+                    self._balance_cache = float(val or 0)
+                    self._balance_cache_ts = now
+                    return self._balance_cache
         except Exception as e:
             log.warning('[SCALPER] balance error: %s', e)
-        return 0.0
+        return self._balance_cache  # return stale cache on error
 
     # ── Order execution ───────────────────────────────────────────────────────
     def market_buy(self, pair: str, usd_amount: float) -> dict:
@@ -252,33 +266,32 @@ class Scalper:
     # ── Journal ───────────────────────────────────────────────────────────────
     def journal_open(self, pair, entry_price, amount, size_usd, notes=''):
         trade_id = str(uuid.uuid4())
-        try:
-            conn = sqlite3.connect(str(JOURNAL_DB))
-            conn.execute("""
-                INSERT INTO trades (engine, timestamp_open, asset, category, direction,
-                    entry_price, position_size, position_size_usd, regime, notes)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, ('coinbase_scalper', datetime.now(timezone.utc).isoformat(),
-                  pair, 'coinbase-scalp', 'BUY', entry_price, amount, size_usd, 'normal', notes))
-            conn.commit()
-            conn.close()
-        except Exception as e:
-            log.warning('[SCALPER] journal open error: %s', e)
-        return trade_id
+        return shared_journal_open(
+            self.journal,
+            trade_id=trade_id,
+            engine='coinbase_scalper',
+            asset=pair,
+            category='coinbase-scalp',
+            direction='BUY',
+            entry_price=entry_price,
+            position_size=amount,
+            position_size_usd=size_usd,
+            regime='normal',
+            notes=notes,
+        )
 
     def journal_close(self, trade_id, exit_price, pnl, pnl_pct, exit_type, hold_sec, notes=''):
-        try:
-            conn = sqlite3.connect(str(JOURNAL_DB))
-            conn.execute("""
-                UPDATE trades SET timestamp_close=?, exit_price=?, pnl_absolute=?,
-                    pnl_percent=?, exit_type=?, hold_duration_seconds=?, notes=?
-                WHERE id=?
-            """, (datetime.now(timezone.utc).isoformat(), exit_price, pnl, pnl_pct,
-                  exit_type, hold_sec, notes, trade_id))
-            conn.commit()
-            conn.close()
-        except Exception as e:
-            log.warning('[SCALPER] journal close error: %s', e)
+        shared_journal_close(
+            self.journal,
+            trade_id=trade_id,
+            exit_price=exit_price,
+            pnl_absolute=pnl,
+            pnl_percent=pnl_pct,
+            exit_type=exit_type,
+            hold_duration_seconds=hold_sec,
+            timestamp_close=datetime.now(timezone.utc).isoformat(),
+            notes=notes,
+        )
 
     # ── Signal detection ──────────────────────────────────────────────────────
     def detect_dip_reversal(self, pair: str, current_price: float) -> bool:
@@ -445,6 +458,7 @@ class Scalper:
 
         log.info('[SCALPER] Stopped')
         self._save_state()
+        self.journal.close()
 
 
 if __name__ == '__main__':

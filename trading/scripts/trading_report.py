@@ -13,6 +13,24 @@ DB_PATH = ROOT / "journal.db"
 POSITIONS_FILE = ROOT / ".positions.json"
 WALLET_FILE = ROOT / ".trading_wallet.json"
 
+DEDUPE_TRADES_CTE = """
+WITH ranked_trades AS (
+    SELECT
+        rowid AS _rowid,
+        trades.*,
+        ROW_NUMBER() OVER (
+            PARTITION BY engine, asset, timestamp_open, direction
+            ORDER BY rowid DESC
+        ) AS lifecycle_rn
+    FROM trades
+),
+dedup_trades AS (
+    SELECT *
+    FROM ranked_trades
+    WHERE engine NOT IN ('btc15m', 'eth15m') OR lifecycle_rn = 1
+)
+"""
+
 def get_engine_status(name, patterns):
     """Check if engine is running."""
     try:
@@ -31,7 +49,7 @@ def get_engine_stats(asset_keyword, conn):
     cur = conn.cursor()
     
     # Match by asset name (Bitcoin, Ethereum, Solana, etc.)
-    cur.execute("""
+    cur.execute(DEDUPE_TRADES_CTE + """
         SELECT 
             COUNT(*) as total,
             SUM(CASE WHEN exit_type = 'filled' THEN 1 ELSE 0 END) as filled,
@@ -39,7 +57,7 @@ def get_engine_stats(asset_keyword, conn):
             SUM(CASE WHEN exit_type IN ('redeemed', 'filled') AND pnl_absolute > 0 THEN 1 ELSE 0 END) as wins,
             SUM(CASE WHEN exit_type IN ('redeemed', 'filled') AND pnl_absolute <= 0 THEN 1 ELSE 0 END) as losses,
             COALESCE(SUM(CASE WHEN exit_type IN ('redeemed', 'filled') THEN pnl_absolute ELSE 0 END), 0) as realized_pnl
-        FROM trades 
+        FROM dedup_trades 
         WHERE asset LIKE ?
     """, (f"%{asset_keyword}%",))
     
@@ -52,8 +70,8 @@ def get_engine_stats(asset_keyword, conn):
     realized = row[5] or 0
     
     # Get posted (all orders placed)
-    cur.execute("""
-        SELECT COUNT(*) FROM trades WHERE engine LIKE ?
+    cur.execute(DEDUPE_TRADES_CTE + """
+        SELECT COUNT(*) FROM dedup_trades WHERE engine LIKE ?
     """, (f"%{asset_keyword}%",))
     posted = cur.fetchone()[0] or 0
     
@@ -61,13 +79,13 @@ def get_engine_stats(asset_keyword, conn):
     
     # Today's stats
     today = datetime.now().strftime("%Y-%m-%d")
-    cur.execute("""
+    cur.execute(DEDUPE_TRADES_CTE + """
         SELECT 
             COUNT(*) as total,
             SUM(CASE WHEN pnl_absolute > 0 THEN 1 ELSE 0 END) as wins,
             SUM(CASE WHEN pnl_absolute <= 0 THEN 1 ELSE 0 END) as losses,
             COALESCE(SUM(CASE WHEN exit_type IN ('redeemed', 'filled') THEN pnl_absolute ELSE 0 END), 0) as pnl
-        FROM trades 
+        FROM dedup_trades 
         WHERE asset LIKE ? AND date(timestamp_open) = date(?)
     """, (f"%{asset_keyword}%", today))
     
@@ -122,11 +140,11 @@ def get_7day_stats(conn):
     cur = conn.cursor()
     seven_days_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
     
-    cur.execute("""
+    cur.execute(DEDUPE_TRADES_CTE + """
         SELECT 
             COUNT(*) as total,
             SUM(CASE WHEN pnl_absolute > 0 THEN 1 ELSE 0 END) as wins
-        FROM trades 
+        FROM dedup_trades 
         WHERE exit_type IN ('redeemed', 'filled') AND date(timestamp_open) >= date(?)
     """, (seven_days_ago,))
     
@@ -136,8 +154,8 @@ def get_7day_stats(conn):
     win_rate = (wins / total * 100) if total > 0 else 0
     
     # Calculate streak (simplified - just check last 5 resolved)
-    cur.execute("""
-        SELECT pnl_absolute FROM trades 
+    cur.execute(DEDUPE_TRADES_CTE + """
+        SELECT pnl_absolute FROM dedup_trades 
         WHERE exit_type IN ('redeemed', 'filled')
         ORDER BY timestamp_open DESC LIMIT 5
     """)
@@ -269,8 +287,8 @@ def get_capital(conn):
     
     # Get realized PnL from journal
     cur = conn.cursor()
-    cur.execute("""
-        SELECT COALESCE(SUM(pnl_absolute), 0) FROM trades 
+    cur.execute(DEDUPE_TRADES_CTE + """
+        SELECT COALESCE(SUM(pnl_absolute), 0) FROM dedup_trades 
         WHERE exit_type IN ('redeemed', 'filled')
     """)
     realized = cur.fetchone()[0] or 0
@@ -295,7 +313,7 @@ def get_capital(conn):
 
 def generate_report():
     """Generate full trading report."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro&immutable=1", uri=True)
     
     # Get all stats - match by asset name
     btc_stats = get_engine_stats("Bitcoin", conn)

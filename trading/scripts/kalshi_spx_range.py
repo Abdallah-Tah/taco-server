@@ -115,10 +115,11 @@ class KalshiAPI:
 
     def _sign(self, method, path):
         ts = str(int(time.time() * 1000))
+        # Message: timestamp + METHOD + full path (including /trade-api/v2 prefix)
         msg = ts + method + path
         sig = base64.b64encode(self.private_key.sign(
             msg.encode(),
-            padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
+            padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH),
             hashes.SHA256(),
         )).decode()
         return {
@@ -222,21 +223,32 @@ class KalshiAPI:
 
 # ── S&P 500 Price ────────────────────────────────────────────────────────────
 def get_spx_price():
-    """Get current S&P 500 price. Yahoo primary (exact index), Alpha Vantage fallback (SPY proxy)."""
+    """Get current S&P 500 price. Yahoo primary (exact index), Coinbase SPY fallback, Alpha Vantage last resort."""
     # Primary: Yahoo Finance (direct S&P 500 index — exact value)
     try:
         r = requests.get(
             'https://query1.finance.yahoo.com/v8/finance/chart/%5EGSPC',
             params={'interval': '1m', 'range': '1d'},
-            headers={'User-Agent': 'Mozilla/5.0'},
+            headers={'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'},
             timeout=10,
         )
-        data = r.json()
-        return float(data['chart']['result'][0]['meta']['regularMarketPrice'])
-    except:
-        pass
+        if r.status_code == 200:
+            data = r.json()
+            return float(data['chart']['result'][0]['meta']['regularMarketPrice'])
+    except Exception as e:
+        log.warning('[SPX] Yahoo price error: %s', e)
 
-    # Fallback: Alpha Vantage via SPY (≈ SPX/10, ~0.2% drift)
+    # Fallback: Coinbase SPY quote (SPY ≈ SPX/10, ~0.2% drift)
+    try:
+        r = requests.get('https://api.exchange.coinbase.com/products/SPY-USD/ticker', timeout=5)
+        if r.status_code == 200:
+            spy_price = float(r.json()['price'])
+            if spy_price > 0:
+                return spy_price * 10
+    except Exception as e:
+        log.warning('[SPX] Coinbase SPY price error: %s', e)
+
+    # Last resort: Alpha Vantage via SPY
     if ALPHA_VANTAGE_KEY:
         try:
             r = requests.get('https://www.alphavantage.co/query', params={
@@ -248,8 +260,8 @@ def get_spx_price():
             spy_price = float(data.get('05. price', 0))
             if spy_price > 0:
                 return spy_price * 10
-        except:
-            pass
+        except Exception as e:
+            log.warning('[SPX] Alpha Vantage price error: %s', e)
 
     return None
 

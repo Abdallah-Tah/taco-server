@@ -28,9 +28,28 @@ def fmt_money(x):
 
 
 def get_db():
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro&immutable=1", uri=True)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+DEDUPE_TRADES_CTE = """
+WITH ranked_trades AS (
+    SELECT
+        rowid AS _rowid,
+        trades.*,
+        ROW_NUMBER() OVER (
+            PARTITION BY engine, asset, timestamp_open, direction
+            ORDER BY rowid DESC
+        ) AS lifecycle_rn
+    FROM trades
+),
+dedup_trades AS (
+    SELECT *
+    FROM ranked_trades
+    WHERE engine NOT IN ('btc15m', 'eth15m') OR lifecycle_rn = 1
+)
+"""
 
 
 def get_engine_stats(engine):
@@ -39,15 +58,19 @@ def get_engine_stats(engine):
     c = conn.cursor()
 
     # Total stats
-    c.execute("""
+    c.execute(
+        DEDUPE_TRADES_CTE
+        + """
         SELECT
             COUNT(*) as total_orders,
-            SUM(CASE WHEN exit_price > 0 THEN 1 ELSE 0 END) as resolved,
-            SUM(CASE WHEN exit_price > 0 AND pnl_percent > 0 THEN 1 ELSE 0 END) as wins,
-            SUM(CASE WHEN exit_price > 0 AND pnl_percent <= 0 THEN 1 ELSE 0 END) as losses,
-            COALESCE(SUM(pnl_absolute), 0) as total_pnl
-        FROM trades WHERE engine = ? AND timestamp_open IS NOT NULL
-    """, (engine,))
+            SUM(CASE WHEN exit_type = 'resolved' THEN 1 ELSE 0 END) as resolved,
+            SUM(CASE WHEN exit_type = 'resolved' AND COALESCE(pnl_absolute, 0) > 0 THEN 1 ELSE 0 END) as wins,
+            SUM(CASE WHEN exit_type = 'resolved' AND COALESCE(pnl_absolute, 0) <= 0 THEN 1 ELSE 0 END) as losses,
+            COALESCE(SUM(CASE WHEN exit_type = 'resolved' THEN COALESCE(pnl_absolute, 0) ELSE 0 END), 0) as total_pnl
+        FROM dedup_trades WHERE engine = ? AND timestamp_open IS NOT NULL
+    """,
+        (engine,),
+    )
 
     row = c.fetchone()
     total_orders = row[0] or 0
@@ -56,16 +79,20 @@ def get_engine_stats(engine):
     losses = row[3] or 0
 
     # Daily stats
-    c.execute("""
+    c.execute(
+        DEDUPE_TRADES_CTE
+        + """
         SELECT DATE(timestamp_open) as date,
                COUNT(*) as trades,
                SUM(CASE WHEN pnl_absolute > 0 THEN 1 ELSE 0 END) as wins,
                SUM(CASE WHEN pnl_absolute < 0 THEN 1 ELSE 0 END) as losses,
                SUM(pnl_absolute) as pnl
-        FROM trades WHERE engine = ? AND timestamp_close IS NOT NULL
+        FROM dedup_trades WHERE engine = ? AND timestamp_close IS NOT NULL
         GROUP BY DATE(timestamp_open)
         ORDER BY date DESC LIMIT 3
-    """, (engine,))
+    """,
+        (engine,),
+    )
     daily = c.fetchall()
 
     conn.close()
@@ -83,12 +110,16 @@ def get_recent_trades(engine, limit=20):
     """Get recent trades for an engine."""
     conn = get_db()
     c = conn.cursor()
-    c.execute("""
+    c.execute(
+        DEDUPE_TRADES_CTE
+        + """
         SELECT timestamp_open, direction, pnl_absolute, pnl_percent, exit_type
-        FROM trades
+        FROM dedup_trades
         WHERE engine = ? AND timestamp_close IS NOT NULL
         ORDER BY timestamp_open DESC LIMIT ?
-    """, (engine, limit))
+    """,
+        (engine, limit),
+    )
     trades = c.fetchall()
     conn.close()
     return trades
@@ -134,19 +165,23 @@ def generate_short_report():
 
     # Today's performance
     lines.append("")
-    lines.append("Today (Mar 22):")
+    lines.append(f"Today ({datetime.now(timezone.utc).strftime('%Y-%m-%d')}):")
 
     # Get today's stats
     conn = get_db()
     c = conn.cursor()
 
-    c.execute("""
+    c.execute(
+        DEDUPE_TRADES_CTE
+        + """
         SELECT engine, COUNT(*) as trades,
                SUM(CASE WHEN pnl_absolute > 0 THEN 1 ELSE 0 END) as wins,
                SUM(pnl_absolute) as pnl
-        FROM trades WHERE DATE(timestamp_open) = '2026-03-22' AND timestamp_close IS NOT NULL
+        FROM dedup_trades
+        WHERE DATE(timestamp_open) = date('now') AND timestamp_close IS NOT NULL
         GROUP BY engine
-    """)
+    """
+    )
     today = {row[0]: (row[1], row[2], row[3]) for row in c.fetchall()}
     conn.close()
 
@@ -212,11 +247,14 @@ def generate_long_report():
 
     # BTC recent trades
     lines.append("## 🎯 BTC - Recent Trades (Last 10)")
-    c.execute("""
+    c.execute(
+        DEDUPE_TRADES_CTE
+        + """
         SELECT timestamp_open, direction, position_size_usd, pnl_absolute, pnl_percent, exit_type
-        FROM trades WHERE engine = 'btc15m' AND timestamp_close IS NOT NULL
+        FROM dedup_trades WHERE engine = 'btc15m' AND timestamp_close IS NOT NULL
         ORDER BY timestamp_open DESC LIMIT 10
-    """)
+    """
+    )
     for t in c.fetchall():
         ts = t[0][:16].replace('T', ' ')
         pnl_sign = "+" if t[3] >= 0 else ""
@@ -227,11 +265,14 @@ def generate_long_report():
 
     # ETH recent trades
     lines.append("## 🎯 ETH - Recent Trades (Last 10)")
-    c.execute("""
+    c.execute(
+        DEDUPE_TRADES_CTE
+        + """
         SELECT timestamp_open, direction, position_size_usd, pnl_absolute, pnl_percent, exit_type
-        FROM trades WHERE engine = 'eth15m' AND timestamp_close IS NOT NULL
+        FROM dedup_trades WHERE engine = 'eth15m' AND timestamp_close IS NOT NULL
         ORDER BY timestamp_open DESC LIMIT 10
-    """)
+    """
+    )
     for t in c.fetchall():
         ts = t[0][:16].replace('T', ' ')
         pnl_sign = "+" if t[3] >= 0 else ""
@@ -243,15 +284,18 @@ def generate_long_report():
     # Daily summary
     lines.append("## 📅 Daily Summary")
 
-    c.execute("""
+    c.execute(
+        DEDUPE_TRADES_CTE
+        + """
         SELECT DATE(timestamp_open) as date, engine,
                COUNT(*) as trades,
                SUM(CASE WHEN pnl_absolute > 0 THEN 1 ELSE 0 END) as wins,
                SUM(pnl_absolute) as pnl
-        FROM trades WHERE timestamp_close IS NOT NULL
+        FROM dedup_trades WHERE timestamp_close IS NOT NULL
         GROUP BY DATE(timestamp_open), engine
         ORDER BY date DESC, engine LIMIT 10
-    """)
+    """
+    )
     daily = c.fetchall()
     conn.close()
 

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import hashlib
+import os
 import sqlite3
 import subprocess
 import sys
@@ -10,6 +11,9 @@ from zoneinfo import ZoneInfo
 from pathlib import Path
 
 import requests
+from journal import journal_close as shared_journal_close
+from journal import journal_open as shared_journal_open
+from journal import open_journal
 
 GAMMA = 'https://gamma-api.polymarket.com/markets?slug={slug}'
 ACTIVITY_API = 'https://data-api.polymarket.com/activity'
@@ -19,6 +23,13 @@ POSITIONS_API = 'https://data-api.polymarket.com/positions?user={user}'
 ROOT = Path.home() / '.openclaw' / 'workspace' / 'trading'
 SECRETS = Path.home() / '.config' / 'openclaw' / 'secrets.env'
 JOURNAL_DB = ROOT / 'journal.db'
+REDEEM_NOTIFY_STATE = ROOT / '.redeem_notify_state.json'
+BTC_SHARED_JOURNAL = str(os.environ.get('BTC15M_SHARED_JOURNAL', 'false')).lower() in ('1', 'true', 'yes', 'on')
+ETH_SHARED_JOURNAL = str(os.environ.get('ETH15M_SHARED_JOURNAL', 'false')).lower() in ('1', 'true', 'yes', 'on')
+SOL_SHARED_JOURNAL = str(os.environ.get('SOL15M_SHARED_JOURNAL', 'false')).lower() in ('1', 'true', 'yes', 'on')
+BTC_SHARED_DB = Path(os.environ.get('BTC15M_JOURNAL_DB', str(ROOT / 'btc15m_journal.db')))
+ETH_SHARED_DB = Path(os.environ.get('ETH15M_JOURNAL_DB', str(ROOT / 'eth15m_journal.db')))
+SOL_SHARED_DB = Path(os.environ.get('SOL15M_JOURNAL_DB', str(ROOT / 'sol15m_journal.db')))
 VENV = ROOT / '.polymarket-venv' / 'bin' / 'python3'
 EXECUTOR = ROOT / 'scripts' / 'polymarket_executor.py'
 WINDOW_SEC = 900
@@ -28,6 +39,31 @@ REQUEST_TIMEOUT_TRADES = 8
 REQUEST_TIMEOUT_ACTIVITY = 8
 REQUEST_TIMEOUT_MARKET = 5
 SUBPROCESS_TIMEOUT_ORDERS = 10
+REDEEM_NOTIFY_MAX_AGE_SEC = int(os.environ.get('REDEEM_NOTIFY_MAX_AGE_SEC', '1800'))
+
+
+def _normalize_tx_hash(tx):
+    t = str(tx or '').strip().lower()
+    if t.startswith('0x'):
+        t = t[2:]
+    return t
+
+
+def _shared_db_for_engine(engine: str) -> Path | None:
+    if engine == 'btc15m' and BTC_SHARED_JOURNAL:
+        return BTC_SHARED_DB
+    if engine == 'eth15m' and ETH_SHARED_JOURNAL:
+        return ETH_SHARED_DB
+    if engine == 'sol15m' and SOL_SHARED_JOURNAL:
+        return SOL_SHARED_DB
+    return None
+
+
+def _trade_id_for_row(engine: str, slug: str, side: str) -> str | None:
+    if engine not in ('btc15m', 'eth15m', 'sol15m'):
+        return None
+    stable = f"{engine}:{slug}:{side or 'UNKNOWN'}"
+    return hashlib.sha256(stable.encode()).hexdigest()[:32]
 
 
 def load_secrets():
@@ -157,6 +193,27 @@ def load_posted_order_stats():
         stats[engine]['posted_orders'] = len(set(posted))
         stats[engine]['filled_orders'] = len(filled_ids)
     return stats
+
+
+def _load_redeem_notify_state():
+    if REDEEM_NOTIFY_STATE.exists():
+        try:
+            data = json.loads(REDEEM_NOTIFY_STATE.read_text())
+            sent_txs = [_normalize_tx_hash(x) for x in (data.get('sent_txs') or [])]
+            sent_txs = [x for x in sent_txs if x]
+            return {'sent_txs': list(sent_txs)[-5000:]}
+        except Exception:
+            pass
+    return {'sent_txs': []}
+
+
+def _save_redeem_notify_state(state):
+    try:
+        sent_txs = [_normalize_tx_hash(x) for x in (state.get('sent_txs') or [])]
+        sent_txs = [x for x in sent_txs if x]
+        REDEEM_NOTIFY_STATE.write_text(json.dumps({'sent_txs': list(sent_txs)[-5000:]}))
+    except Exception:
+        pass
 
 
 def reconcile(fast_post_resolution=False):
@@ -314,16 +371,84 @@ def sync_journal(rows):
         exit_price = 1.0 if r['status'] == 'RESOLVED_WON' else 0.0
         pnl = float(r['realized_pnl'] or 0.0)
         pnl_pct = (pnl / r['total_cost'] * 100) if r['total_cost'] else 0.0
-        notes = f"market-reconciled {r['status']} fill_count={r['fill_count']}"
+        # --- Shadow classification (classify actual trade by entry price) ---
+        entry_price = r.get('entry_price_avg') or r.get('entry_price', 0.5)
+        if 0.45 <= entry_price <= 0.62:
+            shadow_class = "kept"
+            shadow_reason = "allow_0.45_0.62"
+        elif entry_price > 0.70:
+            shadow_class = "filtered"
+            shadow_reason = "block_gt_0.70"
+        else:
+            shadow_class = "filtered"
+            shadow_reason = "outside_0.45_0.62"
+        lo = int(entry_price * 10) / 10
+        shadow_bucket = f"{lo:.1f}-{lo+0.1:.1f}"
+        notes = f"market-reconciled {r['status']} fill_count={r['fill_count']} shadow={shadow_class} shadow_bucket={shadow_bucket} shadow_price={entry_price:.4f} shadow_reason={shadow_reason}"
         if r.get('redeem_tx'):
             notes += f" redeem_tx={r['redeem_tx']}"
-        c.execute("SELECT id FROM trades WHERE engine=? AND asset=? AND timestamp_open=?", (r['engine'], r['slug'], ts_open))
+        shared_db = _shared_db_for_engine(r['engine'])
+        trade_id = _trade_id_for_row(r['engine'], r['slug'], r['side'])
+        if shared_db and trade_id:
+            sconn = open_journal(shared_db, f"{r['engine']}_reconcile")
+            try:
+                try:
+                    shared_journal_close(
+                        sconn,
+                        trade_id=trade_id,
+                        exit_price=exit_price,
+                        pnl_absolute=pnl,
+                        pnl_percent=pnl_pct,
+                        exit_type='resolved',
+                        hold_duration_seconds=WINDOW_SEC,
+                        timestamp_close=ts_close,
+                        notes=notes,
+                    )
+                except RuntimeError:
+                    shared_journal_open(
+                        sconn,
+                        trade_id=trade_id,
+                        engine=r['engine'],
+                        asset=r['slug'],
+                        category='poly-15m',
+                        direction=r['side'],
+                        entry_price=r['entry_price_avg'],
+                        position_size=r['total_shares'],
+                        position_size_usd=r['total_cost'],
+                        regime='normal',
+                        notes=notes,
+                        timestamp_open=ts_open,
+                    )
+                    shared_journal_close(
+                        sconn,
+                        trade_id=trade_id,
+                        exit_price=exit_price,
+                        pnl_absolute=pnl,
+                        pnl_percent=pnl_pct,
+                        exit_type='resolved',
+                        hold_duration_seconds=WINDOW_SEC,
+                        timestamp_close=ts_close,
+                        notes=notes,
+                    )
+            finally:
+                sconn.close()
+            continue
+        c.execute(
+            """
+            SELECT rowid
+            FROM trades
+            WHERE engine=? AND asset=? AND timestamp_open=? AND direction=?
+            ORDER BY rowid DESC
+            LIMIT 1
+            """,
+            (r['engine'], r['slug'], ts_open, r['side']),
+        )
         existing = c.fetchone()
         if existing:
             c.execute("""
                 UPDATE trades SET timestamp_close=?, entry_price=?, exit_price=?, position_size=?, position_size_usd=?,
                     pnl_absolute=?, pnl_percent=?, exit_type=?, hold_duration_seconds=?, notes=?
-                WHERE id=?
+                WHERE rowid=?
             """, (ts_close, r['entry_price_avg'], exit_price, r['total_shares'], r['total_cost'], pnl, pnl_pct, 'resolved', WINDOW_SEC, notes, existing[0]))
         else:
             c.execute("""
@@ -350,18 +475,26 @@ def _send_redeem_notification(title, value, tx, slug=None):
     extra = ''
     if slug:
         try:
-            conn = sqlite3.connect(str(JOURNAL_DB))
-            c = conn.cursor()
-            c.execute("SELECT engine, direction, entry_price, position_size_usd, position_size, pnl_absolute FROM trades WHERE asset=? AND engine IN ('btc15m','eth15m','sol15m','xrp15m') ORDER BY timestamp_open DESC LIMIT 1", (slug,))
-            row = c.fetchone()
-            conn.close()
+            row = None
+            for db_path in [JOURNAL_DB, BTC_SHARED_DB if BTC_SHARED_JOURNAL else None, ETH_SHARED_DB if ETH_SHARED_JOURNAL else None, SOL_SHARED_DB if SOL_SHARED_JOURNAL else None]:
+                if not db_path:
+                    continue
+                conn = sqlite3.connect(str(db_path))
+                c = conn.cursor()
+                c.execute("SELECT engine, direction, entry_price, position_size_usd, position_size, pnl_absolute FROM trades WHERE asset=? AND engine IN ('btc15m','eth15m','sol15m','xrp15m') ORDER BY timestamp_open DESC LIMIT 1", (slug,))
+                row = c.fetchone()
+                conn.close()
+                if row:
+                    break
             if row:
                 engine, direction, entry_price, size_usd, shares, pnl = row
                 outcome = 'WIN' if float(pnl or 0) > 0 else 'LOSS' if float(pnl or 0) < 0 else 'FLAT'
                 extra = f" engine={str(engine).upper()} dir={direction} entry={float(entry_price or 0):.4f} size=${float(size_usd or 0):.2f} shares={float(shares or 0):.2f} outcome={outcome} pnl=${float(pnl or 0):.2f}"
         except Exception:
             pass
-    message = f"💰 CHA-CHING! {prefix} Redeemed ${float(value or 0):.2f} from {title}{extra} tx={tx}"
+    tx_norm = _normalize_tx_hash(tx)
+    tx_display = f"0x{tx_norm}" if tx_norm else (tx or 'n/a')
+    message = f"💰 CHA-CHING! {prefix} Redeemed ${float(value or 0):.2f} from {title}{extra} tx={tx_display}"
     try:
         subprocess.run([
             '/home/abdaltm86/.local/bin/openclaw', 'message', 'send',
@@ -378,14 +511,25 @@ def backfill_redeem_rows(user):
     conn = sqlite3.connect(str(JOURNAL_DB))
     c = conn.cursor()
     inserted = 0
+    notify_state = _load_redeem_notify_state()
+    sent_txs = set(notify_state.get('sent_txs') or [])
+    now_ts = int(datetime.now(timezone.utc).timestamp())
     for a in activity:
         if a.get('type') != 'REDEEM':
             continue
-        tx = a.get('transactionHash') or ''
-        if not tx:
+        tx_norm = _normalize_tx_hash(a.get('transactionHash') or '')
+        if not tx_norm:
             continue
-        c.execute("SELECT 1 FROM trades WHERE engine='polymarket_redeem' AND notes LIKE ? LIMIT 1", (f'%tx={tx}%',))
-        if c.fetchone():
+        tx = f"0x{tx_norm}"
+        event_ts = int(a.get('timestamp') or 0)
+        is_fresh = bool(event_ts) and (now_ts - event_ts) <= REDEEM_NOTIFY_MAX_AGE_SEC
+        c.execute(
+            "SELECT 1 FROM trades WHERE engine='polymarket_redeem' AND (notes LIKE ? OR notes LIKE ?) LIMIT 1",
+            (f'%tx={tx}%', f'%tx={tx_norm}%'),
+        )
+        already_in_journal = bool(c.fetchone())
+        if already_in_journal:
+            sent_txs.add(tx_norm)
             continue
         ts = datetime.fromtimestamp(int(a.get('timestamp') or 0), tz=timezone.utc).isoformat()
         title = (a.get('title') or '')[:200]
@@ -399,10 +543,14 @@ def backfill_redeem_rows(user):
                 pnl_percent, exit_type, hold_duration_seconds, regime, notes
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, ('polymarket_redeem', ts, ts, title, 'redeem', 'REDEEM', 0.0, 0.0, 0.0, 0.0, val, 0.0, 'redeemed', 0, 'normal', notes))
-        _send_redeem_notification(title, val, tx, slug=a.get('slug') or '')
+        if tx_norm not in sent_txs and is_fresh:
+            _send_redeem_notification(title, val, tx, slug=a.get('slug') or '')
+        sent_txs.add(tx_norm)
         inserted += 1
     conn.commit()
     conn.close()
+    notify_state['sent_txs'] = list(sent_txs)[-5000:]
+    _save_redeem_notify_state(notify_state)
     return inserted
 
 

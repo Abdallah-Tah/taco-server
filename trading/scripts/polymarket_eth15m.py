@@ -39,6 +39,7 @@ import requests
 from journal import journal_close as shared_journal_close
 from journal import journal_open as shared_journal_open
 from journal import open_journal
+from polymarket_clob_pricing import fetch_book, choose_buy_price
 
 # ── Paths & creds ──────────────────────────────────────────────────────────────
 WORK_DIR      = Path("/home/abdaltm86/.openclaw/workspace/trading")
@@ -111,6 +112,7 @@ SIGNAL_CONFIRM_SEC   = _int("ETH15M_SIGNAL_CONFIRM_SEC", 15)
 # FIX #17: Capped max entry at 0.55 — above 0.55 has negative expectancy
 SNIPE_MIN_PRICE = _float("ETH15M_SIGNAL_MIN_ENTRY_PRICE", 0.38)
 SNIPE_MAX_PRICE = _float("ETH15M_SIGNAL_MAX_ENTRY_PRICE", _float("ETH15M_SNIPE_MAX_PRICE", 0.55))
+EXEC_SPREAD_CAP = _float("ETH15M_EXEC_SPREAD_CAP", 0.10)
 SNIPE_DEFAULT   = _float("ETH15M_SNIPE_DEFAULT_SIZE", 5.00)
 SNIPE_STRONG    = _float("ETH15M_SNIPE_STRONG_SIZE", 7.50)
 SNIPE_STRONG_D  = _float("ETH15M_SNIPE_STRONG_DELTA", 0.10)  # percent
@@ -577,38 +579,37 @@ def shadow_live_gate_eth(price: float, context: str) -> bool:
 
 
 def get_book_metrics(token_id, submitted_price):
-    """Best-effort orderbook snapshot for ETH maker/fallback decisions."""
-    try:
-        r = requests.get(
-            "https://clob.polymarket.com/book",
-            params={"token_id": token_id},
-            timeout=10,
-        )
-        r.raise_for_status()
-        ob = r.json() or {}
-        bids = [float(x.get("price", 0) or 0) for x in (ob.get("bids") or []) if float(x.get("price", 0) or 0) > 0]
-        asks = [float(x.get("price", 0) or 0) for x in (ob.get("asks") or []) if float(x.get("price", 0) or 0) > 0]
-        best_bid = max(bids) if bids else None
-        best_ask = min(asks) if asks else None
-        tick = float(ob.get("tick_size") or 0.01)
-        spread = round(best_ask - best_bid, 4) if best_bid is not None and best_ask is not None else None
-        distance_to_ask = round(best_ask - submitted_price, 4) if best_ask is not None else None
-        return {
-            "best_bid": best_bid,
-            "best_ask": best_ask,
-            "tick": tick,
-            "spread": spread,
-            "distance_to_ask": distance_to_ask,
-        }
-    except Exception as e:
-        return {
-            "best_bid": None,
-            "best_ask": None,
-            "tick": 0.01,
-            "spread": None,
-            "distance_to_ask": None,
-            "error": str(e),
-        }
+    """CLOB book snapshot used as execution-pricing truth."""
+    book = fetch_book(token_id)
+    distance_to_ask = round(book["best_ask"] - submitted_price, 4) if book.get("best_ask") is not None else None
+    return {
+        "best_bid": book.get("best_bid"),
+        "best_ask": book.get("best_ask"),
+        "midpoint": book.get("midpoint"),
+        "tick": book.get("tick", 0.01),
+        "spread": book.get("spread"),
+        "distance_to_ask": distance_to_ask,
+        "bids": book.get("bids", []),
+        "asks": book.get("asks", []),
+        "error": book.get("error"),
+    }
+
+
+def get_exec_buy_context(market, direction, mode, price_cap, submitted_hint=0.0):
+    token_id = market['clob_token_id'][0] if direction == 'UP' else (market['clob_token_id'][1] if len(market['clob_token_id']) > 1 else '')
+    gamma_price = market['yes_price'] if direction == 'UP' else market['no_price']
+    book = get_book_metrics(token_id, submitted_hint)
+    clob_ref_price = book.get('midpoint') if book.get('midpoint') is not None else (book.get('best_ask') if book.get('best_ask') is not None else book.get('best_bid'))
+    submitted_price, abort_reason = choose_buy_price(book, price_cap=price_cap, mode=mode, spread_cap=EXEC_SPREAD_CAP, maker_offset=MAKER_OFFSET)
+    return {
+        'token_id': token_id,
+        'gamma_price': gamma_price,
+        'clob_ref_price': clob_ref_price,
+        'submitted_price': submitted_price,
+        'abort_reason': abort_reason,
+        'book': book,
+        'side_label': 'BUY YES' if direction == 'UP' else 'BUY NO',
+    }
 
 
 def log_trade(engine, direction, size_usd, entry_price, pnl, exit_type, hold_sec, notes="", sec_remaining=None, price_bucket=None):
@@ -1173,16 +1174,13 @@ def check_maker_snipe(market, seconds_remaining):
             fok_token = _state.get('maker_token_id')
             fok_shares = _state.get('maker_shares', 5.0)
             current_book = get_book_metrics(fok_token, _state.get('maker_price', 0.0))
-            best_ask = current_book.get('best_ask')
-            if current_book.get('error'):
-                log(f"[ETH-MAKER] FOK BOOK bid=NA ask=NA spread=NA error={current_book.get('error')}")
-            else:
-                bid_str = f"{current_book['best_bid']:.4f}" if current_book.get('best_bid') is not None else 'NA'
-                ask_str = f"{best_ask:.4f}" if best_ask is not None else 'NA'
-                spread_str = f"{current_book['spread']:.4f}" if current_book.get('spread') is not None else 'NA'
-                log(f"[ETH-MAKER] FOK BOOK bid={bid_str} ask={ask_str} spread={spread_str} last_maker={_state.get('maker_price', 0.0):.4f}")
-            if best_ask is None:
-                log("[ETH-MAKER] FOK skipped: no best ask available")
+            bid_str = f"{current_book['best_bid']:.4f}" if current_book.get('best_bid') is not None else 'NA'
+            ask_str = f"{current_book['best_ask']:.4f}" if current_book.get('best_ask') is not None else 'NA'
+            mid_str = f"{current_book['midpoint']:.4f}" if current_book.get('midpoint') is not None else 'NA'
+            spread_str = f"{current_book['spread']:.4f}" if current_book.get('spread') is not None else 'NA'
+            fok_price, fok_abort = choose_buy_price(current_book, price_cap=SNIPE_MAX_PRICE, mode='taker', spread_cap=EXEC_SPREAD_CAP, maker_offset=0.0)
+            if fok_abort:
+                log(f"[ETH-MAKER] ABORT: pricing_source=CLOB slug={market.get('slug','')} side={_state.get('maker_side')} token_id={fok_token} gamma_price=NA clob_best_bid={bid_str} clob_best_ask={ask_str} clob_midpoint={mid_str} submitted_price=NA spread={spread_str} abort_reason={fok_abort} stage=fok_fallback")
                 _state['diag_orders_cancelled'] = _state.get('diag_orders_cancelled', 0) + 1
                 if seconds_remaining > MAKER_RETRY_MIN_SEC and _state.get('maker_attempt_count', 0) < MAKER_MAX_RETRIES:
                     _state['maker_attempt_count'] = _state.get('maker_attempt_count', 0) + 1
@@ -1193,8 +1191,6 @@ def check_maker_snipe(market, seconds_remaining):
                     _state['maker_done'] = True
                     save_state()
                     return False
-            fok_price = round(min(max(best_ask, _state.get('maker_price', 0.0)), SNIPE_MAX_PRICE), 4)
-            
             r = place_order("BUY", fok_shares, fok_price, market['condition_id'], fok_token)
             for line in (r.get('output') or '').splitlines():
                 if line.strip() and any(tag in line for tag in ('[ATTEMPT', '[RESULT', 'FILL')):
@@ -1350,8 +1346,12 @@ def check_maker_snipe(market, seconds_remaining):
         )
         return None
 
-    token_id = market['clob_token_id'][0] if direction == 'UP' else (market['clob_token_id'][1] if len(market['clob_token_id']) > 1 else '')
-    token_price = market['yes_price'] if direction == 'UP' else market['no_price']
+    price_cap = LATE_REVERSAL_MAX_PRICE if late_reversal else SNIPE_MAX_PRICE
+    ctx = get_exec_buy_context(market, direction, mode='maker', price_cap=price_cap, submitted_hint=0.0)
+    token_id = ctx['token_id']
+    token_price = ctx['clob_ref_price']
+    gamma_price = ctx['gamma_price']
+    book = ctx['book']
 
     if seconds_remaining < MIN_ENTRY_SEC:
         log(f"[ETH-MAKER] FILTER: sec_remaining={seconds_remaining}s < {MIN_ENTRY_SEC}s, skipping ultra-late entry")
@@ -1367,11 +1367,18 @@ def check_maker_snipe(market, seconds_remaining):
         )
         return None
 
-    # FIX #1: Raised max entry price
-    price_cap = LATE_REVERSAL_MAX_PRICE if late_reversal else SNIPE_MAX_PRICE
+    if token_price is None:
+        log(f"[ETH-MAKER] ABORT: pricing_source=CLOB slug={market.get('slug','')} side={direction} token_id={token_id} gamma_price={gamma_price} abort_reason=missing_clob_reference")
+        return None
+    # ABORT: gamma/clob mismatch (direction source vs execution source disagree)
+    if gamma_price is not None and token_price is not None and abs(gamma_price - token_price) > 0.10:
+        log(f"[ETH-MAKER] ABORT: gamma/clob mismatch gamma_price={gamma_price:.4f} clob_price={token_price:.4f} diff={abs(gamma_price - token_price):.4f}")
+        return None
+    
+
     if token_price > price_cap:
         price_bucket = "high"
-        log(f"[ETH-MAKER] FILTER: entry_price={token_price:.4f} > max {price_cap:.2f} (bucket={price_bucket}), skipping high price")
+        log(f"[ETH-MAKER] FILTER: pricing_source=CLOB entry_price={token_price:.4f} gamma_price={gamma_price:.4f} > max {price_cap:.2f} (bucket={price_bucket}), skipping high price")
         shadow_live_gate_eth(token_price, context='maker')
         write_edge_event(
             market,
@@ -1392,7 +1399,7 @@ def check_maker_snipe(market, seconds_remaining):
         price_bucket = "sweet_spot"
     else:
         price_bucket = "low"
-        log(f"[ETH-MAKER] FILTER: entry_price={token_price:.4f} < min {SNIPE_MIN_PRICE:.2f} (bucket={price_bucket}), skipping low price")
+        log(f"[ETH-MAKER] FILTER: pricing_source=CLOB entry_price={token_price:.4f} gamma_price={gamma_price:.4f} < min {SNIPE_MIN_PRICE:.2f} (bucket={price_bucket}), skipping low price")
         shadow_live_gate_eth(token_price, context='maker')
         write_edge_event(
             market,
@@ -1409,7 +1416,7 @@ def check_maker_snipe(market, seconds_remaining):
         return None
 
     if not shadow_live_gate_eth(token_price, context='maker'):
-        log(f"[ETH-MAKER] SHADOW FILTER: entry_price={token_price:.4f} shadow_reason={_state.get('shadow_reason')} (bucket={price_bucket}), skipping")
+        log(f"[ETH-MAKER] SHADOW FILTER: pricing_source=CLOB entry_price={token_price:.4f} gamma_price={gamma_price:.4f} shadow_reason={_state.get('shadow_reason')} (bucket={price_bucket}), skipping")
         write_edge_event(
             market,
             signal_type="maker",
@@ -1424,37 +1431,23 @@ def check_maker_snipe(market, seconds_remaining):
         )
         return None
 
-    log(f"[ETH-MAKER] PRICE_BUCKET: {price_bucket} (price={token_price:.4f})")
     _state['maker_price_bucket'] = price_bucket
     _state['maker_sec_remaining'] = seconds_remaining
 
     if token_price < MAKER_MIN_PRICE:
-        log(f"[ETH-MAKER] token_mid={token_price:.4f} < min {MAKER_MIN_PRICE:.4f}, skipping")
+        log(f"[ETH-MAKER] ABORT: pricing_source=CLOB slug={market.get('slug','')} side={direction} token_id={token_id} clob_price={token_price:.4f} gamma_price={gamma_price:.4f} abort_reason=below_maker_min")
         return None
 
-    base_limit = max(0.01, round(token_price - MAKER_OFFSET, 2))
-    book = get_book_metrics(token_id, base_limit)
-    if book.get('error'):
-        log(f"[ETH-MAKER] BOOK mid={token_price:.4f} bid=NA ask=NA spread=NA submitted={base_limit:.4f} distance_to_ask=NA error={book.get('error')}")
-        limit_price = base_limit
-    else:
-        bid_str = f"{book['best_bid']:.4f}" if book.get('best_bid') is not None else 'NA'
-        ask_str = f"{book['best_ask']:.4f}" if book.get('best_ask') is not None else 'NA'
-        spread_str = f"{book['spread']:.4f}" if book.get('spread') is not None else 'NA'
-        dta_str = f"{book['distance_to_ask']:.4f}" if book.get('distance_to_ask') is not None else 'NA'
-        log(f"[ETH-MAKER] BOOK mid={token_price:.4f} bid={bid_str} ask={ask_str} spread={spread_str} submitted={base_limit:.4f} distance_to_ask={dta_str}")
-        if book.get('best_ask') is not None and abs(float(book['best_ask']) - float(token_price)) > 0.10:
-            log(f"[ETH-MAKER] ABORT: mid/book mismatch token_mid={token_price:.4f} best_ask={float(book['best_ask']):.4f} submitted={base_limit:.4f}")
-            return None
-        limit_price = base_limit
-        if book.get('best_ask') is not None:
-            tick = max(float(book.get('tick') or 0.01), 0.01)
-            near_ask = round(max(0.01, float(book['best_ask']) - tick), 2)
-            limit_price = max(limit_price, near_ask)
-        limit_price = min(limit_price, SNIPE_MAX_PRICE)
-    maker_budget = SNIPE_DEFAULT * current_risk_multiplier()
-    shares = max(5.0, math.floor((maker_budget / max(limit_price, 0.01)) * 100) / 100)
-    log(f"[ETH-MAKER] {direction} signal token_mid={token_price:.4f} limit={limit_price:.4f} shares={shares:.2f} dry={MAKER_DRY_RUN} attempt={_state.get('maker_attempt_count', 0)+1}")
+    limit_price = ctx['submitted_price']
+    bid_str = f"{book['best_bid']:.4f}" if book.get('best_bid') is not None else 'NA'
+    ask_str = f"{book['best_ask']:.4f}" if book.get('best_ask') is not None else 'NA'
+    mid_str = f"{book['midpoint']:.4f}" if book.get('midpoint') is not None else 'NA'
+    spread_str = f"{book['spread']:.4f}" if book.get('spread') is not None else 'NA'
+    if ctx['abort_reason']:
+        log(f"[ETH-MAKER] ABORT: pricing_source=CLOB slug={market.get('slug','')} side={ctx['side_label']} token_id={token_id} gamma_price={gamma_price:.4f} clob_best_bid={bid_str} clob_best_ask={ask_str} clob_midpoint={mid_str} submitted_price=NA spread={spread_str} abort_reason={ctx['abort_reason']}")
+        return None
+    shares = max(5.0, math.floor(((SNIPE_DEFAULT * current_risk_multiplier()) / max(limit_price, 0.01)) * 100) / 100)
+    log(f"[ETH-MAKER] pricing_source=CLOB slug={market.get('slug','')} side={ctx['side_label']} token_id={token_id} gamma_price={gamma_price:.4f} clob_best_bid={bid_str} clob_best_ask={ask_str} clob_midpoint={mid_str} submitted_price={limit_price:.4f} spread={spread_str} shares={shares:.2f} dry={MAKER_DRY_RUN} attempt={_state.get('maker_attempt_count', 0)+1}")
     write_edge_event(
         market,
         signal_type="maker",
@@ -1613,8 +1606,12 @@ def check_snipe(market, seconds_remaining):
         )
         return None
 
-    token_id = market["clob_token_id"][0] if direction == "UP" else (market["clob_token_id"][1] if len(market["clob_token_id"]) > 1 else "")
-    price    = market["yes_price"] if direction == "UP" else market["no_price"]
+    price_cap = LATE_REVERSAL_MAX_PRICE if late_reversal else SNIPE_MAX_PRICE
+    ctx = get_exec_buy_context(market, direction, mode='taker', price_cap=price_cap, submitted_hint=0.0)
+    token_id = ctx['token_id']
+    price = ctx['clob_ref_price']
+    gamma_price = ctx['gamma_price']
+    book = ctx['book']
 
     if seconds_remaining < MIN_ENTRY_SEC:
         log(f"[ETH-SNIPE] FILTER: sec_remaining={seconds_remaining}s < {MIN_ENTRY_SEC}s, skipping ultra-late entry")
@@ -1630,11 +1627,18 @@ def check_snipe(market, seconds_remaining):
         )
         return None
 
-    # FIX #1: Raised max entry
-    price_cap = LATE_REVERSAL_MAX_PRICE if late_reversal else SNIPE_MAX_PRICE
+    if price is None:
+        log(f"[ETH-SNIPE] ABORT: pricing_source=CLOB slug={market.get('slug','')} side={direction} token_id={token_id} gamma_price={gamma_price} abort_reason=missing_clob_reference")
+        return None
+    # ABORT: gamma/clob mismatch (direction source vs execution source disagree)
+    if gamma_price is not None and price is not None and abs(gamma_price - price) > 0.10:
+        log(f"[ETH-SNIPE] ABORT: gamma/clob mismatch gamma_price={gamma_price:.4f} clob_price={price:.4f} diff={abs(gamma_price - price):.4f}")
+        return None
+    
+
     if price > price_cap:
         price_bucket = "high"
-        log(f"[ETH-SNIPE] FILTER: entry_price={price:.4f} > max {price_cap:.2f} (bucket={price_bucket}), skipping high price")
+        log(f"[ETH-SNIPE] FILTER: pricing_source=CLOB entry_price={price:.4f} gamma_price={gamma_price:.4f} > max {price_cap:.2f} (bucket={price_bucket}), skipping high price")
         shadow_live_gate_eth(price, context='snipe')
         write_edge_event(
             market,
@@ -1655,7 +1659,7 @@ def check_snipe(market, seconds_remaining):
         price_bucket = "sweet_spot"
     else:
         price_bucket = "low"
-        log(f"[ETH-SNIPE] FILTER: entry_price={price:.4f} < floor {SNIPE_MIN_PRICE:.2f} (bucket={price_bucket}), skipping low price")
+        log(f"[ETH-SNIPE] FILTER: pricing_source=CLOB entry_price={price:.4f} gamma_price={gamma_price:.4f} < floor {SNIPE_MIN_PRICE:.2f} (bucket={price_bucket}), skipping low price")
         shadow_live_gate_eth(price, context='snipe')
         write_edge_event(
             market,
@@ -1672,7 +1676,7 @@ def check_snipe(market, seconds_remaining):
         return None
 
     if not shadow_live_gate_eth(price, context='snipe'):
-        log(f"[ETH-SNIPE] SHADOW FILTER: entry_price={price:.4f} shadow_reason={_state.get('shadow_reason')} (bucket={price_bucket}), skipping")
+        log(f"[ETH-SNIPE] SHADOW FILTER: pricing_source=CLOB entry_price={price:.4f} gamma_price={gamma_price:.4f} shadow_reason={_state.get('shadow_reason')} (bucket={price_bucket}), skipping")
         write_edge_event(
             market,
             signal_type="snipe",
@@ -1687,19 +1691,23 @@ def check_snipe(market, seconds_remaining):
         )
         return None
 
-    log(f"[ETH-SNIPE] PRICE_BUCKET: {price_bucket} (price={price:.4f})")
+    submitted_price = ctx['submitted_price']
+    bid_str = f"{book['best_bid']:.4f}" if book.get('best_bid') is not None else 'NA'
+    ask_str = f"{book['best_ask']:.4f}" if book.get('best_ask') is not None else 'NA'
+    mid_str = f"{book['midpoint']:.4f}" if book.get('midpoint') is not None else 'NA'
+    spread_str = f"{book['spread']:.4f}" if book.get('spread') is not None else 'NA'
+    if ctx['abort_reason']:
+        log(f"[ETH-SNIPE] ABORT: pricing_source=CLOB slug={market.get('slug','')} side={ctx['side_label']} token_id={token_id} gamma_price={gamma_price:.4f} clob_best_bid={bid_str} clob_best_ask={ask_str} clob_midpoint={mid_str} submitted_price=NA spread={spread_str} abort_reason={ctx['abort_reason']}")
+        return None
 
     base_size = SNIPE_STRONG if abs(delta_pct) >= SNIPE_STRONG_D * 100 else SNIPE_DEFAULT
     size = base_size * current_risk_multiplier()
-    shares = size / price
+    shares = size / submitted_price
     if shares < 5:
         shares = 5
-        size = shares * price
+        size = shares * submitted_price
 
-    if late_reversal:
-        log(f"[ETH-SNIPE] LATE REVERSAL signal! ETH delta={delta_pct:+.3f}% size=${size:.2f} price={price:.4f} shares={shares:.2f}")
-    else:
-        log(f"[ETH-SNIPE] {direction} signal! ETH delta={delta_pct:+.3f}% size=${size:.2f} price={price:.4f} shares={shares:.2f}")
+    log(f"[ETH-SNIPE] pricing_source=CLOB slug={market.get('slug','')} side={ctx['side_label']} token_id={token_id} gamma_price={gamma_price:.4f} clob_best_bid={bid_str} clob_best_ask={ask_str} clob_midpoint={mid_str} submitted_price={submitted_price:.4f} spread={spread_str}")
     write_edge_event(
         market,
         signal_type="snipe",
@@ -1711,7 +1719,7 @@ def check_snipe(market, seconds_remaining):
         shadow_decision=_state.get('shadow_decision', ''),
         shadow_skip_reason=_state.get('shadow_reason', ''),
     )
-    r = place_order("BUY", shares, price, market["condition_id"], token_id)
+    r = place_order("BUY", shares, submitted_price, market["condition_id"], token_id)
     for line in (r.get("output") or "").splitlines():
         if any(tag in line for tag in ("[ATTEMPT]", "[RESULT]", "Book best", "FILL")):
             log(f"[EXEC] {line.strip()}")

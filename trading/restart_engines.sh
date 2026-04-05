@@ -12,8 +12,8 @@ echo "Checking all processes killed..."
 ps aux | grep -E "polymarket_btc15m|polymarket_eth15m" | grep -v grep || echo "All engines stopped"
 
 echo "Starting new engines with Fix 1-8..."
-nohup .polymarket-venv/bin/python3 scripts/polymarket_btc15m.py > /tmp/polymarket_btc15m.log 2>&1 &
-nohup .polymarket-venv/bin/python3 scripts/polymarket_eth15m.py > /tmp/polymarket_eth15m.log 2>&1 &
+nohup env -u BTC15M_SIGNAL_MAX_ENTRY_PRICE .polymarket-venv/bin/python3 scripts/polymarket_btc15m.py > /tmp/polymarket_btc15m.log 2>&1 &
+nohup env -u ETH15M_SIGNAL_MAX_ENTRY_PRICE .polymarket-venv/bin/python3 scripts/polymarket_eth15m.py > /tmp/polymarket_eth15m.log 2>&1 &
 
 sleep 3
 echo "Verifying engines are running..."

@@ -31,6 +31,8 @@
 - Reconciled entry_price = weighted avg of fill prices (correct behavior)
 - Signal quality in 0.45-0.55 range is weak, Edge strongest in 0.55-0.65
 - Persist important decisions to memory files so context survives resets.
+- BTC env precedence lesson: `polymarket_btc15m.py` prefers `os.environ` over `~/.config/openclaw/secrets.env` for `BTC15M_SIGNAL_MAX_ENTRY_PRICE`; if an exported shell variable exists, it overrides the secrets file until cleared or the process is restarted.
+- Future launcher behavior should clear exported max-entry overrides before starting engines (`env -u BTC15M_SIGNAL_MAX_ENTRY_PRICE ...`; ETH launcher also clears its matching override for consistency).
 
 ## /report command format (permanent rule)
 

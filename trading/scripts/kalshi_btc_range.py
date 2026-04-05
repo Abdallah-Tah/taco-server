@@ -112,10 +112,12 @@ class KalshiAPI:
 
     def _sign(self, method, path):
         ts = str(int(time.time() * 1000))
-        msg = ts + method + path
+        # Message: timestamp + METHOD + full path (including /trade-api/v2 prefix)
+        full_path = path  # path already includes /trade-api/v2 when called from self.get/post
+        msg = ts + method + full_path
         sig = base64.b64encode(self.private_key.sign(
             msg.encode(),
-            padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
+            padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH),
             hashes.SHA256(),
         )).decode()
         return {
@@ -157,7 +159,7 @@ class KalshiAPI:
         today = datetime.now(timezone(timedelta(hours=-4))).strftime('%b %-d')  # ET
         for e in events:
             title = e.get('title', '')
-            if today in title or 'Apr 2' in title:  # fallback
+            if today in title:
                 return [m for m in e.get('markets', []) if m.get('status') == 'active']
 
         # If no exact match, return closest event
