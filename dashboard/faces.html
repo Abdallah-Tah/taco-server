@@ -1,0 +1,747 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Face Management - TacoClaw</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      background: #0a0a0f;
+      color: #e5e5e5;
+      min-height: 100vh;
+    }
+    .header {
+      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+      padding: 24px 32px;
+      border-bottom: 1px solid rgba(255,255,255,0.1);
+    }
+    .header h1 {
+      font-size: 24px;
+      font-weight: 700;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      margin-bottom: 4px;
+    }
+    .header p { font-size: 14px; color: #888; }
+    .container { max-width: 1200px; margin: 0 auto; padding: 32px; }
+
+    .card {
+      background: linear-gradient(145deg, #13131a, #1a1a24);
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 16px;
+      padding: 24px;
+      margin-bottom: 24px;
+    }
+    .card-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 20px;
+    }
+    .card-title {
+      font-size: 18px;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .card-title svg { width: 24px; height: 24px; }
+
+    .help-card {
+      background: linear-gradient(145deg, #13131a, #1a1a24);
+      border: 1px solid rgba(102, 126, 234, 0.3);
+      border-radius: 12px;
+      padding: 20px;
+      margin-bottom: 24px;
+    }
+    .help-card h3 {
+      font-size: 14px;
+      font-weight: 600;
+      color: #667eea;
+      margin-bottom: 12px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .help-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 16px;
+    }
+    .help-item {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      font-size: 13px;
+      color: #aaa;
+    }
+    .help-item-icon {
+      width: 20px;
+      height: 20px;
+      background: rgba(102, 126, 234, 0.2);
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 11px;
+      flex-shrink: 0;
+      color: #667eea;
+    }
+
+    <a href="/" class="back-link">← Back to Dashboard</a>
+
+    <div class="help-card">
+      <h3>
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/>
+        </svg>
+        How It Works
+      </h3>
+      <div class="help-grid">
+        <div class="help-item">
+          <span class="help-item-icon">1</span>
+          <span>Add a person with 1-5 clear photos</span>
+        </div>
+        <div class="help-item">
+          <span class="help-item-icon">2</span>
+          <span>When doorbell detects motion, face is checked</span>
+        </div>
+        <div class="help-item">
+          <span class="help-item-icon">3</span>
+          <span>Match triggers Alexa: "Name is at the door"</span>
+        </div>
+        <div class="help-item">
+          <span class="help-item-icon">4</span>
+          <span>Telegram alert sent with snapshot</span>
+        </div>
+      </div>
+    </div>
+
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 16px;
+      margin-bottom: 32px;
+    }
+    .stat-card {
+      background: linear-gradient(145deg, #13131a, #1a1a24);
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 12px;
+      padding: 20px;
+      text-align: center;
+    }
+    .stat-value { font-size: 36px; font-weight: 700; color: #667eea; }
+    .stat-label { font-size: 12px; color: #888; text-transform: uppercase; letter-spacing: 1px; margin-top: 4px; }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 20px;
+      border: none;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .btn-primary {
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: white;
+    }
+    .btn-primary:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4); }
+    .btn-danger { background: #dc3545; color: white; }
+    .btn-danger:hover { background: #c82333; }
+    .btn-sm { padding: 6px 12px; font-size: 12px; }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+      gap: 20px;
+    }
+    .person-card {
+      background: rgba(255,255,255,0.03);
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 12px;
+      overflow: hidden;
+      transition: all 0.2s;
+    }
+    .person-card:hover { border-color: rgba(102, 126, 234, 0.5); transform: translateY(-2px); }
+    .person-image {
+      width: 100%;
+      height: 200px;
+      object-fit: cover;
+      background: #1a1a24;
+    }
+    .person-info { padding: 16px; }
+    .person-name { font-size: 18px; font-weight: 600; margin-bottom: 4px; }
+    .person-date { font-size: 12px; color: #888; }
+    .person-actions { padding: 0 16px 16px; display: flex; gap: 8px; }
+
+    .modal-overlay {
+      position: fixed;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background: rgba(0,0,0,0.8);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 1000;
+      opacity: 0;
+      visibility: hidden;
+      transition: all 0.2s;
+    }
+    .modal-overlay.active { opacity: 1; visibility: visible; }
+    .modal {
+      background: #1a1a24;
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 16px;
+      width: 100%;
+      max-width: 480px;
+      padding: 32px;
+      transform: scale(0.95);
+      transition: all 0.2s;
+    }
+    .modal-overlay.active .modal { transform: scale(1); }
+    .modal h2 { font-size: 20px; margin-bottom: 24px; }
+    .form-group { margin-bottom: 20px; }
+    .form-group label { display: block; font-size: 14px; color: #888; margin-bottom: 8px; }
+    .form-group input[type="text"] {
+      width: 100%;
+      padding: 12px 16px;
+      background: #0a0a0f;
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 8px;
+      color: #e5e5e5;
+      font-size: 14px;
+    }
+    .form-group input:focus { outline: none; border-color: #667eea; }
+    .upload-area {
+      border: 2px dashed rgba(255,255,255,0.2);
+      border-radius: 12px;
+      padding: 40px;
+      text-align: center;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .upload-area:hover { border-color: #667eea; background: rgba(102,126,234,0.1); }
+    .upload-area.dragover { border-color: #667eea; background: rgba(102,126,234,0.1); }
+    .upload-icon { font-size: 48px; margin-bottom: 16px; }
+    .upload-text { font-size: 14px; color: #888; }
+    .upload-text strong { color: #667eea; }
+    .preview-image {
+      width: 100%;
+      height: 200px;
+      object-fit: cover;
+      border-radius: 8px;
+      margin-top: 16px;
+      display: none;
+    }
+    .preview-image.visible { display: block; }
+    .modal-actions { display: flex; gap: 12px; margin-top: 24px; }
+    .modal-actions .btn { flex: 1; justify-content: center; }
+
+    .empty-state {
+      text-align: center;
+      padding: 60px 20px;
+      color: #888;
+    }
+    .empty-icon { font-size: 64px; margin-bottom: 16px; }
+    .empty-text { font-size: 16px; margin-bottom: 8px; }
+    .empty-subtext { font-size: 14px; }
+
+    .loading {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 40px;
+    }
+    .spinner {
+      width: 40px;
+      height: 40px;
+      border: 3px solid rgba(255,255,255,0.1);
+      border-top-color: #667eea;
+      border-radius: 50%;
+      animation: spin 1s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .toast {
+      position: fixed;
+      bottom: 24px;
+      right: 24px;
+      background: #1a1a24;
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 8px;
+      padding: 16px 24px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      transform: translateY(100px);
+      opacity: 0;
+      transition: all 0.3s;
+      z-index: 2000;
+    }
+    .toast.show { transform: translateY(0); opacity: 1; }
+    .toast.success { border-color: #28a745; }
+    .toast.error { border-color: #dc3545; }
+    .toast-icon { font-size: 20px; }
+
+    .back-link {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      color: #888;
+      text-decoration: none;
+      font-size: 14px;
+      margin-bottom: 24px;
+    }
+    .back-link:hover { color: #667eea; }
+  </style>
+</head>
+<body>
+  <header class="header">
+    <h1>Face Recognition Management</h1>
+    <p>Manage known faces for Blink Cam doorbell alerts</p>
+  </header>
+
+  <main class="container">
+    <a href="/" class="back-link">← Back to Dashboard</a>
+
+    <!-- Help Card -->
+    <div class="card" style="background: linear-gradient(145deg, #1a1a2e, #16213e); border-color: rgba(102, 126, 234, 0.3);">
+      <div class="card-header">
+        <div class="card-title">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#667eea" stroke-width="2">
+            <circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/>
+          </svg>
+          How It Works
+        </div>
+      </div>
+      <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px; color: #aaa; font-size: 14px;">
+        <div>
+          <div style="color: #667eea; font-weight: 600; margin-bottom: 8px;">1. Add a Face</div>
+          <p>Click "Add Face", enter the person's name, and upload a clear photo. Use 1-5 photos per person for best results.</p>
+        </div>
+        <div>
+          <div style="color: #667eea; font-weight: 600; margin-bottom: 8px;">2. Face Detection</div>
+          <p>When the Blink doorbell detects motion, it captures images and runs face recognition on them.</p>
+        </div>
+        <div>
+          <div style="color: #667eea; font-weight: 600; margin-bottom: 8px;">3. Alexa Announcement</div>
+          <p>When a registered face is recognized, Alexa automatically announces "<span style="color: #fff;">[Name] is at the door</span>".</p>
+        </div>
+        <div>
+          <div style="color: #667eea; font-weight: 600; margin-bottom: 8px;">Tips for Best Results</div>
+          <p>Use clear, well-lit photos with the face visible. Frontal views work best. Add multiple angles for better matching.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="stats">
+      <div class="stat-card">
+        <div class="stat-value" id="totalFaces">0</div>
+        <div class="stat-label">Total Faces</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-value" id="activeToday">0</div>
+        <div class="stat-label">Active Today</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>
+            <circle cx="9" cy="7" r="4"/>
+            <path d="M23 21v-2a4 4 0 0 0-3-3.87"/>
+            <path d="M16 3.13a4 4 0 0 1 0 7.75"/>
+          </svg>
+          Known Faces
+        </div>
+        <button class="btn btn-primary" onclick="openAddModal()">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+          </svg>
+          Add Face
+        </button>
+      </div>
+
+      <div id="facesGrid" class="grid"></div>
+      <div id="loading" class="loading"><div class="spinner"></div></div>
+      <div id="emptyState" class="empty-state" style="display:none;">
+        <div class="empty-icon">👤</div>
+        <div class="empty-text">No faces registered yet</div>
+        <div class="empty-subtext">Add your first face to enable recognition</div>
+      </div>
+    </div>
+  </main>
+
+  <!-- Add Modal -->
+  <div class="modal-overlay" id="addModal">
+    <div class="modal">
+      <h2>Add New Face</h2>
+      <form id="addForm" onsubmit="handleAdd(event)">
+        <div class="form-group">
+          <label>Name</label>
+          <input type="text" id="personName" placeholder="Enter person's name" required>
+        </div>
+        <div class="form-group">
+          <label>Photo</label>
+          <div class="upload-area" id="uploadArea" onclick="document.getElementById('fileInput').click()">
+            <div class="upload-icon">📷</div>
+            <div class="upload-text">
+              <strong>Click to upload</strong> or drag and drop<br>
+              JPG or PNG (max 5MB)
+            </div>
+            <input type="file" id="fileInput" accept="image/jpeg,image/png" style="display:none" onchange="handleFileSelect(event)">
+          </div>
+          <img id="previewImage" class="preview-image" alt="Preview">
+        </div>
+        <div class="modal-actions">
+          <button type="button" class="btn" onclick="closeAddModal()" style="background:#333;color:#fff;">Cancel</button>
+          <button type="submit" class="btn btn-primary" id="submitBtn">Add Face</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Edit Modal -->
+  <div class="modal-overlay" id="editModal">
+    <div class="modal">
+      <h2>Edit Face</h2>
+      <form id="editForm" onsubmit="handleEdit(event)">
+        <input type="hidden" id="editPersonId">
+        <div class="form-group">
+          <label>Name</label>
+          <input type="text" id="editPersonName" placeholder="Enter person's name" required>
+        </div>
+        <div class="form-group">
+          <label>New Photo (optional)</label>
+          <div class="upload-area" id="editUploadArea" onclick="document.getElementById('editFileInput').click()">
+            <div class="upload-icon">📷</div>
+            <div class="upload-text">
+              <strong>Click to upload</strong> or drag and drop<br>
+              JPG or PNG (max 5MB) - Leave empty to keep current photo
+            </div>
+            <input type="file" id="editFileInput" accept="image/jpeg,image/png" style="display:none" onchange="handleEditFileSelect(event)">
+          </div>
+          <img id="editPreviewImage" class="preview-image" alt="Preview">
+        </div>
+        <div class="modal-actions">
+          <button type="button" class="btn" onclick="closeEditModal()" style="background:#333;color:#fff;">Cancel</button>
+          <button type="submit" class="btn btn-primary" id="editSubmitBtn">Save Changes</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Toast -->
+  <div class="toast" id="toast">
+    <span class="toast-icon"></span>
+    <span class="toast-message"></span>
+  </div>
+
+  <script>
+    let selectedFile = null;
+    let editSelectedFile = null;
+    let currentEditId = null;
+
+    async function loadFaces() {
+      document.getElementById('loading').style.display = 'flex';
+      document.getElementById('facesGrid').innerHTML = '';
+      document.getElementById('emptyState').style.display = 'none';
+
+      try {
+        const res = await fetch('/api/faces');
+        const faces = await res.json();
+
+        document.getElementById('loading').style.display = 'none';
+        document.getElementById('totalFaces').textContent = faces.length;
+        document.getElementById('activeToday').textContent = faces.length;
+
+        if (faces.length === 0) {
+          document.getElementById('emptyState').style.display = 'block';
+          return;
+        }
+
+        faces.forEach(face => {
+          const card = document.createElement('div');
+          card.className = 'person-card';
+          card.innerHTML = `
+            <img src="/api/faces/${face.id}/image" class="person-image" alt="${face.name}" onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><rect fill=%22%231a1a24%22 width=%22100%22 height=%22100%22/><text x=%2250%22 y=%2255%22 text-anchor=%22middle%22 fill=%22%23666%22 font-size=%2240%22>?</text></svg>'">
+            <div class="person-info">
+              <div class="person-name">${escapeHtml(face.name)}</div>
+              <div class="person-date">Added ${formatDate(face.created_at)}</div>
+            </div>
+            <div class="person-actions">
+              <button class="btn btn-primary btn-sm" onclick="openEditModal(${face.id}, '${escapeHtml(face.name)}')">Edit</button>
+              <button class="btn btn-danger btn-sm" onclick="deleteFace(${face.id}, '${escapeHtml(face.name)}')">Delete</button>
+            </div>
+          `;
+          document.getElementById('facesGrid').appendChild(card);
+        });
+      } catch (e) {
+        showToast('Failed to load faces', 'error');
+      }
+    }
+
+    function openAddModal() {
+      document.getElementById('addModal').classList.add('active');
+      document.getElementById('addForm').reset();
+      document.getElementById('previewImage').classList.remove('visible');
+      selectedFile = null;
+    }
+
+    function closeAddModal() {
+      document.getElementById('addModal').classList.remove('active');
+    }
+
+    function handleFileSelect(e) {
+      const file = e.target.files[0];
+      if (file) {
+        selectedFile = file;
+        const reader = new FileReader();
+        reader.onload = (e) => {
+          const preview = document.getElementById('previewImage');
+          preview.src = e.target.result;
+          preview.classList.add('visible');
+        };
+        reader.readAsDataURL(file);
+      }
+    }
+
+    // Drag and drop
+    const uploadArea = document.getElementById('uploadArea');
+    uploadArea.addEventListener('dragover', (e) => { e.preventDefault(); uploadArea.classList.add('dragover'); });
+    uploadArea.addEventListener('dragleave', () => uploadArea.classList.remove('dragover'));
+    uploadArea.addEventListener('drop', (e) => {
+      e.preventDefault();
+      uploadArea.classList.remove('dragover');
+      const file = e.dataTransfer.files[0];
+      if (file && (file.type === 'image/jpeg' || file.type === 'image/png')) {
+        selectedFile = file;
+        document.getElementById('fileInput').files = e.dataTransfer.files;
+        handleFileSelect({ target: { files: [file] } });
+      }
+    });
+
+    async function handleAdd(e) {
+      e.preventDefault();
+
+      const name = document.getElementById('personName').value.trim();
+      if (!name) { showToast('Please enter a name', 'error'); return; }
+      if (!selectedFile) { showToast('Please select an image', 'error'); return; }
+
+      const formData = new FormData();
+      formData.append('name', name);
+      formData.append('image', selectedFile);
+
+      document.getElementById('submitBtn').disabled = true;
+      document.getElementById('submitBtn').textContent = 'Adding...';
+
+      try {
+        const res = await fetch('/api/faces', { method: 'POST', body: formData });
+        const data = await res.json();
+
+        if (res.ok) {
+          showToast(`${name} added successfully!`, 'success');
+          closeAddModal();
+          loadFaces();
+        } else {
+          showToast(data.error || 'Failed to add face', 'error');
+        }
+      } catch (e) {
+        showToast('Failed to add face', 'error');
+      }
+
+      document.getElementById('submitBtn').disabled = false;
+      document.getElementById('submitBtn').textContent = 'Add Face';
+    }
+
+    async function deleteFace(id, name) {
+      if (!confirm(`Delete ${name}? This will remove them from face recognition.`)) return;
+
+      try {
+        const res = await fetch(`/api/faces/${id}`, { method: 'DELETE' });
+        if (res.ok) {
+          showToast(`${name} deleted`, 'success');
+          loadFaces();
+        } else {
+          showToast('Failed to delete', 'error');
+        }
+      } catch (e) {
+        showToast('Failed to delete', 'error');
+      }
+    }
+
+    function openEditModal(id, name) {
+      currentEditId = id;
+      document.getElementById('editPersonId').value = id;
+      document.getElementById('editPersonName').value = name;
+      document.getElementById('editPreviewImage').classList.remove('visible');
+      editSelectedFile = null;
+      document.getElementById('editForm').reset();
+      document.getElementById('editPersonName').value = name;
+      document.getElementById('editModal').classList.add('active');
+    }
+
+    function closeEditModal() {
+      document.getElementById('editModal').classList.remove('active');
+      currentEditId = null;
+    }
+
+    function handleEditFileSelect(e) {
+      const file = e.target.files[0];
+      if (file) {
+        editSelectedFile = file;
+        const reader = new FileReader();
+        reader.onload = (e) => {
+          const preview = document.getElementById('editPreviewImage');
+          preview.src = e.target.result;
+          preview.classList.add('visible');
+        };
+        reader.readAsDataURL(file);
+      }
+    }
+
+    async function handleEdit(e) {
+      e.preventDefault();
+
+      const id = document.getElementById('editPersonId').value;
+      const name = document.getElementById('editPersonName').value.trim();
+      if (!name) { showToast('Please enter a name', 'error'); return; }
+
+      const formData = new FormData();
+      formData.append('name', name);
+      if (editSelectedFile) {
+        formData.append('image', editSelectedFile);
+      }
+
+      document.getElementById('editSubmitBtn').disabled = true;
+      document.getElementById('editSubmitBtn').textContent = 'Saving...';
+
+      try {
+        const res = await fetch(`/api/faces/${id}`, { method: 'PUT', body: formData });
+        const data = await res.json();
+
+        if (res.ok) {
+          showToast(`${name} updated successfully!`, 'success');
+          closeEditModal();
+          loadFaces();
+        } else {
+          showToast(data.error || 'Failed to update face', 'error');
+        }
+      } catch (e) {
+        showToast('Failed to update face', 'error');
+      }
+
+      document.getElementById('editSubmitBtn').disabled = false;
+      document.getElementById('editSubmitBtn').textContent = 'Save Changes';
+    }
+
+    function openEditModal(id, name) {
+      currentEditId = id;
+      document.getElementById('editPersonId').value = id;
+      document.getElementById('editPersonName').value = name;
+      document.getElementById('editPreviewImage').classList.remove('visible');
+      editSelectedFile = null;
+      document.getElementById('editModal').classList.add('active');
+    }
+
+    function closeEditModal() {
+      document.getElementById('editModal').classList.remove('active');
+      currentEditId = null;
+    }
+
+    function handleEditFileSelect(e) {
+      const file = e.target.files[0];
+      if (file) {
+        editSelectedFile = file;
+        const reader = new FileReader();
+        reader.onload = (e) => {
+          const preview = document.getElementById('editPreviewImage');
+          preview.src = e.target.result;
+          preview.classList.add('visible');
+        };
+        reader.readAsDataURL(file);
+      }
+    }
+
+    // Setup edit drag and drop
+    const editUploadArea = document.getElementById('editUploadArea');
+    editUploadArea.addEventListener('dragover', (e) => { e.preventDefault(); editUploadArea.classList.add('dragover'); });
+    editUploadArea.addEventListener('dragleave', () => editUploadArea.classList.remove('dragover'));
+    editUploadArea.addEventListener('drop', (e) => {
+      e.preventDefault();
+      editUploadArea.classList.remove('dragover');
+      const file = e.dataTransfer.files[0];
+      if (file && (file.type === 'image/jpeg' || file.type === 'image/png')) {
+        editSelectedFile = file;
+        document.getElementById('editFileInput').files = e.dataTransfer.files;
+        handleEditFileSelect({ target: { files: [file] } });
+      }
+    });
+
+    async function handleEdit(e) {
+      e.preventDefault();
+
+      const id = document.getElementById('editPersonId').value;
+      const name = document.getElementById('editPersonName').value.trim();
+      if (!name) { showToast('Please enter a name', 'error'); return; }
+
+      const formData = new FormData();
+      formData.append('name', name);
+      if (editSelectedFile) {
+        formData.append('image', editSelectedFile);
+      }
+
+      document.getElementById('editSubmitBtn').disabled = true;
+      document.getElementById('editSubmitBtn').textContent = 'Saving...';
+
+      try {
+        const res = await fetch(`/api/faces/${id}`, { method: 'PUT', body: formData });
+        const data = await res.json();
+
+        if (res.ok) {
+          showToast(`${name} updated successfully!`, 'success');
+          closeEditModal();
+          loadFaces();
+        } else {
+          showToast(data.error || 'Failed to update face', 'error');
+        }
+      } catch (e) {
+        showToast('Failed to update face', 'error');
+      }
+
+      document.getElementById('editSubmitBtn').disabled = false;
+      document.getElementById('editSubmitBtn').textContent = 'Save Changes';
+    }
+
+    function showToast(message, type) {
+      const toast = document.getElementById('toast');
+      toast.querySelector('.toast-icon').textContent = type === 'success' ? '✓' : '✕';
+      toast.querySelector('.toast-message').textContent = message;
+      toast.className = `toast ${type} show`;
+      setTimeout(() => toast.classList.remove('show'), 3000);
+    }
+
+    function formatDate(dateStr) {
+      const date = new Date(dateStr);
+      return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+    }
+
+    function escapeHtml(text) {
+      const div = document.createElement('div');
+      div.textContent = text;
+      return div.innerHTML;
+    }
+
+    loadFaces();
+  </script>
+</body>
+</html>

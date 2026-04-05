@@ -4,12 +4,16 @@ import net from "net";
 import { Readable } from "stream";
 import path from "path";
 import { fileURLToPath } from "url";
+import facesRouter from "./routes/faces.js";
 
 const PORT = process.env.PORT || 8080;
 const DASHBOARD_DIR = path.dirname(fileURLToPath(import.meta.url));
 const UI_DIR = process.env.UI_DIR || DASHBOARD_DIR;
 const LIVE_API = process.env.LIVE_API || "http://127.0.0.1:18791";
 const app = express();
+
+app.use(express.json());
+app.use("/api/faces", facesRouter);
 
 app.get("/api/events/stream", async (req, res) => {
   try {
@@ -54,6 +58,8 @@ app.all("/api/*", async (req, res) => {
 });
 
 app.use(express.static(UI_DIR));
+
+app.get("/faces", (req, res) => res.sendFile(path.join(UI_DIR, "faces.html")));
 
 app.get("/token", async (req, res) => {
   try {

@@ -4,7 +4,9 @@
   "type": "module",
   "private": true,
   "dependencies": {
+    "better-sqlite3": "^12.8.0",
     "express": "^4.19.2",
-    "http-proxy-middleware": "^3.0.5"
+    "http-proxy-middleware": "^3.0.5",
+    "multer": "^2.1.1"
   }
 }

@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>TacoClaw Live — Galaxy Engine</title>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Orbitron:wght@400;500;600;700;800;900&family=Exo+2:wght@300;400;500;600;700&display=swap');
@@ -23,6 +23,7 @@
     --text-bright: #f8fafc;
     --laser-green: #00ff88;
     --laser-core: #ffffff;
+    --header-height: 70px;
   }
 
   * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -33,6 +34,7 @@
     font-family: 'Exo 2', sans-serif;
     overflow: hidden;
     height: 100vh;
+    width: 100vw;
   }
 
   .galaxy-container {
@@ -154,6 +156,11 @@
     opacity: 0;
   }
 
+  @media (max-width: 768px) {
+    .win-banner { font-size: 24px; letter-spacing: 3px; }
+    .win-banner .pnl { font-size: 18px !important; }
+  }
+
   .win-banner.active {
     animation: bannerPop 1.8s cubic-bezier(0.16, 1, 0.3, 1) forwards;
   }
@@ -178,12 +185,16 @@
     top: 0;
     left: 0;
     right: 0;
-    z-index: 10;
+    z-index: 100;
     display: flex;
     align-items: center;
     justify-content: space-between;
     padding: 16px 24px;
     background: linear-gradient(180deg, rgba(6, 11, 24, 0.95), transparent);
+  }
+
+  @media (max-width: 768px) {
+    .header { padding: 10px 15px; }
   }
 
   .header-left {
@@ -204,14 +215,16 @@
     box-shadow: 0 0 20px rgba(0, 212, 255, 0.2);
   }
 
+  .logo-ring svg {
+    width: 24px;
+    height: 24px;
+    fill: var(--accent-cyan);
+    filter: drop-shadow(0 0 5px var(--accent-cyan));
+  }
+
   @keyframes logoSpin {
     from { transform: rotate(0deg); }
     to { transform: rotate(360deg); }
-  }
-
-  .logo-ring span {
-    font-size: 20px;
-    animation: logoSpin 20s linear infinite reverse;
   }
 
   .brand h1 {
@@ -232,10 +245,21 @@
     text-transform: uppercase;
   }
 
+  @media (max-width: 480px) {
+    .brand h1 { font-size: 14px; letter-spacing: 1px; }
+    .brand .subtitle { font-size: 7px; letter-spacing: 2px; }
+    .logo-ring { width: 32px; height: 32px; }
+  }
+
   .header-nav {
     display: flex;
     gap: 8px;
     align-items: center;
+  }
+
+  @media (max-width: 768px) {
+    .header-nav .nav-btn, .header-nav .shell-btn { display: none; }
+    .header-nav .nav-btn.active { display: block; }
   }
 
   .nav-btn,
@@ -273,6 +297,15 @@
     border: 1px solid rgba(251, 191, 36, 0.2);
     border-radius: 6px;
     background: rgba(251, 191, 36, 0.05);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .temp-badge svg {
+    width: 12px;
+    height: 12px;
+    fill: var(--accent-gold);
   }
 
   .shell-btn {
@@ -289,6 +322,7 @@
     box-shadow: 0 0 20px rgba(0, 212, 255, 0.3);
   }
 
+  /* Main Layout Panels */
   .engine-panel {
     position: absolute;
     top: 80px;
@@ -301,6 +335,14 @@
     overflow: hidden;
     background: rgba(10, 17, 40, 0.3);
     backdrop-filter: blur(4px);
+  }
+
+  @media (max-width: 1024px) {
+    .engine-panel { right: 20px; bottom: 45%; }
+  }
+
+  @media (max-width: 768px) {
+    .engine-panel { top: 70px; left: 10px; right: 10px; bottom: 55%; }
   }
 
   .engine-panel-header {
@@ -348,14 +390,31 @@
 
   .taco-sprite {
     position: absolute;
-    z-index: 7;
-    font-size: 52px;
-    transition: transform 0.1s, left 0.25s ease-out, top 0.25s ease-out;
+    z-index: 100;
+    transition: left 1.2s cubic-bezier(0.34, 1.56, 0.64, 1), 
+                top 1.2s cubic-bezier(0.34, 1.56, 0.64, 1), 
+                transform 0.3s ease-out;
     filter: drop-shadow(0 0 15px rgba(251, 191, 36, 0.3));
     cursor: pointer;
     user-select: none;
     left: 6%;
     top: 50%;
+  }
+
+  .taco-sprite svg {
+    width: 52px;
+    height: 52px;
+    filter: drop-shadow(0 0 15px rgba(251, 191, 36, 0.5));
+  }
+
+  .taco-sprite.striking {
+    transition: left 0.4s cubic-bezier(0.17, 0.67, 0.83, 0.67), 
+                top 0.4s cubic-bezier(0.17, 0.67, 0.83, 0.67);
+    z-index: 150;
+  }
+
+  @media (max-width: 768px) {
+    .taco-sprite svg { width: 40px; height: 40px; }
   }
 
   .taco-sprite.charging {
@@ -367,9 +426,9 @@
   }
 
   @keyframes tacoCharge {
-    0% { transform: scale(1); filter: drop-shadow(0 0 15px rgba(251, 191, 36, 0.3)); }
-    50% { transform: scale(1.2); filter: drop-shadow(0 0 30px rgba(0, 255, 136, 0.8)); }
-    100% { transform: scale(1.1); filter: drop-shadow(0 0 40px rgba(0, 255, 136, 1)); }
+    0% { transform: scale(1); }
+    50% { transform: scale(1.2); }
+    100% { transform: scale(1.1); }
   }
 
   @keyframes tacoRecoil {
@@ -426,17 +485,58 @@
     position: absolute;
     z-index: 3;
     pointer-events: none;
-    right: 15%;
-    top: 20%;
+    transition: transform 2s ease-in-out, left 2s ease-in-out, top 2s ease-in-out;
   }
 
   .planet-body {
-    width: 40px;
-    height: 40px;
+    width: 100%;
+    height: 100%;
     border-radius: 50%;
-    background: radial-gradient(circle at 35% 35%, #a78bfa, #7c3aed, #4c1d95);
-    box-shadow: 0 0 25px rgba(167, 139, 250, 0.2), inset -6px -6px 15px rgba(0,0,0,0.4);
-    animation: planetBob 8s ease-in-out infinite;
+    box-shadow: inset -6px -6px 15px rgba(0,0,0,0.4);
+    position: relative;
+  }
+
+  .planet.btc .planet-body { background: radial-gradient(circle at 35% 35%, #fbbf24, #d97706, #92400e); box-shadow: 0 0 40px rgba(251, 191, 36, 0.2); }
+  .planet.eth .planet-body { background: radial-gradient(circle at 35% 35%, #60a5fa, #2563eb, #1e3a8a); box-shadow: 0 0 40px rgba(37, 99, 235, 0.2); }
+  .planet.sol .planet-body { background: radial-gradient(circle at 35% 35%, #a855f7, #7c3aed, #4c1d95); box-shadow: 0 0 40px rgba(124, 58, 237, 0.2); }
+  .planet.xrp .planet-body { background: radial-gradient(circle at 35% 35%, #94a3b8, #475569, #1e293b); box-shadow: 0 0 40px rgba(148, 163, 184, 0.2); }
+
+  .planet-icon {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    width: 55%;
+    height: 55%;
+    opacity: 1;
+    pointer-events: none;
+    filter: drop-shadow(0 0 10px rgba(255,255,255,0.4));
+    z-index: 10;
+    object-fit: contain;
+  }
+
+  .planet-ring {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: 140%;
+    height: 140%;
+    transform: translate(-50%, -50%) rotateX(75deg);
+    border: 2px solid rgba(255, 255, 255, 0.1);
+    border-radius: 50%;
+    pointer-events: none;
+  }
+
+  .planet-label {
+    position: absolute;
+    top: -20px;
+    left: 50%;
+    transform: translateX(-50%);
+    font-family: 'Orbitron', sans-serif;
+    font-size: 8px;
+    color: var(--text-dim);
+    letter-spacing: 1px;
+    white-space: nowrap;
   }
 
   @keyframes planetBob {
@@ -455,6 +555,20 @@
     gap: 12px;
   }
 
+  @media (max-width: 1024px) {
+    .stats-bar { right: 20px; bottom: 33%; }
+  }
+
+  @media (max-width: 768px) {
+    .stats-bar {
+      grid-template-columns: repeat(2, 1fr);
+      left: 10px;
+      right: 10px;
+      bottom: 40%;
+      gap: 8px;
+    }
+  }
+
   .stat-card {
     background: rgba(13, 26, 51, 0.8);
     border: 1px solid var(--border-glow);
@@ -463,6 +577,10 @@
     backdrop-filter: blur(10px);
     transition: all 0.3s;
     position: relative;
+  }
+
+  @media (max-width: 768px) {
+    .stat-card { padding: 10px 12px; }
   }
 
   .stat-card:hover {
@@ -490,6 +608,11 @@
   .stat-value.streak { font-size: 28px; color: var(--accent-gold); }
   .stat-value.uptime { font-size: 22px; color: var(--accent-cyan); }
 
+  @media (max-width: 768px) {
+    .stat-value.money, .stat-value.percent, .stat-value.streak { font-size: 20px; }
+    .stat-value.uptime { font-size: 16px; }
+  }
+
   .kill-counter {
     position: absolute;
     bottom: 4px;
@@ -514,12 +637,24 @@
     overflow: hidden;
   }
 
+  @media (max-width: 1024px) {
+    .positions-panel { right: 20px; bottom: 10px; height: 30%; }
+  }
+
+  @media (max-width: 768px) {
+    .positions-panel { left: 10px; right: 10px; bottom: 10px; height: 38%; }
+  }
+
   .positions-header {
     display: flex;
     justify-content: space-between;
     align-items: center;
     padding: 12px 20px;
     border-bottom: 1px solid rgba(255,255,255,0.04);
+  }
+
+  @media (max-width: 768px) {
+    .positions-header { padding: 8px 12px; }
   }
 
   .positions-title {
@@ -539,6 +674,11 @@
     color: var(--accent-cyan);
   }
 
+  #positionsList {
+    height: calc(100% - 40px);
+    overflow-y: auto;
+  }
+
   .position-row {
     display: flex;
     justify-content: space-between;
@@ -549,6 +689,10 @@
     gap: 12px;
   }
 
+  @media (max-width: 768px) {
+    .position-row { padding: 8px 12px; font-size: 10px; }
+  }
+
   .position-row:hover { background: rgba(255,255,255,0.02); }
 
   .position-name {
@@ -556,6 +700,9 @@
     font-size: 11px;
     color: var(--text-primary);
     flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .position-price {
@@ -588,6 +735,22 @@
     display: flex;
     flex-direction: column;
     overflow: hidden;
+    transition: transform 0.3s ease;
+  }
+
+  @media (max-width: 1024px) {
+    .event-feed {
+      transform: translateX(110%);
+    }
+    .event-feed.mobile-open {
+      transform: translateX(0);
+      right: 10px;
+      left: 10px;
+      width: auto;
+      top: 70px;
+      bottom: 10px;
+      z-index: 200;
+    }
   }
 
   .feed-header {
@@ -718,6 +881,30 @@
       rgba(0, 0, 0, 0.03) 4px
     );
   }
+
+  /* Mobile Toggle */
+  .mobile-toggle {
+    display: none;
+    position: fixed;
+    bottom: 20px;
+    right: 20px;
+    width: 50px;
+    height: 50px;
+    border-radius: 50%;
+    background: var(--accent-purple);
+    color: white;
+    border: none;
+    z-index: 300;
+    font-size: 24px;
+    box-shadow: 0 0 20px rgba(168, 85, 247, 0.4);
+    cursor: pointer;
+    align-items: center;
+    justify-content: center;
+  }
+
+  @media (max-width: 1024px) {
+    .mobile-toggle { display: flex; }
+  }
 </style>
 </head>
 <body>
@@ -737,13 +924,15 @@
 
   <div class="win-flash" id="winFlash"></div>
   <div class="win-banner" id="winBanner">
-    🌮 WIN TRADE 🌮
+    TACO WIN TRADE
     <span class="pnl" id="winPnl">+$0.00</span>
   </div>
 
   <div class="header">
     <div class="header-left">
-      <div class="logo-ring"><span>🌮</span></div>
+      <div class="logo-ring" id="mainLogo">
+        <svg viewBox="0 0 512 512"><path d="M464 256c0-114.87-93.13-208-208-208S48 141.13 48 256s93.13 208 208 208 208-93.13 208-208zm-208 160c-88.22 0-160-71.78-160-160s71.78-160 160-160 160 71.78 160 160-71.78 160-160 160z"/><path d="M256 160c-52.93 0-96 43.07-96 96s43.07 96 96 96 96-43.07 96-96-43.07-96-96-96z"/></svg>
+      </div>
       <div class="brand">
         <h1>TACOCLAW LIVE</h1>
         <div class="subtitle">Real-Time Trading Activity</div>
@@ -753,7 +942,10 @@
       <a class="nav-btn active" href="/">Live Dashboard</a>
       <a class="nav-btn" href="http://192.168.40.209:7681/" target="_blank" rel="noreferrer">Terminal</a>
       <a class="nav-btn" href="/system" target="_blank" rel="noreferrer">Health</a>
-      <div class="temp-badge" id="tempBadge">🌡 --.-°C</div>
+      <div class="temp-badge" id="tempBadge">
+        <svg viewBox="0 0 320 512"><path d="M160 64c-26.5 0-48 21.5-48 48v153.1c-20.3 13.1-32 35.8-32 58.9 0 39.8 32.2 72 72 72s72-32.2 72-72c0-23.1-11.7-45.8-32-58.9V112c0-26.5-21.5-48-48-48z"/></svg>
+        <span>--.-°C</span>
+      </div>
       <a class="shell-btn" href="http://192.168.40.209:7681/" target="_blank" rel="noreferrer">SHELL</a>
     </div>
   </div>
@@ -767,8 +959,10 @@
       </div>
     </div>
 
-    <div class="taco-sprite" id="tacoSprite">🌮</div>
-    <div class="planet"><div class="planet-body"></div></div>
+    <div class="taco-sprite" id="tacoSprite">
+      <svg viewBox="0 0 512 512"><path fill="#fbbf24" d="M464 256c0-114.87-93.13-208-208-208S48 141.13 48 256s93.13 208 208 208 208-93.13 208-208zm-208 160c-88.22 0-160-71.78-160-160s71.78-160 160-160 160 71.78 160 160-71.78 160-160 160z"/><circle cx="256" cy="256" r="64" fill="#ef4444"/></svg>
+    </div>
+    <div id="planetsContainer"></div>
     <div class="log-entries" id="logEntries"></div>
   </div>
 
@@ -800,13 +994,16 @@
     <div id="positionsList"></div>
   </div>
 
-  <div class="event-feed">
+  <div class="event-feed" id="eventFeed">
     <div class="feed-header">
       <div class="feed-title">LIVE EVENT FEED</div>
       <div class="feed-badge">REALTIME_SSE</div>
+      <button id="closeFeed" style="display:none; background:none; border:none; color:white; font-size:20px; cursor:pointer;">×</button>
     </div>
     <div class="feed-scroll" id="feedScroll"></div>
   </div>
+
+  <button class="mobile-toggle" id="mobileToggle">📡</button>
 </div>
 
 <script>
@@ -823,6 +1020,9 @@ const killCounterEl = document.getElementById('killCounter');
 const logContainer = document.getElementById('logEntries');
 const feedScroll = document.getElementById('feedScroll');
 const positionsList = document.getElementById('positionsList');
+const eventFeed = document.getElementById('eventFeed');
+const mobileToggle = document.getElementById('mobileToggle');
+const closeFeed = document.getElementById('closeFeed');
 const seenEvents = new Set();
 
 let W;
@@ -837,9 +1037,24 @@ function resize() {
   H = canvas.height = window.innerHeight;
   laserCanvas.width = W;
   laserCanvas.height = H;
+  
+  if (W <= 1024) {
+    closeFeed.style.display = 'block';
+  } else {
+    closeFeed.style.display = 'none';
+    eventFeed.classList.remove('mobile-open');
+  }
 }
 resize();
 window.addEventListener('resize', resize);
+
+// Mobile Toggle Support
+mobileToggle.addEventListener('click', () => {
+  eventFeed.classList.add('mobile-open');
+});
+closeFeed.addEventListener('click', () => {
+  eventFeed.classList.remove('mobile-open');
+});
 
 class Star {
   constructor(layer) {
@@ -1026,11 +1241,54 @@ class Particle {
   }
 }
 
+class Planet {
+  constructor(type, label, iconUrl) {
+    this.type = type;
+    this.label = label;
+    this.iconUrl = iconUrl;
+    this.el = document.createElement('div');
+    this.el.className = `planet ${type}`;
+    this.el.innerHTML = `
+      <div class="planet-body">
+        <div class="planet-ring"></div>
+        <div class="planet-label">${label}</div>
+        <img src="${iconUrl}" class="planet-icon" alt="${label}" onerror="this.src='https://cdn.jsdelivr.net/gh/spothq/cryptocurrency-icons@master/svg/color/${type}.svg'; this.onerror=null;" />
+      </div>
+    `;
+    const size = 30 + Math.random() * 40;
+    this.el.style.width = `${size}px`;
+    this.el.style.height = `${size}px`;
+    document.getElementById('planetsContainer').appendChild(this.el);
+    this.randomize();
+  }
+  randomize() {
+    const panel = document.getElementById('enginePanel').getBoundingClientRect();
+    const x = 50 + Math.random() * (panel.width - 150);
+    const y = 50 + Math.random() * (panel.height - 150);
+    this.el.style.left = `${x}px`;
+    this.el.style.top = `${y}px`;
+    this.el.style.transform = `scale(${0.8 + Math.random() * 0.4})`;
+  }
+}
+
 const stars = [];
 for (let i = 0; i < 180; i++) stars.push(new Star(0));
 for (let i = 0; i < 60; i++) stars.push(new Star(1));
 for (let i = 0; i < 25; i++) stars.push(new Star(2));
 const shootingStars = Array.from({ length: 3 }, () => new ShootingStar());
+
+const planets = [
+  new Planet('btc', 'BITCOIN', 'https://cdn.jsdelivr.net/gh/spothq/cryptocurrency-icons@master/svg/color/btc.svg'),
+  new Planet('eth', 'ETHEREUM', 'https://cdn.jsdelivr.net/gh/spothq/cryptocurrency-icons@master/svg/color/eth.svg'),
+  new Planet('sol', 'SOLANA', 'https://cdn.jsdelivr.net/gh/spothq/cryptocurrency-icons@master/svg/color/sol.svg'),
+  new Planet('xrp', 'RIPPLE', 'https://cdn.jsdelivr.net/gh/spothq/cryptocurrency-icons@master/svg/color/xrp.svg')
+];
+
+setInterval(() => {
+  planets.forEach(p => {
+    if (Math.random() < 0.3) p.randomize();
+  });
+}, 5000);
 
 setInterval(() => {
   const s = shootingStars.find((star) => !star.active);
@@ -1048,16 +1306,40 @@ function impactPoint() {
   return { targetX, targetY };
 }
 
-function moveTaco(yRatio) {
-  const top = Math.max(100, Math.min(window.innerHeight - 320, window.innerHeight * yRatio));
+function moveTaco(xRatio, yRatio) {
+  const panel = document.getElementById('enginePanel').getBoundingClientRect();
+  const left = 20 + (panel.width - 100) * (xRatio || 0.1);
+  const top = 60 + (panel.height - 100) * (yRatio || 0.5);
+  tacoSprite.style.left = `${left}px`;
   tacoSprite.style.top = `${top}px`;
 }
 
-function fireLaser(pnlText) {
+async function strikeTarget(pnlText) {
+  const { targetX, targetY } = impactPoint();
+  const panel = document.getElementById('enginePanel').getBoundingClientRect();
+  
+  // Fly closer to strike
+  tacoSprite.classList.add('striking');
+  tacoSprite.style.left = `${targetX - panel.left - 150}px`;
+  tacoSprite.style.top = `${targetY - panel.top - 20}px`;
+  tacoSprite.style.transform = 'rotate(15deg) scale(1.3)';
+
+  setTimeout(() => {
+    fireLaser(pnlText, targetX, targetY);
+    setTimeout(() => {
+      tacoSprite.classList.remove('striking');
+      tacoSprite.style.transform = 'rotate(0deg) scale(1)';
+      moveTaco(0.1, 0.4 + Math.random() * 0.2);
+    }, 800);
+  }, 400);
+}
+
+function fireLaser(pnlText, tX, tY) {
   const rect = tacoSprite.getBoundingClientRect();
   const startX = rect.right;
   const startY = rect.top + rect.height / 2;
-  const { targetX, targetY } = impactPoint();
+  const targetX = tX || impactPoint().targetX;
+  const targetY = tY || impactPoint().targetY;
 
   tacoSprite.classList.add('charging');
   setTimeout(() => {
@@ -1074,7 +1356,7 @@ function fireLaser(pnlText) {
     laserKills++;
     killCounterEl.textContent = `LASERS: ${laserKills}`;
     setTimeout(() => tacoSprite.classList.remove('firing'), 150);
-  }, 300);
+  }, 100);
 }
 
 function animate() {
@@ -1136,9 +1418,10 @@ function processEvent(ev) {
   renderFeed(ev);
 
   if (ev.event_type === 'win' || ev.event_type === 'fill_verified' || ev.event_type === 'redeem') {
-    fireLaser(ev.pnl_text || ev.pnl_display || (ev.pnl_absolute !== undefined ? `${Number(ev.pnl_absolute) >= 0 ? '+' : ''}$${Math.abs(Number(ev.pnl_absolute)).toFixed(2)}` : '+$WIN'));
+    const pnl = ev.pnl_text || ev.pnl_display || (ev.pnl_absolute !== undefined ? `${Number(ev.pnl_absolute) >= 0 ? '+' : ''}$${Math.abs(Number(ev.pnl_absolute)).toFixed(2)}` : '+$WIN');
+    strikeTarget(pnl);
   } else if (ev.event_type === 'skip') {
-    moveTaco(0.45 + Math.random() * 0.2);
+    moveTaco(0.1 + Math.random() * 0.1, 0.2 + Math.random() * 0.6);
   } else if (ev.event_type === 'loss') {
     galaxyContainer.classList.add('screen-shake');
     setTimeout(() => galaxyContainer.classList.remove('screen-shake'), 250);
@@ -1149,7 +1432,7 @@ function renderPositions(positions) {
   positionsList.innerHTML = '';
   const rows = Array.isArray(positions) ? positions : [];
   document.getElementById('positionsCount').textContent = `${rows.length} LOCKED`;
-  for (const p of rows.slice(0, 6)) {
+  for (const p of rows) {
     const pnl = Number(p.unrealized_pnl || 0);
     const row = document.createElement('div');
     row.className = 'position-row';
@@ -1176,7 +1459,7 @@ async function updateStats() {
     document.getElementById('streak').textContent = report.streak || extended.streak || '0';
     document.getElementById('uptime').textContent = system.uptime || '--';
     if (system.cpu_temp_c !== undefined && system.cpu_temp_c !== null) {
-      document.getElementById('tempBadge').textContent = `🌡 ${Number(system.cpu_temp_c).toFixed(1)}°C`;
+      document.getElementById('tempBadge').innerHTML = `<svg viewBox="0 0 320 512" style="width:12px; height:12px; fill:var(--accent-gold);"><path d="M160 64c-26.5 0-48 21.5-48 48v153.1c-20.3 13.1-32 35.8-32 58.9 0 39.8 32.2 72 72 72s72-32.2 72-72c0-23.1-11.7-45.8-32-58.9V112c0-26.5-21.5-48-48-48z"/></svg> <span>${Number(system.cpu_temp_c).toFixed(1)}°C</span>`;
     }
     renderPositions(summary.positions || []);
     if (Array.isArray(summary.event_history) && feedScroll.children.length === 0) {
@@ -1206,7 +1489,7 @@ function connectEvents() {
   };
 }
 
-tacoSprite.addEventListener('click', () => fireLaser('+$🌮'));
+tacoSprite.addEventListener('click', () => strikeTarget('+$🌮'));
 
 updateStats();
 setInterval(updateStats, 5000);
