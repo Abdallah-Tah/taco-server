@@ -36,10 +36,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
+from journal import journal_close as shared_journal_close
+from journal import journal_open as shared_journal_open
+from journal import open_journal
 
 # ── Paths & creds ──────────────────────────────────────────────────────────────
 WORK_DIR      = Path("/home/abdaltm86/.openclaw/workspace/trading")
 JOURNAL_DB    = WORK_DIR / "journal.db"
+SHARED_JOURNAL_DB = Path(os.environ.get("ETH15M_JOURNAL_DB", str(WORK_DIR / "eth15m_journal.db")))
 CREDS_FILE    = Path("/home/abdaltm86/.config/openclaw/secrets.env")
 POSITIONS_F  = WORK_DIR / ".poly_eth15m_positions.json"
 STATE_F       = WORK_DIR / ".poly_eth15m_state.json"
@@ -69,11 +73,16 @@ def _int(key, default):
     except Exception:
         return int(default)
 
+
+def _bool(key, default):
+    return str(os.environ.get(key, ENV.get(key, str(default)))).lower() in ("1", "true", "yes", "on")
+
 TELEGRAM_TOKEN = ENV.get("TELEGRAM_TOKEN", "8457917317:AAHGueV-SogZl14cW5uMmIACpaWuyzByXOo")
 CHAT_ID        = ENV.get("CHAT_ID",        "7520899464")
 POLY_WALLET    = ENV.get("POLY_WALLET",    "0x1a4c163a134D7154ebD5f7359919F9c439424f00")
 VENV_PY        = Path("/home/abdaltm86/.openclaw/workspace/trading/.polymarket-venv/bin/python3")
 DRY_RUN        = os.environ.get("ETH15M_DRY_RUN", ENV.get("ETH15M_DRY_RUN", "true")).lower() != "false"
+USE_SHARED_JOURNAL = _bool("ETH15M_SHARED_JOURNAL", False)
 MAKER_ENABLED  = os.environ.get("ETH15M_MAKER_ENABLED", ENV.get("ETH15M_MAKER_ENABLED", "false")).lower() == "true"
 MAKER_DRY_RUN  = os.environ.get("ETH15M_MAKER_DRY_RUN", ENV.get("ETH15M_MAKER_DRY_RUN", "true")).lower() != "false"
 MAKER_START_SEC = _int("ETH15M_MAKER_START_SEC", 540)
@@ -86,6 +95,7 @@ MAKER_MIN_PRICE = _float("ETH15M_MAKER_MIN_PRICE", 0.38)
 MAKER_FOK_FALLBACK_SEC = _int("ETH15M_MAKER_FOK_FALLBACK_SEC", 60)
 # FIX #5: Allow retry after cancellation if >N seconds remain
 MAKER_RETRY_MIN_SEC = _int("ETH15M_MAKER_RETRY_MIN_SEC", 45)
+MAKER_MAX_RETRIES = _int("ETH15M_MAKER_MAX_RETRIES", 1)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 WINDOW_SEC      = _int("ETH15M_WINDOW_SEC", 900)          # 15 minutes
@@ -104,6 +114,11 @@ SNIPE_MAX_PRICE = _float("ETH15M_SIGNAL_MAX_ENTRY_PRICE", _float("ETH15M_SNIPE_M
 SNIPE_DEFAULT   = _float("ETH15M_SNIPE_DEFAULT_SIZE", 5.00)
 SNIPE_STRONG    = _float("ETH15M_SNIPE_STRONG_SIZE", 7.50)
 SNIPE_STRONG_D  = _float("ETH15M_SNIPE_STRONG_DELTA", 0.10)  # percent
+ROLLING_RISK_ENABLED = _bool("ETH15M_ROLLING_RISK_ENABLED", True)
+ROLLING_RISK_LOOKBACK = _int("ETH15M_ROLLING_RISK_LOOKBACK", 20)
+ROLLING_RISK_MIN_SAMPLE = _int("ETH15M_ROLLING_RISK_MIN_SAMPLE", 10)
+ROLLING_RISK_MULTIPLIER = _float("ETH15M_ROLLING_RISK_MULTIPLIER", 0.60)
+ROLLING_RISK_REFRESH_SEC = _int("ETH15M_ROLLING_RISK_REFRESH_SEC", 120)
 SNIPE_WINDOW    = _int("ETH15M_SNIPE_WINDOW_SEC", 45)
 MIN_ENTRY_SEC   = _int("ETH15M_MIN_ENTRY_SEC", 8)
 LATE_REVERSAL_SEC = _int("ETH15M_LATE_REVERSAL_SEC", 45)
@@ -143,6 +158,11 @@ _state = {
     "maker_seen_fills": [],
     "maker_attempt_count": 0,
     "maker_placed_ts":  0,
+    "maker_book_bid":   None,
+    "maker_book_ask":   None,
+    "maker_book_spread": None,
+    "maker_book_tick":  0.01,
+    "maker_distance_to_ask": None,
     "diag_orders_placed": 0,
     "diag_orders_filled": 0,
     "diag_orders_cancelled": 0,
@@ -158,10 +178,21 @@ def log(msg):
     with open(LOG_F, "a") as f:
         f.write(line + "\n")
 
+
+def safe_log(msg):
+    try:
+        log(msg)
+    except Exception:
+        print(msg, flush=True)
+
 def tg(msg):
     if DRY_RUN:
         return
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        log("[TG-SKIP] Missing TELEGRAM_TOKEN or CHAT_ID")
+        return
     log(f"[TG] Sending: {msg}")
+    is_maker_msg = msg.startswith("[ETH-MAKER]")
     def _send():
         try:
             r = requests.post(
@@ -171,9 +202,11 @@ def tg(msg):
             )
             if r.status_code != 200:
                 log(f"[TG-ERR] code={r.status_code} response={r.text}")
+            elif is_maker_msg:
+                log("[TG] Delivered maker alert")
         except Exception as e:
             log(f"[TG-ERR] {e}")
-    threading.Thread(target=_send, daemon=True).start()
+    threading.Thread(target=_send, daemon=not is_maker_msg).start()
 
 
 def notify_recent_resolutions():
@@ -285,6 +318,11 @@ def load_state():
     _state.setdefault('cooldown_until', 0)
     _state.setdefault('maker_attempt_count', 0)
     _state.setdefault('maker_placed_ts', 0)
+    _state.setdefault('maker_book_bid', None)
+    _state.setdefault('maker_book_ask', None)
+    _state.setdefault('maker_book_spread', None)
+    _state.setdefault('maker_book_tick', 0.01)
+    _state.setdefault('maker_distance_to_ask', None)
     _state.setdefault('arb_logged', False)
     _state.setdefault('diag_orders_placed', 0)
     _state.setdefault('diag_orders_filled', 0)
@@ -453,6 +491,10 @@ def write_edge_event(
     shadow_decision: str = "",
     shadow_skip_reason: str = "",
     actual_fill_price: float | None = None,
+    best_bid: float | None = None,
+    best_ask: float | None = None,
+    spread: float | None = None,
+    midprice: float | None = None,
 ):
     try:
         conn = sqlite3.connect(str(JOURNAL_DB))
@@ -461,10 +503,11 @@ def write_edge_event(
             """
             INSERT INTO edge_events (
                 id, engine, asset, timestamp_et, market_slug, market_id, side, signal_type,
-                seconds_remaining, model_p_yes, model_p_no, regime_ok, skip_reason,
+                seconds_remaining, best_bid, best_ask, spread, midprice,
+                model_p_yes, model_p_no, regime_ok, skip_reason,
                 intended_entry_price, actual_fill_price, slippage, decision, shadow_decision,
                 shadow_skip_reason, execution_status, regime
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 _edge_event_id(signal_type, side, seconds_remaining),
@@ -476,6 +519,10 @@ def write_edge_event(
                 side,
                 signal_type,
                 seconds_remaining,
+                best_bid,
+                best_ask,
+                spread,
+                midprice,
                 float(market.get("yes_price") or 0.0),
                 float(market.get("no_price") or 0.0),
                 1,
@@ -524,14 +571,52 @@ def set_shadow_state_eth(price: float, context: str):
     log(f"[ETH-SHADOW] {decision} context={context} bucket={bucket} price={price:.4f} expected_pnl=NA reason={reason}")
 
 
-def log_trade(engine, direction, size_usd, entry_price, pnl, exit_type, hold_sec, notes="", sec_remaining=None, price_bucket=None):
-    import sqlite3
+def shadow_live_gate_eth(price: float, context: str) -> bool:
+    set_shadow_state_eth(price, context=context)
+    return _state.get('shadow_decision') == 'kept'
+
+
+def get_book_metrics(token_id, submitted_price):
+    """Best-effort orderbook snapshot for ETH maker/fallback decisions."""
     try:
-        conn = sqlite3.connect(str(JOURNAL_DB))
-        c = conn.cursor()
+        r = requests.get(
+            "https://clob.polymarket.com/book",
+            params={"token_id": token_id},
+            timeout=10,
+        )
+        r.raise_for_status()
+        ob = r.json() or {}
+        bids = [float(x.get("price", 0) or 0) for x in (ob.get("bids") or []) if float(x.get("price", 0) or 0) > 0]
+        asks = [float(x.get("price", 0) or 0) for x in (ob.get("asks") or []) if float(x.get("price", 0) or 0) > 0]
+        best_bid = max(bids) if bids else None
+        best_ask = min(asks) if asks else None
+        tick = float(ob.get("tick_size") or 0.01)
+        spread = round(best_ask - best_bid, 4) if best_bid is not None and best_ask is not None else None
+        distance_to_ask = round(best_ask - submitted_price, 4) if best_ask is not None else None
+        return {
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "tick": tick,
+            "spread": spread,
+            "distance_to_ask": distance_to_ask,
+        }
+    except Exception as e:
+        return {
+            "best_bid": None,
+            "best_ask": None,
+            "tick": 0.01,
+            "spread": None,
+            "distance_to_ask": None,
+            "error": str(e),
+        }
+
+
+def log_trade(engine, direction, size_usd, entry_price, pnl, exit_type, hold_sec, notes="", sec_remaining=None, price_bucket=None):
+    try:
         timestamp_open = _current_window_open_iso()
         is_resolved = exit_type == "resolved"
         asset = _current_trade_slug()
+        trade_id = _current_trade_id(direction)
         
         full_notes = notes
         if sec_remaining is not None:
@@ -540,41 +625,216 @@ def log_trade(engine, direction, size_usd, entry_price, pnl, exit_type, hold_sec
             full_notes = f"{full_notes} price_bucket={price_bucket}"
         if _state.get('shadow_decision'):
             full_notes = f"{full_notes} shadow={_state.get('shadow_decision')} shadow_bucket={_state.get('shadow_bucket')} shadow_price={_state.get('shadow_price')} shadow_reason={_state.get('shadow_reason')}"
-        
-        c.execute("""
-            INSERT INTO trades (
-                engine, timestamp_open, timestamp_close, asset,
-                category, direction, entry_price, exit_price,
-                position_size, position_size_usd, pnl_absolute, pnl_percent,
-                exit_type, hold_duration_seconds, regime, notes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(engine, asset, timestamp_open) DO UPDATE SET
-                timestamp_close=excluded.timestamp_close,
-                entry_price=excluded.entry_price,
-                exit_price=excluded.exit_price,
-                position_size=excluded.position_size,
-                position_size_usd=excluded.position_size_usd,
-                pnl_absolute=excluded.pnl_absolute,
-                pnl_percent=excluded.pnl_percent,
-                exit_type=excluded.exit_type,
-                hold_duration_seconds=excluded.hold_duration_seconds,
-                regime=excluded.regime,
-                notes=excluded.notes
-        """, (
-            engine, timestamp_open,
-            datetime.now(timezone.utc).isoformat() if is_resolved else None,
+
+        if USE_SHARED_JOURNAL:
+            conn = open_journal(SHARED_JOURNAL_DB, "eth15m")
+            try:
+                if is_resolved:
+                    shared_journal_close(
+                        conn,
+                        trade_id=trade_id,
+                        exit_price=entry_price,
+                        pnl_absolute=pnl or 0.0,
+                        pnl_percent=(pnl / size_usd * 100) if size_usd else 0.0,
+                        exit_type=exit_type,
+                        hold_duration_seconds=hold_sec or 0,
+                        timestamp_close=datetime.now(timezone.utc).isoformat(),
+                        notes=full_notes,
+                    )
+                else:
+                    shared_journal_open(
+                        conn,
+                        trade_id=trade_id,
+                        engine=engine,
+                        asset=asset,
+                        category="eth-updown",
+                        direction=direction,
+                        entry_price=entry_price,
+                        position_size=size_usd / entry_price if entry_price else 0,
+                        position_size_usd=size_usd,
+                        regime="normal",
+                        notes=full_notes,
+                        timestamp_open=timestamp_open,
+                    )
+            finally:
+                conn.close()
+            return
+
+        import sqlite3
+        conn = sqlite3.connect(str(JOURNAL_DB))
+        conn.execute("PRAGMA busy_timeout = 5000")
+        c = conn.cursor()
+        close_ts = datetime.now(timezone.utc).isoformat() if is_resolved else None
+        base_params = (
+            engine,
+            timestamp_open,
+            close_ts,
             asset,
             "eth-updown",
-            direction, entry_price, entry_price if is_resolved else None,
+            direction,
+            entry_price,
+            entry_price if is_resolved else None,
             size_usd / entry_price if entry_price else 0,
-            size_usd, pnl or 0.0, (pnl/size_usd*100) if size_usd else 0,
-            exit_type or "open", hold_sec or 0,
-            "normal", full_notes
-        ))
+            size_usd,
+            pnl or 0.0,
+            (pnl / size_usd * 100) if size_usd else 0,
+            exit_type or "open",
+            hold_sec or 0,
+            "normal",
+            full_notes,
+        )
+
+        if is_resolved:
+            c.execute(
+                """
+                SELECT rowid
+                FROM trades
+                WHERE engine=? AND asset=? AND timestamp_open=? AND direction=?
+                ORDER BY rowid DESC
+                LIMIT 1
+                """,
+                (engine, asset, timestamp_open, direction),
+            )
+            existing = c.fetchone()
+            if existing:
+                c.execute(
+                    """
+                    UPDATE trades
+                    SET timestamp_close=?, entry_price=?, exit_price=?, position_size=?, position_size_usd=?,
+                        pnl_absolute=?, pnl_percent=?, exit_type=?, hold_duration_seconds=?, regime=?, notes=?
+                    WHERE rowid=?
+                    """,
+                    (
+                        close_ts,
+                        entry_price,
+                        entry_price,
+                        size_usd / entry_price if entry_price else 0,
+                        size_usd,
+                        pnl or 0.0,
+                        (pnl / size_usd * 100) if size_usd else 0,
+                        exit_type or "open",
+                        hold_sec or 0,
+                        "normal",
+                        full_notes,
+                        existing[0],
+                    ),
+                )
+            else:
+                c.execute(
+                    """
+                    INSERT INTO trades (
+                        engine, timestamp_open, timestamp_close, asset,
+                        category, direction, entry_price, exit_price,
+                        position_size, position_size_usd, pnl_absolute, pnl_percent,
+                        exit_type, hold_duration_seconds, regime, notes
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    base_params,
+                )
+        else:
+            c.execute(
+                """
+                SELECT rowid
+                FROM trades
+                WHERE engine=? AND asset=? AND timestamp_open=? AND direction=? AND timestamp_close IS NULL
+                ORDER BY rowid DESC
+                LIMIT 1
+                """,
+                (engine, asset, timestamp_open, direction),
+            )
+            existing_open = c.fetchone()
+            if existing_open:
+                c.execute(
+                    """
+                    UPDATE trades
+                    SET entry_price=?, position_size=?, position_size_usd=?, pnl_absolute=?, pnl_percent=?,
+                        exit_type=?, hold_duration_seconds=?, regime=?, notes=?
+                    WHERE rowid=?
+                    """,
+                    (
+                        entry_price,
+                        size_usd / entry_price if entry_price else 0,
+                        size_usd,
+                        pnl or 0.0,
+                        (pnl / size_usd * 100) if size_usd else 0,
+                        exit_type or "open",
+                        hold_sec or 0,
+                        "normal",
+                        full_notes,
+                        existing_open[0],
+                    ),
+                )
+            else:
+                c.execute(
+                    """
+                    INSERT INTO trades (
+                        engine, timestamp_open, timestamp_close, asset,
+                        category, direction, entry_price, exit_price,
+                        position_size, position_size_usd, pnl_absolute, pnl_percent,
+                        exit_type, hold_duration_seconds, regime, notes
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    base_params,
+                )
         conn.commit()
         conn.close()
     except Exception as e:
         log(f"Journal error: {e}")
+
+
+def current_risk_multiplier():
+    if not ROLLING_RISK_ENABLED:
+        return 1.0
+    now = time.time()
+    last_ts = float(_state.get("risk_last_check_ts", 0) or 0)
+    cached = float(_state.get("risk_multiplier", 1.0) or 1.0)
+    if now - last_ts < ROLLING_RISK_REFRESH_SEC:
+        return cached
+    try:
+        conn = sqlite3.connect(str(JOURNAL_DB))
+        c = conn.cursor()
+        c.execute(
+            """
+            WITH ranked AS (
+                SELECT
+                    pnl_absolute,
+                    timestamp_close,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY engine, asset, timestamp_open, direction
+                        ORDER BY rowid DESC
+                    ) AS rn
+                FROM trades
+                WHERE engine='eth15m' AND exit_type='resolved' AND timestamp_close IS NOT NULL
+            ),
+            dedup AS (
+                SELECT pnl_absolute, timestamp_close
+                FROM ranked
+                WHERE rn=1
+                ORDER BY timestamp_close DESC
+                LIMIT ?
+            )
+            SELECT COALESCE(SUM(COALESCE(pnl_absolute, 0)), 0), COUNT(*)
+            FROM dedup
+            """,
+            (ROLLING_RISK_LOOKBACK,),
+        )
+        row = c.fetchone()
+        conn.close()
+        rolling_pnl = float((row or [0, 0])[0] or 0.0)
+        sample_n = int((row or [0, 0])[1] or 0)
+        new_mult = 1.0
+        if sample_n >= ROLLING_RISK_MIN_SAMPLE and rolling_pnl < 0:
+            new_mult = max(0.1, float(ROLLING_RISK_MULTIPLIER))
+        if abs(new_mult - cached) > 1e-9:
+            safe_log(f"[ETH-RISK] rolling_{ROLLING_RISK_LOOKBACK} pnl={rolling_pnl:+.2f} n={sample_n} -> size_mult={new_mult:.2f}")
+        _state["risk_multiplier"] = new_mult
+        _state["risk_last_check_ts"] = now
+        return new_mult
+    except Exception as e:
+        safe_log(f"[ETH-RISK] risk multiplier check failed: {e}")
+        _state["risk_last_check_ts"] = now
+        _state["risk_multiplier"] = cached
+        return cached
 
 
 def init_active_fills_db():
@@ -599,6 +859,82 @@ def init_active_fills_db():
         conn.close()
     except Exception as e:
         log(f"[ETH] active_fills init error: {e}")
+
+
+def init_edge_events_db():
+    import sqlite3
+    try:
+        conn = sqlite3.connect(str(JOURNAL_DB))
+        c = conn.cursor()
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS edge_events (
+                id TEXT PRIMARY KEY,
+                engine TEXT,
+                asset TEXT,
+                timestamp_et TEXT,
+                market_slug TEXT,
+                market_id TEXT,
+                side TEXT,
+                signal_type TEXT,
+                seconds_remaining INTEGER,
+                best_bid REAL,
+                best_ask REAL,
+                spread REAL,
+                midprice REAL,
+                microprice REAL,
+                price_now REAL,
+                price_1s_ago REAL,
+                price_3s_ago REAL,
+                price_5s_ago REAL,
+                price_10s_ago REAL,
+                price_30s_ago REAL,
+                ret_1s REAL,
+                ret_3s REAL,
+                ret_5s REAL,
+                ret_10s REAL,
+                ret_30s REAL,
+                vol_10s REAL,
+                vol_30s REAL,
+                vol_60s REAL,
+                imbalance_1 REAL,
+                imbalance_3 REAL,
+                model_p_yes REAL,
+                model_p_no REAL,
+                edge_yes REAL,
+                edge_no REAL,
+                net_edge REAL,
+                confidence REAL,
+                regime TEXT,
+                regime_ok INTEGER,
+                adaptive_net_edge_floor REAL,
+                adaptive_confidence_floor REAL,
+                skip_reason TEXT,
+                intended_entry_price REAL,
+                actual_fill_price REAL,
+                slippage REAL,
+                shadow_decision TEXT,
+                shadow_skip_reason TEXT,
+                execution_status TEXT,
+                decision TEXT
+            )
+        """)
+        c.execute("""
+            CREATE INDEX IF NOT EXISTS idx_edge_events_timestamp
+            ON edge_events (timestamp_et)
+        """)
+        c.execute("""
+            CREATE INDEX IF NOT EXISTS idx_edge_events_engine_asset
+            ON edge_events (engine, asset)
+        """)
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log(f"[ETH] edge_events init error: {e}")
+
+
+def init_runtime_db():
+    init_edge_events_db()
+    init_active_fills_db()
 
 
 def prune_active_fills(current_window_ts):
@@ -715,6 +1051,11 @@ def _reset_maker_state_for_retry():
     _state['maker_done'] = False
     _state['maker_last_poll'] = 0
     _state['maker_placed_ts'] = 0
+    _state['maker_book_bid'] = None
+    _state['maker_book_ask'] = None
+    _state['maker_book_spread'] = None
+    _state['maker_book_tick'] = 0.01
+    _state['maker_distance_to_ask'] = None
     save_state()
 
 
@@ -739,6 +1080,11 @@ def _handle_maker_fill(oid, source="status", vf=None):
     _state['maker_shares'] = 0.0
     _state['maker_last_poll'] = 0
     _state['maker_placed_ts'] = 0
+    _state['maker_book_bid'] = None
+    _state['maker_book_ask'] = None
+    _state['maker_book_spread'] = None
+    _state['maker_book_tick'] = 0.01
+    _state['maker_distance_to_ask'] = None
     save_state()
     
     if source == "status":
@@ -824,11 +1170,30 @@ def check_maker_snipe(market, seconds_remaining):
             maker_cancel_order(oid)
             tg(f"[ETH-MAKER] ORDER CANCELLED (FOK fallback): {oid} | open_for={int(time.time()) - placed_ts}s")
             
-            # FIX #12: Add +0.02 premium above mid to hit actual ask (mid-price FOKs were not filling)
-            FOK_PREMIUM = 0.02
-            fok_price = round(min((market['yes_price'] if _state.get('maker_side') == 'UP' else market['no_price']) + FOK_PREMIUM, SNIPE_MAX_PRICE), 4)
             fok_token = _state.get('maker_token_id')
             fok_shares = _state.get('maker_shares', 5.0)
+            current_book = get_book_metrics(fok_token, _state.get('maker_price', 0.0))
+            best_ask = current_book.get('best_ask')
+            if current_book.get('error'):
+                log(f"[ETH-MAKER] FOK BOOK bid=NA ask=NA spread=NA error={current_book.get('error')}")
+            else:
+                bid_str = f"{current_book['best_bid']:.4f}" if current_book.get('best_bid') is not None else 'NA'
+                ask_str = f"{best_ask:.4f}" if best_ask is not None else 'NA'
+                spread_str = f"{current_book['spread']:.4f}" if current_book.get('spread') is not None else 'NA'
+                log(f"[ETH-MAKER] FOK BOOK bid={bid_str} ask={ask_str} spread={spread_str} last_maker={_state.get('maker_price', 0.0):.4f}")
+            if best_ask is None:
+                log("[ETH-MAKER] FOK skipped: no best ask available")
+                _state['diag_orders_cancelled'] = _state.get('diag_orders_cancelled', 0) + 1
+                if seconds_remaining > MAKER_RETRY_MIN_SEC and _state.get('maker_attempt_count', 0) < MAKER_MAX_RETRIES:
+                    _state['maker_attempt_count'] = _state.get('maker_attempt_count', 0) + 1
+                    log(f"[ETH-MAKER] RETRY enabled (attempt {_state['maker_attempt_count']}/{MAKER_MAX_RETRIES}, {seconds_remaining}s remaining)")
+                    _reset_maker_state_for_retry()
+                    return None
+                else:
+                    _state['maker_done'] = True
+                    save_state()
+                    return False
+            fok_price = round(min(max(best_ask, _state.get('maker_price', 0.0)), SNIPE_MAX_PRICE), 4)
             
             r = place_order("BUY", fok_shares, fok_price, market['condition_id'], fok_token)
             for line in (r.get('output') or '').splitlines():
@@ -841,9 +1206,9 @@ def check_maker_snipe(market, seconds_remaining):
             else:
                 log(f"[ETH-MAKER] FOK fallback no fill, will retry if time permits")
                 _state['diag_orders_cancelled'] = _state.get('diag_orders_cancelled', 0) + 1
-                if seconds_remaining > MAKER_RETRY_MIN_SEC and _state.get('maker_attempt_count', 0) < 3:
+                if seconds_remaining > MAKER_RETRY_MIN_SEC and _state.get('maker_attempt_count', 0) < MAKER_MAX_RETRIES:
                     _state['maker_attempt_count'] = _state.get('maker_attempt_count', 0) + 1
-                    log(f"[ETH-MAKER] RETRY enabled (attempt {_state['maker_attempt_count']}/3, {seconds_remaining}s remaining)")
+                    log(f"[ETH-MAKER] RETRY enabled (attempt {_state['maker_attempt_count']}/{MAKER_MAX_RETRIES}, {seconds_remaining}s remaining)")
                     _reset_maker_state_for_retry()
                     return None
                 else:
@@ -1007,7 +1372,7 @@ def check_maker_snipe(market, seconds_remaining):
     if token_price > price_cap:
         price_bucket = "high"
         log(f"[ETH-MAKER] FILTER: entry_price={token_price:.4f} > max {price_cap:.2f} (bucket={price_bucket}), skipping high price")
-        set_shadow_state_eth(token_price, context='maker')
+        shadow_live_gate_eth(token_price, context='maker')
         write_edge_event(
             market,
             signal_type="maker",
@@ -1028,7 +1393,7 @@ def check_maker_snipe(market, seconds_remaining):
     else:
         price_bucket = "low"
         log(f"[ETH-MAKER] FILTER: entry_price={token_price:.4f} < min {SNIPE_MIN_PRICE:.2f} (bucket={price_bucket}), skipping low price")
-        set_shadow_state_eth(token_price, context='maker')
+        shadow_live_gate_eth(token_price, context='maker')
         write_edge_event(
             market,
             signal_type="maker",
@@ -1036,6 +1401,22 @@ def check_maker_snipe(market, seconds_remaining):
             intended_entry_price=token_price,
             decision="skip_no_edge",
             skip_reason="entry_price_below_min",
+            execution_status="skipped",
+            seconds_remaining=seconds_remaining,
+            shadow_decision=_state.get('shadow_decision', ''),
+            shadow_skip_reason=_state.get('shadow_reason', ''),
+        )
+        return None
+
+    if not shadow_live_gate_eth(token_price, context='maker'):
+        log(f"[ETH-MAKER] SHADOW FILTER: entry_price={token_price:.4f} shadow_reason={_state.get('shadow_reason')} (bucket={price_bucket}), skipping")
+        write_edge_event(
+            market,
+            signal_type="maker",
+            side=direction,
+            intended_entry_price=token_price,
+            decision="skip_no_edge",
+            skip_reason=_state.get('shadow_reason', 'shadow_filtered'),
             execution_status="skipped",
             seconds_remaining=seconds_remaining,
             shadow_decision=_state.get('shadow_decision', ''),
@@ -1051,11 +1432,29 @@ def check_maker_snipe(market, seconds_remaining):
         log(f"[ETH-MAKER] token_mid={token_price:.4f} < min {MAKER_MIN_PRICE:.4f}, skipping")
         return None
 
-    # FIX #2: More competitive limit price
-    limit_price = max(0.01, round(token_price - MAKER_OFFSET, 2))
-    shares = max(5.0, math.floor((SNIPE_DEFAULT / max(limit_price, 0.01)) * 100) / 100)
+    base_limit = max(0.01, round(token_price - MAKER_OFFSET, 2))
+    book = get_book_metrics(token_id, base_limit)
+    if book.get('error'):
+        log(f"[ETH-MAKER] BOOK mid={token_price:.4f} bid=NA ask=NA spread=NA submitted={base_limit:.4f} distance_to_ask=NA error={book.get('error')}")
+        limit_price = base_limit
+    else:
+        bid_str = f"{book['best_bid']:.4f}" if book.get('best_bid') is not None else 'NA'
+        ask_str = f"{book['best_ask']:.4f}" if book.get('best_ask') is not None else 'NA'
+        spread_str = f"{book['spread']:.4f}" if book.get('spread') is not None else 'NA'
+        dta_str = f"{book['distance_to_ask']:.4f}" if book.get('distance_to_ask') is not None else 'NA'
+        log(f"[ETH-MAKER] BOOK mid={token_price:.4f} bid={bid_str} ask={ask_str} spread={spread_str} submitted={base_limit:.4f} distance_to_ask={dta_str}")
+        if book.get('best_ask') is not None and abs(float(book['best_ask']) - float(token_price)) > 0.10:
+            log(f"[ETH-MAKER] ABORT: mid/book mismatch token_mid={token_price:.4f} best_ask={float(book['best_ask']):.4f} submitted={base_limit:.4f}")
+            return None
+        limit_price = base_limit
+        if book.get('best_ask') is not None:
+            tick = max(float(book.get('tick') or 0.01), 0.01)
+            near_ask = round(max(0.01, float(book['best_ask']) - tick), 2)
+            limit_price = max(limit_price, near_ask)
+        limit_price = min(limit_price, SNIPE_MAX_PRICE)
+    maker_budget = SNIPE_DEFAULT * current_risk_multiplier()
+    shares = max(5.0, math.floor((maker_budget / max(limit_price, 0.01)) * 100) / 100)
     log(f"[ETH-MAKER] {direction} signal token_mid={token_price:.4f} limit={limit_price:.4f} shares={shares:.2f} dry={MAKER_DRY_RUN} attempt={_state.get('maker_attempt_count', 0)+1}")
-    set_shadow_state_eth(token_price, context='maker')
     write_edge_event(
         market,
         signal_type="maker",
@@ -1066,6 +1465,10 @@ def check_maker_snipe(market, seconds_remaining):
         seconds_remaining=seconds_remaining,
         shadow_decision=_state.get('shadow_decision', ''),
         shadow_skip_reason=_state.get('shadow_reason', ''),
+        best_bid=book.get('best_bid'),
+        best_ask=book.get('best_ask'),
+        spread=book.get('spread'),
+        midprice=token_price,
     )
     r = maker_place_order('BUY', shares, limit_price, market['condition_id'], token_id)
     for line in (r.get('output') or '').splitlines():
@@ -1083,6 +1486,14 @@ def check_maker_snipe(market, seconds_remaining):
     _state['maker_last_poll'] = int(time.time())
     _state['maker_placed_ts'] = int(time.time())
     _state['maker_done'] = False
+    _state['maker_book_bid'] = book.get('best_bid')
+    _state['maker_book_ask'] = book.get('best_ask')
+    _state['maker_book_spread'] = book.get('spread')
+    _state['maker_book_tick'] = float(book.get('tick') or 0.01)
+    _state['maker_distance_to_ask'] = (
+        round(float(book['best_ask']) - float(limit_price), 4)
+        if book.get('best_ask') is not None else None
+    )
     _state['diag_orders_placed'] = _state.get('diag_orders_placed', 0) + 1
     save_state()
     tg(f"[ETH-MAKER] ORDER PLACED: {direction} {shares:.2f} shares @ {limit_price:.4f} | Order: {r.get('order_id') or (r.get('posted') or {}).get('order_id') or ''}")
@@ -1104,14 +1515,16 @@ def check_arb(market):
     yes_tid = market["clob_token_id"][0] if len(market["clob_token_id"]) > 0 else ""
     no_tid  = market["clob_token_id"][1] if len(market["clob_token_id"]) > 1 else ""
 
-    yes_shares = ARB_SIZE / market["yes_price"]
-    no_shares  = ARB_SIZE / market["no_price"]
+    risk_mult = current_risk_multiplier()
+    arb_budget = ARB_SIZE * risk_mult
+    yes_shares = arb_budget / market["yes_price"]
+    no_shares  = arb_budget / market["no_price"]
 
     r1 = place_order("BUY", yes_shares, market["yes_price"], market["condition_id"], yes_tid)
     r2 = place_order("BUY", no_shares,  market["no_price"],  market["condition_id"], no_tid)
 
     arb_profit = (1.00 - combined) * min(yes_shares, no_shares)
-    notes = f"arb profit=${arb_profit:.2f} yes_shares={yes_shares:.2f} no_shares={no_shares:.2f}"
+    notes = f"arb profit=${arb_profit:.2f} yes_shares={yes_shares:.2f} no_shares={no_shares:.2f} risk_mult={risk_mult:.2f}"
     log(f"[ETH-ARB] Result: yes={r1.get('success')}, no={r2.get('success')}. {notes}")
     tg(f"[ETH-ARB] {notes}")
 
@@ -1222,7 +1635,7 @@ def check_snipe(market, seconds_remaining):
     if price > price_cap:
         price_bucket = "high"
         log(f"[ETH-SNIPE] FILTER: entry_price={price:.4f} > max {price_cap:.2f} (bucket={price_bucket}), skipping high price")
-        set_shadow_state_eth(price, context='snipe')
+        shadow_live_gate_eth(price, context='snipe')
         write_edge_event(
             market,
             signal_type="snipe",
@@ -1243,7 +1656,7 @@ def check_snipe(market, seconds_remaining):
     else:
         price_bucket = "low"
         log(f"[ETH-SNIPE] FILTER: entry_price={price:.4f} < floor {SNIPE_MIN_PRICE:.2f} (bucket={price_bucket}), skipping low price")
-        set_shadow_state_eth(price, context='snipe')
+        shadow_live_gate_eth(price, context='snipe')
         write_edge_event(
             market,
             signal_type="snipe",
@@ -1258,9 +1671,26 @@ def check_snipe(market, seconds_remaining):
         )
         return None
 
+    if not shadow_live_gate_eth(price, context='snipe'):
+        log(f"[ETH-SNIPE] SHADOW FILTER: entry_price={price:.4f} shadow_reason={_state.get('shadow_reason')} (bucket={price_bucket}), skipping")
+        write_edge_event(
+            market,
+            signal_type="snipe",
+            side=direction,
+            intended_entry_price=price,
+            decision="skip_no_edge",
+            skip_reason=_state.get('shadow_reason', 'shadow_filtered'),
+            execution_status="skipped",
+            seconds_remaining=seconds_remaining,
+            shadow_decision=_state.get('shadow_decision', ''),
+            shadow_skip_reason=_state.get('shadow_reason', ''),
+        )
+        return None
+
     log(f"[ETH-SNIPE] PRICE_BUCKET: {price_bucket} (price={price:.4f})")
 
-    size = SNIPE_STRONG if abs(delta_pct) >= SNIPE_STRONG_D * 100 else SNIPE_DEFAULT
+    base_size = SNIPE_STRONG if abs(delta_pct) >= SNIPE_STRONG_D * 100 else SNIPE_DEFAULT
+    size = base_size * current_risk_multiplier()
     shares = size / price
     if shares < 5:
         shares = 5
@@ -1270,7 +1700,6 @@ def check_snipe(market, seconds_remaining):
         log(f"[ETH-SNIPE] LATE REVERSAL signal! ETH delta={delta_pct:+.3f}% size=${size:.2f} price={price:.4f} shares={shares:.2f}")
     else:
         log(f"[ETH-SNIPE] {direction} signal! ETH delta={delta_pct:+.3f}% size=${size:.2f} price={price:.4f} shares={shares:.2f}")
-    set_shadow_state_eth(price, context='snipe')
     write_edge_event(
         market,
         signal_type="snipe",
@@ -1340,6 +1769,11 @@ def setup_new_window(slug, window_ts):
     _state["maker_last_poll"] = 0
     _state["maker_placed_ts"] = 0
     _state["maker_attempt_count"] = 0
+    _state["maker_book_bid"] = None
+    _state["maker_book_ask"] = None
+    _state["maker_book_spread"] = None
+    _state["maker_book_tick"] = 0.01
+    _state["maker_distance_to_ask"] = None
     _state["prev_slug"]       = slug
     save_state()
 
@@ -1361,7 +1795,7 @@ def check_daily_limit():
 def main():
     global _state
     load_state()
-    init_active_fills_db()
+    init_runtime_db()
     log("=" * 60)
     log(f"[ETH-15M] STARTING {'(DRY RUN)' if DRY_RUN else '(LIVE)'}")
     log(f"[ETH-15M] Arb threshold=${ARB_THRESHOLD}, snipe delta>={SNIPE_DELTA_MIN}%, max daily loss=${MAX_DAILY_LOSS}")

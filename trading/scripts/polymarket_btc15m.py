@@ -41,10 +41,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
+from journal import journal_close as shared_journal_close
+from journal import journal_open as shared_journal_open
+from journal import open_journal
 
 # ── Paths & creds ──────────────────────────────────────────────────────────────
 WORK_DIR      = Path("/home/abdaltm86/.openclaw/workspace/trading")
 JOURNAL_DB    = WORK_DIR / "journal.db"
+SHARED_JOURNAL_DB = Path(os.environ.get("BTC15M_JOURNAL_DB", str(WORK_DIR / "btc15m_journal.db")))
 CREDS_FILE    = Path("/home/abdaltm86/.config/openclaw/secrets.env")
 POSITIONS_F  = WORK_DIR / ".poly_btc15m_positions.json"
 STATE_F       = WORK_DIR / ".poly_btc15m_state.json"
@@ -74,10 +78,15 @@ def _int(key, default):
     except Exception:
         return int(default)
 
+
+def _bool(key, default):
+    return str(os.environ.get(key, ENV.get(key, str(default)))).lower() in ("1", "true", "yes", "on")
+
 TELEGRAM_TOKEN = ENV.get("TELEGRAM_TOKEN", "8457917317:AAHGueV-SogZl14cW5uMmIACpaWuyzByXOo")
 CHAT_ID        = ENV.get("CHAT_ID",        "7520899464")
 POLY_WALLET    = ENV.get("POLY_WALLET",    "0x1a4c163a134D7154ebD5f7359919F9c439424f00")
 VENV_PY        = Path("/home/abdaltm86/.openclaw/workspace/trading/.polymarket-venv/bin/python3")
+USE_SHARED_JOURNAL = _bool("BTC15M_SHARED_JOURNAL", False)
 DRY_RUN        = os.environ.get("BTC15M_DRY_RUN",  ENV.get("BTC15M_DRY_RUN",  "true")).lower() != "false"
 MAKER_ENABLED  = os.environ.get("BTC15M_MAKER_ENABLED", ENV.get("BTC15M_MAKER_ENABLED", "false")).lower() == "true"
 MAKER_DRY_RUN  = os.environ.get("BTC15M_MAKER_DRY_RUN", ENV.get("BTC15M_MAKER_DRY_RUN", "true")).lower() != "false"
@@ -116,6 +125,11 @@ SIGNAL_MIN_ENTRY_PRICE = _float("BTC15M_SIGNAL_MIN_ENTRY_PRICE", 0.45)
 SNIPE_DEFAULT   = _float("BTC15M_SNIPE_DEFAULT_SIZE", 5.00)
 SNIPE_STRONG    = _float("BTC15M_SNIPE_STRONG_SIZE", 7.50)
 SNIPE_STRONG_D  = _float("BTC15M_SNIPE_STRONG_DELTA", 0.10)  # percent
+ROLLING_RISK_ENABLED = _bool("BTC15M_ROLLING_RISK_ENABLED", True)
+ROLLING_RISK_LOOKBACK = _int("BTC15M_ROLLING_RISK_LOOKBACK", 20)
+ROLLING_RISK_MIN_SAMPLE = _int("BTC15M_ROLLING_RISK_MIN_SAMPLE", 10)
+ROLLING_RISK_MULTIPLIER = _float("BTC15M_ROLLING_RISK_MULTIPLIER", 0.60)
+ROLLING_RISK_REFRESH_SEC = _int("BTC15M_ROLLING_RISK_REFRESH_SEC", 120)
 SNIPE_WINDOW    = _int("BTC15M_SNIPE_WINDOW_SEC", 30)
 POLL_SEC        = _int("BTC15M_PRICE_POLL_SEC", 5)
 SCAN_SEC        = _int("BTC15M_SCAN_INTERVAL", 10)
@@ -170,10 +184,21 @@ def log(msg):
     with open(LOG_F, "a") as f:
         f.write(line + "\n")
 
+
+def safe_log(msg):
+    try:
+        log(msg)
+    except Exception:
+        print(msg, flush=True)
+
 def tg(msg):
     if DRY_RUN:
         return
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        log("[TG-SKIP] Missing TELEGRAM_TOKEN or CHAT_ID")
+        return
     log(f"[TG] Sending: {msg}")
+    is_maker_msg = msg.startswith("[BTC-MAKER]")
     def _send():
         try:
             r = requests.post(
@@ -183,9 +208,11 @@ def tg(msg):
             )
             if r.status_code != 200:
                 log(f"[TG-ERR] code={r.status_code} response={r.text}")
+            elif is_maker_msg:
+                log("[TG] Delivered maker alert")
         except Exception as e:
             log(f"[TG-ERR] {e}")
-    threading.Thread(target=_send, daemon=True).start()
+    threading.Thread(target=_send, daemon=not is_maker_msg).start()
 
 
 def notify_recent_resolutions():
@@ -523,6 +550,11 @@ def set_shadow_state_btc(price: float, context: str):
     log(f"[BTC-SHADOW] {decision} context={context} bucket={bucket} price={price:.4f} expected_pnl=NA reason={reason}")
 
 
+def shadow_live_gate_btc(price: float, context: str) -> bool:
+    set_shadow_state_btc(price, context=context)
+    return _state.get('shadow_decision') == 'kept'
+
+
 def get_book_metrics(token_id, submitted_price):
     """Best-effort orderbook snapshot for maker observability only.
     Returns best_bid/best_ask/spread/distance_to_ask; never raises.
@@ -558,13 +590,11 @@ def get_book_metrics(token_id, submitted_price):
 
 
 def log_trade(engine, direction, size_usd, entry_price, pnl, exit_type, hold_sec, notes="", sec_remaining=None, price_bucket=None):
-    import sqlite3
     try:
-        conn = sqlite3.connect(str(JOURNAL_DB))
-        c = conn.cursor()
         timestamp_open = _current_window_open_iso()
         is_resolved = exit_type == "resolved"
         asset = _current_trade_slug()
+        trade_id = _current_trade_id(direction)
         
         # Build notes with sec_remaining and price_bucket if provided
         full_notes = notes
@@ -574,41 +604,216 @@ def log_trade(engine, direction, size_usd, entry_price, pnl, exit_type, hold_sec
             full_notes = f"{full_notes} price_bucket={price_bucket}"
         if _state.get('shadow_decision'):
             full_notes = f"{full_notes} shadow={_state.get('shadow_decision')} shadow_bucket={_state.get('shadow_bucket')} shadow_price={_state.get('shadow_price')} shadow_reason={_state.get('shadow_reason')}"
-        
-        c.execute("""
-            INSERT INTO trades (
-                engine, timestamp_open, timestamp_close, asset,
-                category, direction, entry_price, exit_price,
-                position_size, position_size_usd, pnl_absolute, pnl_percent,
-                exit_type, hold_duration_seconds, regime, notes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(engine, asset, timestamp_open) DO UPDATE SET
-                timestamp_close=excluded.timestamp_close,
-                entry_price=excluded.entry_price,
-                exit_price=excluded.exit_price,
-                position_size=excluded.position_size,
-                position_size_usd=excluded.position_size_usd,
-                pnl_absolute=excluded.pnl_absolute,
-                pnl_percent=excluded.pnl_percent,
-                exit_type=excluded.exit_type,
-                hold_duration_seconds=excluded.hold_duration_seconds,
-                regime=excluded.regime,
-                notes=excluded.notes
-        """, (
-            engine, timestamp_open,
-            datetime.now(timezone.utc).isoformat() if is_resolved else None,
+
+        if USE_SHARED_JOURNAL:
+            conn = open_journal(SHARED_JOURNAL_DB, "btc15m")
+            try:
+                if is_resolved:
+                    shared_journal_close(
+                        conn,
+                        trade_id=trade_id,
+                        exit_price=entry_price,
+                        pnl_absolute=pnl or 0.0,
+                        pnl_percent=(pnl / size_usd * 100) if size_usd else 0.0,
+                        exit_type=exit_type,
+                        hold_duration_seconds=hold_sec or 0,
+                        timestamp_close=datetime.now(timezone.utc).isoformat(),
+                        notes=full_notes,
+                    )
+                else:
+                    shared_journal_open(
+                        conn,
+                        trade_id=trade_id,
+                        engine=engine,
+                        asset=asset,
+                        category="btc-updown",
+                        direction=direction,
+                        entry_price=entry_price,
+                        position_size=size_usd / entry_price if entry_price else 0,
+                        position_size_usd=size_usd,
+                        regime="normal",
+                        notes=full_notes,
+                        timestamp_open=timestamp_open,
+                    )
+            finally:
+                conn.close()
+            return
+
+        import sqlite3
+        conn = sqlite3.connect(str(JOURNAL_DB))
+        conn.execute("PRAGMA busy_timeout = 5000")
+        c = conn.cursor()
+        close_ts = datetime.now(timezone.utc).isoformat() if is_resolved else None
+        base_params = (
+            engine,
+            timestamp_open,
+            close_ts,
             asset,
             "btc-updown",
-            direction, entry_price, entry_price if is_resolved else None,
+            direction,
+            entry_price,
+            entry_price if is_resolved else None,
             size_usd / entry_price if entry_price else 0,
-            size_usd, pnl or 0.0, (pnl/size_usd*100) if size_usd else 0,
-            exit_type or "open", hold_sec or 0,
-            "normal", full_notes
-        ))
+            size_usd,
+            pnl or 0.0,
+            (pnl / size_usd * 100) if size_usd else 0,
+            exit_type or "open",
+            hold_sec or 0,
+            "normal",
+            full_notes,
+        )
+
+        if is_resolved:
+            c.execute(
+                """
+                SELECT rowid
+                FROM trades
+                WHERE engine=? AND asset=? AND timestamp_open=? AND direction=?
+                ORDER BY rowid DESC
+                LIMIT 1
+                """,
+                (engine, asset, timestamp_open, direction),
+            )
+            existing = c.fetchone()
+            if existing:
+                c.execute(
+                    """
+                    UPDATE trades
+                    SET timestamp_close=?, entry_price=?, exit_price=?, position_size=?, position_size_usd=?,
+                        pnl_absolute=?, pnl_percent=?, exit_type=?, hold_duration_seconds=?, regime=?, notes=?
+                    WHERE rowid=?
+                    """,
+                    (
+                        close_ts,
+                        entry_price,
+                        entry_price,
+                        size_usd / entry_price if entry_price else 0,
+                        size_usd,
+                        pnl or 0.0,
+                        (pnl / size_usd * 100) if size_usd else 0,
+                        exit_type or "open",
+                        hold_sec or 0,
+                        "normal",
+                        full_notes,
+                        existing[0],
+                    ),
+                )
+            else:
+                c.execute(
+                    """
+                    INSERT INTO trades (
+                        engine, timestamp_open, timestamp_close, asset,
+                        category, direction, entry_price, exit_price,
+                        position_size, position_size_usd, pnl_absolute, pnl_percent,
+                        exit_type, hold_duration_seconds, regime, notes
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    base_params,
+                )
+        else:
+            c.execute(
+                """
+                SELECT rowid
+                FROM trades
+                WHERE engine=? AND asset=? AND timestamp_open=? AND direction=? AND timestamp_close IS NULL
+                ORDER BY rowid DESC
+                LIMIT 1
+                """,
+                (engine, asset, timestamp_open, direction),
+            )
+            existing_open = c.fetchone()
+            if existing_open:
+                c.execute(
+                    """
+                    UPDATE trades
+                    SET entry_price=?, position_size=?, position_size_usd=?, pnl_absolute=?, pnl_percent=?,
+                        exit_type=?, hold_duration_seconds=?, regime=?, notes=?
+                    WHERE rowid=?
+                    """,
+                    (
+                        entry_price,
+                        size_usd / entry_price if entry_price else 0,
+                        size_usd,
+                        pnl or 0.0,
+                        (pnl / size_usd * 100) if size_usd else 0,
+                        exit_type or "open",
+                        hold_sec or 0,
+                        "normal",
+                        full_notes,
+                        existing_open[0],
+                    ),
+                )
+            else:
+                c.execute(
+                    """
+                    INSERT INTO trades (
+                        engine, timestamp_open, timestamp_close, asset,
+                        category, direction, entry_price, exit_price,
+                        position_size, position_size_usd, pnl_absolute, pnl_percent,
+                        exit_type, hold_duration_seconds, regime, notes
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    base_params,
+                )
         conn.commit()
         conn.close()
     except Exception as e:
         log(f"Journal error: {e}")
+
+
+def current_risk_multiplier():
+    if not ROLLING_RISK_ENABLED:
+        return 1.0
+    now = time.time()
+    last_ts = float(_state.get("risk_last_check_ts", 0) or 0)
+    cached = float(_state.get("risk_multiplier", 1.0) or 1.0)
+    if now - last_ts < ROLLING_RISK_REFRESH_SEC:
+        return cached
+    try:
+        conn = sqlite3.connect(str(JOURNAL_DB))
+        c = conn.cursor()
+        c.execute(
+            """
+            WITH ranked AS (
+                SELECT
+                    pnl_absolute,
+                    timestamp_close,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY engine, asset, timestamp_open, direction
+                        ORDER BY rowid DESC
+                    ) AS rn
+                FROM trades
+                WHERE engine='btc15m' AND exit_type='resolved' AND timestamp_close IS NOT NULL
+            ),
+            dedup AS (
+                SELECT pnl_absolute, timestamp_close
+                FROM ranked
+                WHERE rn=1
+                ORDER BY timestamp_close DESC
+                LIMIT ?
+            )
+            SELECT COALESCE(SUM(COALESCE(pnl_absolute, 0)), 0), COUNT(*)
+            FROM dedup
+            """,
+            (ROLLING_RISK_LOOKBACK,),
+        )
+        row = c.fetchone()
+        conn.close()
+        rolling_pnl = float((row or [0, 0])[0] or 0.0)
+        sample_n = int((row or [0, 0])[1] or 0)
+        new_mult = 1.0
+        if sample_n >= ROLLING_RISK_MIN_SAMPLE and rolling_pnl < 0:
+            new_mult = max(0.1, float(ROLLING_RISK_MULTIPLIER))
+        if abs(new_mult - cached) > 1e-9:
+            safe_log(f"[BTC-RISK] rolling_{ROLLING_RISK_LOOKBACK} pnl={rolling_pnl:+.2f} n={sample_n} -> size_mult={new_mult:.2f}")
+        _state["risk_multiplier"] = new_mult
+        _state["risk_last_check_ts"] = now
+        return new_mult
+    except Exception as e:
+        safe_log(f"[BTC-RISK] risk multiplier check failed: {e}")
+        _state["risk_last_check_ts"] = now
+        _state["risk_multiplier"] = cached
+        return cached
 
 
 def init_active_fills_db():
@@ -633,6 +838,82 @@ def init_active_fills_db():
         conn.close()
     except Exception as e:
         log(f"[BTC] active_fills init error: {e}")
+
+
+def init_edge_events_db():
+    import sqlite3
+    try:
+        conn = sqlite3.connect(str(JOURNAL_DB))
+        c = conn.cursor()
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS edge_events (
+                id TEXT PRIMARY KEY,
+                engine TEXT,
+                asset TEXT,
+                timestamp_et TEXT,
+                market_slug TEXT,
+                market_id TEXT,
+                side TEXT,
+                signal_type TEXT,
+                seconds_remaining INTEGER,
+                best_bid REAL,
+                best_ask REAL,
+                spread REAL,
+                midprice REAL,
+                microprice REAL,
+                price_now REAL,
+                price_1s_ago REAL,
+                price_3s_ago REAL,
+                price_5s_ago REAL,
+                price_10s_ago REAL,
+                price_30s_ago REAL,
+                ret_1s REAL,
+                ret_3s REAL,
+                ret_5s REAL,
+                ret_10s REAL,
+                ret_30s REAL,
+                vol_10s REAL,
+                vol_30s REAL,
+                vol_60s REAL,
+                imbalance_1 REAL,
+                imbalance_3 REAL,
+                model_p_yes REAL,
+                model_p_no REAL,
+                edge_yes REAL,
+                edge_no REAL,
+                net_edge REAL,
+                confidence REAL,
+                regime TEXT,
+                regime_ok INTEGER,
+                adaptive_net_edge_floor REAL,
+                adaptive_confidence_floor REAL,
+                skip_reason TEXT,
+                intended_entry_price REAL,
+                actual_fill_price REAL,
+                slippage REAL,
+                shadow_decision TEXT,
+                shadow_skip_reason TEXT,
+                execution_status TEXT,
+                decision TEXT
+            )
+        """)
+        c.execute("""
+            CREATE INDEX IF NOT EXISTS idx_edge_events_timestamp
+            ON edge_events (timestamp_et)
+        """)
+        c.execute("""
+            CREATE INDEX IF NOT EXISTS idx_edge_events_engine_asset
+            ON edge_events (engine, asset)
+        """)
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log(f"[BTC] edge_events init error: {e}")
+
+
+def init_runtime_db():
+    init_edge_events_db()
+    init_active_fills_db()
 
 
 def prune_active_fills(current_window_ts):
@@ -1027,7 +1308,7 @@ def check_maker_snipe(market, seconds_remaining):
     if token_price > SIGNAL_MAX_ENTRY_PRICE:
         price_bucket = "high"
         log(f"[BTC-MAKER] FILTER: entry_price={token_price:.4f} > max {SIGNAL_MAX_ENTRY_PRICE:.2f} (bucket={price_bucket}), skipping high price")
-        set_shadow_state_btc(token_price, context='maker')
+        shadow_live_gate_btc(token_price, context='maker')
         write_edge_event(
             market,
             signal_type="maker",
@@ -1048,7 +1329,7 @@ def check_maker_snipe(market, seconds_remaining):
     else:
         price_bucket = "low"
         log(f"[BTC-MAKER] FILTER: entry_price={token_price:.4f} < min {SIGNAL_MIN_ENTRY_PRICE:.2f} (bucket={price_bucket}), skipping low price")
-        set_shadow_state_btc(token_price, context='maker')
+        shadow_live_gate_btc(token_price, context='maker')
         write_edge_event(
             market,
             signal_type="maker",
@@ -1062,7 +1343,24 @@ def check_maker_snipe(market, seconds_remaining):
             shadow_skip_reason=_state.get('shadow_reason', ''),
         )
         return None
-    
+
+    if not shadow_live_gate_btc(token_price, context='maker'):
+        price_bucket = "mid" if token_price >= 0.60 else "sweet_spot" if token_price >= SIGNAL_MIN_ENTRY_PRICE else "low"
+        log(f"[BTC-MAKER] SHADOW FILTER: entry_price={token_price:.4f} shadow_reason={_state.get('shadow_reason')} (bucket={price_bucket}), skipping")
+        write_edge_event(
+            market,
+            signal_type="maker",
+            side=direction,
+            intended_entry_price=token_price,
+            decision="skip_no_edge",
+            skip_reason=_state.get('shadow_reason', 'shadow_filtered'),
+            execution_status="skipped",
+            seconds_remaining=seconds_remaining,
+            shadow_decision=_state.get('shadow_decision', ''),
+            shadow_skip_reason=_state.get('shadow_reason', ''),
+        )
+        return None
+
     log(f"[BTC-MAKER] PRICE_BUCKET: {price_bucket} (price={token_price:.4f})")
     
     # Store in state for later logging
@@ -1075,7 +1373,8 @@ def check_maker_snipe(market, seconds_remaining):
     
     # FIX #2: More competitive limit price (reduced offset)
     limit_price = max(0.01, round(token_price - MAKER_OFFSET, 2))
-    shares = max(5.0, math.floor((SNIPE_DEFAULT / max(limit_price, 0.01)) * 100) / 100)
+    maker_budget = SNIPE_DEFAULT * current_risk_multiplier()
+    shares = max(5.0, math.floor((maker_budget / max(limit_price, 0.01)) * 100) / 100)
     attempt_num = _state.get('maker_attempt_count', 0) + 1
     family_id = _current_maker_family_id(direction)
     side_label = 'BUY YES' if direction == 'UP' else 'BUY NO'
@@ -1084,7 +1383,6 @@ def check_maker_snipe(market, seconds_remaining):
     token_id_order = token_id
     book = get_book_metrics(token_id_book, limit_price)
     log(f"[BTC-MAKER] {direction} signal token_mid={token_price:.4f} limit={limit_price:.4f} shares={shares:.2f} dry={MAKER_DRY_RUN} attempt={attempt_num} family={family_id}")
-    set_shadow_state_btc(token_price, context='maker')
     write_edge_event(
         market,
         signal_type="maker",
@@ -1196,14 +1494,16 @@ def check_arb(market):
     yes_tid = market["clob_token_id"][0] if len(market["clob_token_id"]) > 0 else ""
     no_tid  = market["clob_token_id"][1] if len(market["clob_token_id"]) > 1 else ""
 
-    yes_shares = ARB_SIZE / market["yes_price"]
-    no_shares  = ARB_SIZE / market["no_price"]
+    risk_mult = current_risk_multiplier()
+    arb_budget = ARB_SIZE * risk_mult
+    yes_shares = arb_budget / market["yes_price"]
+    no_shares  = arb_budget / market["no_price"]
 
     r1 = place_order("BUY", yes_shares, market["yes_price"], market["condition_id"], yes_tid)
     r2 = place_order("BUY", no_shares,  market["no_price"],  market["condition_id"], no_tid)
 
     arb_profit = (1.00 - combined) * min(yes_shares, no_shares)
-    notes = f"arb profit=${arb_profit:.2f} yes_shares={yes_shares:.2f} no_shares={no_shares:.2f}"
+    notes = f"arb profit=${arb_profit:.2f} yes_shares={yes_shares:.2f} no_shares={no_shares:.2f} risk_mult={risk_mult:.2f}"
     log(f"[ARB] Result: yes={r1.get('success')}, no={r2.get('success')}. {notes}")
     tg(f"[BTC-ARB] {notes}")
 
@@ -1284,7 +1584,7 @@ def check_snipe(market, seconds_remaining):
     if price > SIGNAL_MAX_ENTRY_PRICE:
         price_bucket = "high"
         log(f"[SNIPE] FILTER: entry_price={price:.4f} > max {SIGNAL_MAX_ENTRY_PRICE:.2f} (bucket={price_bucket}), skipping high price")
-        set_shadow_state_btc(price, context='snipe')
+        shadow_live_gate_btc(price, context='snipe')
         write_edge_event(
             market,
             signal_type="snipe",
@@ -1305,7 +1605,7 @@ def check_snipe(market, seconds_remaining):
     else:
         price_bucket = "low"
         log(f"[SNIPE] FILTER: entry_price={price:.4f} < floor {SIGNAL_MIN_ENTRY_PRICE:.2f} (bucket={price_bucket}), skipping low price")
-        set_shadow_state_btc(price, context='snipe')
+        shadow_live_gate_btc(price, context='snipe')
         write_edge_event(
             market,
             signal_type="snipe",
@@ -1320,20 +1620,36 @@ def check_snipe(market, seconds_remaining):
         )
         return None
 
+    if not shadow_live_gate_btc(price, context='snipe'):
+        log(f"[SNIPE] SHADOW FILTER: entry_price={price:.4f} shadow_reason={_state.get('shadow_reason')} (bucket={price_bucket}), skipping")
+        write_edge_event(
+            market,
+            signal_type="snipe",
+            side=direction,
+            intended_entry_price=price,
+            decision="skip_no_edge",
+            skip_reason=_state.get('shadow_reason', 'shadow_filtered'),
+            execution_status="skipped",
+            seconds_remaining=seconds_remaining,
+            shadow_decision=_state.get('shadow_decision', ''),
+            shadow_skip_reason=_state.get('shadow_reason', ''),
+        )
+        return None
+
     log(f"[SNIPE] PRICE_BUCKET: {price_bucket} (price={price:.4f})")
 
     if price > SNIPE_MAX_PRICE:
         log(f"[SNIPE] Price {price:.4f} > max {SNIPE_MAX_PRICE}, skipping")
         return None
 
-    size = SNIPE_STRONG if abs(delta_pct) >= SNIPE_STRONG_D * 100 else SNIPE_DEFAULT
+    base_size = SNIPE_STRONG if abs(delta_pct) >= SNIPE_STRONG_D * 100 else SNIPE_DEFAULT
+    size = base_size * current_risk_multiplier()
     shares = size / price
     if shares < 5:
         shares = 5
         size = shares * price
 
     log(f"[SNIPE] {direction} signal! BTC delta={delta_pct:+.3f}% size=${size:.2f} price={price:.4f} shares={shares:.2f}")
-    set_shadow_state_btc(price, context='snipe')
     write_edge_event(
         market,
         signal_type="snipe",
@@ -1431,7 +1747,7 @@ def check_daily_limit():
 def main():
     global _state
     load_state()
-    init_active_fills_db()
+    init_runtime_db()
     log("=" * 60)
     log(f"[BTC-15M] STARTING {'(DRY RUN)' if DRY_RUN else '(LIVE)'}")
     log(f"[BTC-15M] Arb threshold=${ARB_THRESHOLD}, snipe delta>={SNIPE_DELTA_MIN}%, max daily loss=${MAX_DAILY_LOSS}")
