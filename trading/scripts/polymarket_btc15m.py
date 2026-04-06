@@ -1321,8 +1321,13 @@ def check_maker_snipe(market, seconds_remaining):
         log(f"[BTC-MAKER] ABORT: pricing_source=CLOB abort_reason=missing_clob_reference slug={market.get('slug','')} side={direction} token_id={token_id} gamma_price={gamma_price}")
         return None
     # ABORT: gamma/clob mismatch (direction source vs execution source disagree)
-    if gamma_price is not None and token_price is not None and abs(gamma_price - token_price) > 0.10:
-        log(f"[BTC-MAKER] ABORT: gamma/clob mismatch gamma_price={gamma_price:.4f} clob_price={token_price:.4f} diff={abs(gamma_price - token_price):.4f}")
+    # Use directional CLOB price for comparison (best_bid for UP, best_ask for NO)
+    # to avoid false aborts from wide-spread midpoints in thin markets
+    dir_clob_price = ctx['book'].get('best_bid') if direction == 'UP' else ctx['book'].get('best_ask')
+    compare_price = dir_clob_price if dir_clob_price is not None else token_price
+    mismatch_diff = abs(gamma_price - compare_price) if gamma_price is not None and compare_price is not None else 0
+    if gamma_price is not None and compare_price is not None and mismatch_diff > 0.20:
+        log(f"[BTC-MAKER] ABORT: gamma/clob mismatch gamma_price={gamma_price:.4f} dir_clob={compare_price:.4f} midpoint={token_price:.4f} diff={mismatch_diff:.4f}")
         return None
     
     
@@ -1599,8 +1604,13 @@ def check_snipe(market, seconds_remaining):
         log(f"[BTC-SNIPE] ABORT: pricing_source=CLOB slug={market.get('slug','')} side={direction} token_id={token_id} gamma_price={gamma_price} abort_reason=missing_clob_reference")
         return None
     # ABORT: gamma/clob mismatch (direction source vs execution source disagree)
-    if gamma_price is not None and price is not None and abs(gamma_price - price) > 0.10:
-        log(f"[BTC-SNIPE] ABORT: gamma/clob mismatch gamma_price={gamma_price:.4f} clob_price={price:.4f} diff={abs(gamma_price - price):.4f}")
+    # Use directional CLOB price for comparison
+    snipe_book = ctx.get('book', {})
+    snipe_dir_clob = snipe_book.get('best_bid') if direction == 'UP' else snipe_book.get('best_ask')
+    snipe_compare = snipe_dir_clob if snipe_dir_clob is not None else price
+    snipe_mismatch = abs(gamma_price - snipe_compare) if gamma_price is not None and snipe_compare is not None else 0
+    if gamma_price is not None and snipe_compare is not None and snipe_mismatch > 0.20:
+        log(f"[BTC-SNIPE] ABORT: gamma/clob mismatch gamma_price={gamma_price:.4f} dir_clob={snipe_compare:.4f} midpoint={price:.4f} diff={snipe_mismatch:.4f}")
         return None
     
     

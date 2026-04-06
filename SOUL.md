@@ -176,3 +176,27 @@ nohup /usr/bin/python3 scripts/coinbase_momentum.py > /tmp/coinbase_momentum.log
 nohup .polymarket-venv/bin/python3 scripts/polymarket_auto_redeem_daemon.py > /tmp/polymarket_auto_redeem.log 2>&1 &
 nohup .polymarket-venv/bin/python3 -u scripts/taco_trader.py > /tmp/taco_trader.log 2>&1 &
 ```
+
+---
+
+## CAREER-OPS (Resume & Job Pipeline)
+Repo: `~/Documents/career-ops/`
+Profile: `config/profile.yml` + `cv.md`
+
+### AI Advisor
+- Command: `cd ~/Documents/career-ops && ollama run gemma4:31b-cloud`
+- When Master says "run Claude" he means `ollama run gemma4:31b-cloud`
+- Claude Code CLI is installed (`/usr/bin/claude` v2.1.83) but needs Anthropic API key
+- Ollama uses cloud Gemma model (free, no key needed)
+
+### Resume Generation Workflow
+1. Master pastes a job URL
+2. Fetch + parse the job description (browser if Cloudflare blocks web_fetch)
+3. Evaluate fit (A-F across dimensions)
+4. Tailor CV from `config/profile.yml` to match the job
+5. Generate styled HTML resume (Space Grotesk + DM Sans, blue accent)
+6. Convert HTML → PDF via Playwright
+7. Copy PDF to workspace + send via Telegram
+
+### Active Applications
+- Lumion (https://jobs.lumion.ai/38433): Senior AI-Augmented Engineer (Laravel), $120-130K remote. A- fit. Resume sent 2026-04-05.

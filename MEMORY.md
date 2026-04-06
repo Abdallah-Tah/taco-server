@@ -71,3 +71,14 @@ Rules:
 - Default = current day stats
 - If user says "from X to Y" = use that date range for Today section
 - Never use cached/stale numbers — always pull live
+
+## Career-Ops / Resume System (career-ops)
+- Repo: `~/Documents/career-ops/`
+- Profile: `config/profile.yml` (single source of truth for Abdallah's career data)
+- CV: `cv.md` (markdown CV for tailoring)
+- Use case: When Master asks for a resume/CV, use the profile to generate tailored resumes and convert to PDF via Playwright.
+- To run the advisor: `cd ~/Documents/career-ops && ollama run gemma4:31b-cloud`
+- Claude Code is installed (`claude` CLI v2.1.83) but requires Anthropic API key.
+- Career-ops is designed for Claude Code CLI, but can be adapted to any AI chat.
+- PDF generation: Use Playwright (`npx playwright chromium` installed) via Node.js script to convert HTML resume to PDF.
+- Resume template: Space Grotesk + DM Sans fonts, blue (#2563eb) accent theme, ATS-optimized.

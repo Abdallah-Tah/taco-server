@@ -98,3 +98,15 @@ Net today: ${net} | 🟢/🟡/🔴 status
 - Always pull live — never use cached numbers
 
 **Additional rule:** Only display engines that are currently running (check `ps aux | grep polymarket_<engine>`). If an engine is not running, omit it from the report entirely.
+
+### Career-Ops / Resume Generator
+- Repo: `~/Documents/career-ops/`
+- Profile: `config/profile.yml` — Abdallah's career data (single source of truth)
+- CV source: `cv.md` — full CV in markdown
+- Resume template: `resume_lumion.html` — ATS-optimized, Space Grotesk + DM Sans, blue (#2563eb) accent
+- PDF output: Playwright (`npx playwright`) converts HTML → PDF
+- How to run the AI advisor: `cd ~/Documents/career-ops && ollama run gemma4:31b-cloud`
+- Claude Code CLI installed: `/usr/bin/claude` v2.1.83 (needs ANTHROPIC_API_KEY to use)
+- Ollama CLI: `ollama run gemma4:31b-cloud` (free, cloud-based Gemma model)
+- When Master says "run Claude" he means: `ollama run gemma4:31b-cloud`
+- Workflow: Fetch job URL → evaluate fit → tailor CV → generate HTML → Playwright PDF → send via Telegram
