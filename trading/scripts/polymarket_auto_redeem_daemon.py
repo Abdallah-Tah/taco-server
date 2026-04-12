@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import time
+import requests as _requests
 from datetime import datetime
 from pathlib import Path
 
@@ -31,7 +32,25 @@ LOCK_FILE = Path('/tmp/polymarket_auto_redeem.lock')
 STATE_FILE = Path('/tmp/polymarket_auto_redeem_state.json')
 CHECK_EVERY_SEC = 300
 NOTHING_LOG_EVERY_SEC = 1800
-TELEGRAM_TARGET = '7520899464'
+TELEGRAM_TARGET = '-1003948211258'
+TELEGRAM_TOPIC  = 3
+
+# Load bot token from secrets, fallback to OpenClaw config
+_SECRETS = {}
+_secrets_path = Path('/home/abdaltm86/.config/openclaw/secrets.env')
+if _secrets_path.exists():
+    for line in _secrets_path.read_text().splitlines():
+        if '=' in line and not line.startswith('#'):
+            k, v = line.split('=', 1)
+            _SECRETS[k.strip()] = v.strip().strip("'").strip('"')
+
+TG_TOKEN = _SECRETS.get('TELEGRAM_TOKEN', os.environ.get('TELEGRAM_TOKEN', ''))
+if not TG_TOKEN:
+    try:
+        _cfg = json.loads(Path('/home/abdaltm86/.openclaw/openclaw.json').read_text())
+        TG_TOKEN = _cfg.get('channels', {}).get('telegram', {}).get('botToken', '')
+    except Exception:
+        TG_TOKEN = ''
 REDEEM_EMAIL_TO = 'abdallahtmohamed86@gmail.com'
 REDEEM_EMAIL_SUBJECT = 'TacoTrader: REDEEMED 🤑'
 PUSHCUT_URL = 'https://api.pushcut.io/Sp32e9ypdNreANO8BpJGG/notifications/My%20First%20Notification'
@@ -94,9 +113,9 @@ def run_redeem_check():
     except Exception:
         items = []
 
-    ready = [x for x in items if (x.get('status') == 'READY' and float(x.get('value') or 0) > 0)]
+    ready = [x for x in items if x.get('status') == 'READY']
     if not ready:
-        return {"claimed": False, "items": [], "claimed_total": 0.0}
+        return {"claimed": False, "items": [], "claimed_total": 0.0, "errors": []}
 
     live = subprocess.run([str(VENV), str(REDEEM), '--json'], capture_output=True, text=True, timeout=300)
     live_stdout = live.stdout.strip()
@@ -107,12 +126,15 @@ def run_redeem_check():
 
     claimed_total = 0.0
     claimed_items = []
+    errors = []
     for x in result:
         if x.get('status') == 'redeemed':
             val = float(x.get('value') or 0)
             claimed_total += val
             claimed_items.append(x)
-    return {"claimed": bool(claimed_items), "items": claimed_items, "claimed_total": claimed_total}
+        elif x.get('status') in {'error', 'insufficient_gas', 'redeem_failed'}:
+            errors.append(x)
+    return {"claimed": bool(claimed_items), "items": claimed_items, "claimed_total": claimed_total, "errors": errors}
 
 
 def _redeem_prefix(title: str) -> str:
@@ -135,20 +157,60 @@ def _normalize_tx_hash(tx_hash):
     return f'0x{tx}'
 
 
+def _get_trade_details(title: str):
+    """Look up direction, entry price, and pnl from journal for this market."""
+    try:
+        conn = sqlite3.connect(str(ROOT / 'journal.db'))
+        c = conn.cursor()
+        # Match by asset title, most recent resolved trade
+        c.execute("""
+            SELECT direction, entry_price, pnl_absolute, position_size_usd
+            FROM trades
+            WHERE asset LIKE ? AND exit_type='resolved' AND direction NOT IN ('REDEEM')
+            ORDER BY timestamp_close DESC LIMIT 1
+        """, (f'%{title[:40]}%',))
+        row = c.fetchone()
+        conn.close()
+        return row  # (direction, entry_price, pnl_absolute, position_size_usd) or None
+    except Exception:
+        return None
+
+
 def send_telegram_cha_ching(item):
     """Send celebration notification for winning redeems."""
     title = item.get('title') or 'Polymarket redeem'
     value = float(item.get('value') or 0)
     tx = _normalize_tx_hash(item.get('txHash') or item.get('transactionHash')) or 'n/a'
     prefix = _redeem_prefix(title)
-    message = f"💰 CHA-CHING! {prefix} Redeemed ${value:.2f} from {title} | pnl=${value:.2f} tx={tx}"
+
+    # Look up trade details from journal
+    details = _get_trade_details(title)
+    if details:
+        direction, entry_price, pnl_abs, size_usd = details
+        if direction == 'UP':
+            market_label = title.replace('Up or Down', 'UP ⬆️')
+        elif direction == 'DOWN':
+            market_label = title.replace('Up or Down', 'DOWN ⬇️')
+        else:
+            market_label = title
+        cost = float(size_usd or 0)
+        profit = value - cost
+        message = (
+            f"💰 CHA-CHING! {prefix}\n"
+            f"Market: {market_label}\n"
+            f"Entry: ${float(entry_price or 0):.2f} | Paid: ${cost:.2f}\n"
+            f"Redeemed: ${value:.2f} | Profit: +${profit:.2f}\n"
+            f"tx={tx}"
+        )
+    else:
+        message = f"💰 CHA-CHING! {prefix} Redeemed ${value:.2f} from {title} | pnl=${value:.2f} tx={tx}"
     try:
-        subprocess.run([
-            '/home/abdaltm86/.local/bin/openclaw', 'message', 'send',
-            '--channel', 'telegram',
-            '--target', TELEGRAM_TARGET,
-            '--message', message,
-        ], check=False, capture_output=True, text=True, timeout=30)
+        r = _requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_TARGET, "text": message, "message_thread_id": TELEGRAM_TOPIC},
+            timeout=10)
+        if r.status_code != 200:
+            log(f"[REDEEM] Telegram send failed code={r.status_code} body={r.text}")
     except Exception as e:
         log(f"[REDEEM] Telegram send failed: {e}")
 
@@ -161,12 +223,12 @@ def send_telegram_loss(item):
     prefix = _redeem_prefix(title)
     message = f"❌ {prefix} Lost position: {title} ($0.00) tx={tx}"
     try:
-        subprocess.run([
-            '/home/abdaltm86/.local/bin/openclaw', 'message', 'send',
-            '--channel', 'telegram',
-            '--target', TELEGRAM_TARGET,
-            '--message', message,
-        ], check=False, capture_output=True, text=True, timeout=30)
+        r = _requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_TARGET, "text": message, "message_thread_id": TELEGRAM_TOPIC},
+            timeout=10)
+        if r.status_code != 200:
+            log(f"[REDEEM] Telegram loss send failed code={r.status_code} body={r.text}")
     except Exception as e:
         log(f"[REDEEM] Telegram loss send failed: {e}")
 
@@ -229,6 +291,17 @@ def main():
                             send_telegram_cha_ching(item)
                             # send_redeem_email(item)  # Disabled per user request
                             send_pushcut_notification(item)
+                elif result.get('errors'):
+                    for item in result['errors']:
+                        status = item.get('status') or 'error'
+                        err = item.get('error') or ''
+                        if status == 'insufficient_gas':
+                            log(
+                                f"[REDEEM] Insufficient POL gas for {item.get('title')} "
+                                f"(need {float(item.get('requiredPol') or 0):.6f}, have {float(item.get('availablePol') or 0):.6f})"
+                            )
+                        else:
+                            log(f"[REDEEM] {status} for {item.get('title')}: {err}")
                 else:
                     now = int(time.time())
                     if now - int(state.get('last_nothing_log') or 0) >= NOTHING_LOG_EVERY_SEC:

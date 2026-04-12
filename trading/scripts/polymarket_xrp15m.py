@@ -21,6 +21,7 @@ from pathlib import Path
 import requests
 
 from polymarket_clob_pricing import fetch_book, choose_buy_price
+from scalp_exit import ScalpExitManager
 
 # ── Paths & creds ──────────────────────────────────────────────────────────────
 WORK_DIR      = Path("/home/abdaltm86/.openclaw/workspace/trading")
@@ -55,7 +56,8 @@ def _int(key, default):
         return int(default)
 
 TELEGRAM_TOKEN = ENV.get("TELEGRAM_TOKEN", "8457917317:AAGtnuRix7Ei-rslwVAbfFIFJSK0UIwi0d4")
-CHAT_ID        = ENV.get("CHAT_ID",        "7520899464")
+CHAT_ID        = ENV.get("CHAT_ID",        "-1003948211258")
+TOPIC_ID       = ENV.get("TOPIC_ID",       "3")
 POLY_WALLET    = ENV.get("POLY_WALLET",    "0x1a4c163a134D7154ebD5f7359919F9c439424f00")
 VENV_PY        = Path("/home/abdaltm86/.openclaw/workspace/trading/.polymarket-venv/bin/python3")
 DRY_RUN        = os.environ.get("XRP15M_DRY_RUN",  ENV.get("XRP15M_DRY_RUN",  "true")).lower() != "false"
@@ -74,6 +76,8 @@ ARB_SIZE        = _float("XRP15M_ARB_SIZE", 10.00)
 SNIPE_DELTA_MIN = _float("XRP15M_SNIPE_DELTA_MIN", 0.025)
 SNIPE_MAX_PRICE = _float("XRP15M_SNIPE_MAX_PRICE", 0.90)
 EXEC_SPREAD_CAP = _float("XRP15M_EXEC_SPREAD_CAP", 0.10)
+XRP_EXEC_BOOK_SPREAD_CAP = _float("XRP15M_BOOK_SPREAD_CAP", 0.03)
+XRP_EXEC_GAMMA_CLOB_MAX = _float("XRP15M_GAMMA_CLOB_MAX", 0.05)
 # Signal confirmation (improved filtering)
 SIGNAL_CONFIRM_COUNT   = _int("XRP15M_SIGNAL_CONFIRM_COUNT", 2)   # consecutive polls needed
 SIGNAL_CONFIRM_SEC     = _int("XRP15M_SIGNAL_CONFIRM_SEC", 15)     # max age of confirm samples
@@ -105,9 +109,14 @@ _state = {
     "maker_shares":     0.0,
     "maker_done":       False,
     "maker_last_poll":  0,
+    "maker_placed_ts":  0,
     "maker_seen_fills": [],
+    "diag_orders_placed": 0,
+    "diag_orders_cancelled": 0,
 }
 _positions = []   # list of dicts for open/confirmation positions
+
+scalp_mgr = None  # initialized in main()
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 def log(msg):
@@ -125,12 +134,36 @@ def tg(msg):
         try:
             requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                json={"chat_id": CHAT_ID, "text": msg},
+                json={"chat_id": CHAT_ID, "text": msg, "message_thread_id": int(TOPIC_ID)},
                 timeout=10,
             )
         except Exception:
             pass
     threading.Thread(target=_send, daemon=True).start()
+
+
+def _book_quality_abort(ctx, mode='maker'):
+    book = ctx.get('book') or {}
+    best_bid = book.get('best_bid')
+    best_ask = book.get('best_ask')
+    midpoint = book.get('midpoint')
+    spread = book.get('spread')
+    gamma_price = ctx.get('gamma_price')
+    submitted_price = ctx.get('submitted_price')
+
+    if best_ask is None:
+        return 'missing_best_ask'
+    if mode == 'maker' and best_bid is None:
+        return 'missing_best_bid'
+    if spread is None:
+        return 'missing_spread'
+    if spread > XRP_EXEC_BOOK_SPREAD_CAP:
+        return f'spread_too_wide:{spread:.4f}>{XRP_EXEC_BOOK_SPREAD_CAP:.4f}'
+    if gamma_price is not None and midpoint is not None and abs(midpoint - gamma_price) > XRP_EXEC_GAMMA_CLOB_MAX:
+        return f'mid_vs_gamma_too_wide:{midpoint:.4f}:{gamma_price:.4f}'
+    if gamma_price is not None and submitted_price is not None and abs(submitted_price - gamma_price) > XRP_EXEC_GAMMA_CLOB_MAX:
+        return f'submitted_vs_gamma_too_wide:{submitted_price:.4f}:{gamma_price:.4f}'
+    return None
 
 
 def trigger_post_resolution_tasks():
@@ -153,6 +186,9 @@ def load_state():
         with open(STATE_F) as f:
             _state = json.load(f)
     _state.setdefault('maker_seen_fills', [])
+    _state.setdefault('maker_placed_ts', 0)
+    _state.setdefault('diag_orders_placed', 0)
+    _state.setdefault('diag_orders_cancelled', 0)
 
 # ── XRP price from Coinbase ────────────────────────────────────────────────────
 def get_xrp_price():
@@ -393,6 +429,14 @@ def check_maker_snipe(market, seconds_remaining):
                 _state['snipe_done'] = True
                 save_state()
                 return True
+            no_fill_reason = vf.get('reason', 'no_recent_fill')
+            open_for = max(0, int(time.time()) - int(_state.get('maker_placed_ts', 0) or 0))
+            log(f"[XRP-MAKER] VERIFY NO FILL: {oid} | open_for={open_for}s | reason={no_fill_reason}")
+            tg(f"[XRP-MAKER] ORDER CANCELLED (verify no fill): {oid} | open_for={open_for}s")
+            _state['diag_orders_cancelled'] = _state.get('diag_orders_cancelled', 0) + 1
+            _state['maker_done'] = True
+            save_state()
+            return False
         if seconds_remaining <= MAKER_CANCEL_SEC and st.get('status') in ('open', 'partially_filled'):
             maker_cancel_order(oid)
             log(f"[XRP-MAKER] cancel by deadline order_id={oid} sec_rem={seconds_remaining}")
@@ -461,6 +505,10 @@ def check_maker_snipe(market, seconds_remaining):
     if ctx['abort_reason']:
         log(f"[XRP-MAKER] ABORT: pricing_source=CLOB slug={market.get('slug','')} side={ctx['side_label']} token_id={token_id} gamma_price={gamma_price:.4f} clob_best_bid={bid_str} clob_best_ask={ask_str} clob_midpoint={mid_str} submitted_price=NA spread={spread_str} abort_reason={ctx['abort_reason']}")
         return None
+    quality_abort = _book_quality_abort(ctx, mode='maker')
+    if quality_abort:
+        log(f"[XRP-MAKER] ABORT: pricing_source=CLOB slug={market.get('slug','')} side={ctx['side_label']} token_id={token_id} gamma_price={gamma_price:.4f} clob_best_bid={bid_str} clob_best_ask={ask_str} clob_midpoint={mid_str} submitted_price={limit_price:.4f} spread={spread_str} abort_reason={quality_abort}")
+        return None
     shares = max(5.0, math.floor((SNIPE_DEFAULT / max(limit_price, 0.01)) * 100) / 100)
     log(f"[XRP-MAKER] pricing_source=CLOB slug={market.get('slug','')} side={ctx['side_label']} token_id={token_id} gamma_price={gamma_price:.4f} clob_best_bid={bid_str} clob_best_ask={ask_str} clob_midpoint={mid_str} submitted_price={limit_price:.4f} spread={spread_str} shares={shares:.2f} dry={MAKER_DRY_RUN}")
     r = maker_place_order('BUY', shares, limit_price, market['condition_id'], token_id)
@@ -471,17 +519,26 @@ def check_maker_snipe(market, seconds_remaining):
         for line in r['error'].splitlines():
             if line.strip():
                 log(f"[EXEC-ERR] {line.strip()}")
-    _state['maker_order_id'] = str(r.get('order_id') or (r.get('posted') or {}).get('order_id') or '')
+    posted_oid = str(r.get('order_id') or (r.get('posted') or {}).get('order_id') or '')
+    if not r.get('success') or not posted_oid:
+        fail_reason = 'missing_order_id' if r.get('success') and not posted_oid else 'executor_error'
+        log(f"[XRP-MAKER] submit failed reason={fail_reason} sec_rem={seconds_remaining} output_oid={posted_oid or 'none'}")
+        _state['maker_done'] = True
+        save_state()
+        return False
+    _state['maker_order_id'] = posted_oid
     _state['maker_token_id'] = token_id
     _state['maker_side'] = direction
     _state['maker_price'] = limit_price
     _state['maker_shares'] = shares
     _state['maker_last_poll'] = int(time.time())
+    _state['maker_placed_ts'] = int(time.time())
     _state['maker_done'] = False
+    _state['diag_orders_placed'] = _state.get('diag_orders_placed', 0) + 1
     save_state()
     # Send Telegram notification for order placement
-    tg(f"[XRP-MAKER] ORDER PLACED: {direction} {shares:.2f} shares @ {limit_price:.4f} | Order: {r.get('order_id') or (r.get('posted') or {}).get('order_id') or ''}")
-    return r.get('success')
+    tg(f"[XRP-MAKER] ORDER PLACED: {direction} {shares:.2f} shares @ {limit_price:.4f} | Order: {posted_oid}")
+    return True
 
 # ── Strategy A: Arb check ─────────────────────────────────────────────────────
 def check_arb(market):
@@ -553,6 +610,10 @@ def check_snipe(market, seconds_remaining):
     if price is None or ctx['abort_reason']:
         log(f"[XRP-SNIPE] ABORT: pricing_source=CLOB slug={market.get('slug','')} side={ctx['side_label']} token_id={token_id} gamma_price={gamma_price:.4f} clob_best_bid={bid_str} clob_best_ask={ask_str} clob_midpoint={mid_str} submitted_price=NA spread={spread_str} abort_reason={ctx['abort_reason'] or 'missing_clob_reference'}")
         return None
+    quality_abort = _book_quality_abort(ctx, mode='taker')
+    if quality_abort:
+        log(f"[XRP-SNIPE] ABORT: pricing_source=CLOB slug={market.get('slug','')} side={ctx['side_label']} token_id={token_id} gamma_price={gamma_price:.4f} clob_best_bid={bid_str} clob_best_ask={ask_str} clob_midpoint={mid_str} submitted_price={submitted_price:.4f} spread={spread_str} abort_reason={quality_abort}")
+        return None
 
     size = SNIPE_STRONG if abs(delta_pct) >= SNIPE_STRONG_D * 100 else SNIPE_DEFAULT
     shares = size / submitted_price
@@ -613,6 +674,10 @@ def setup_new_window(slug, window_ts):
     save_state()
     trigger_post_resolution_tasks()
 
+    # Reset scalp exit for new window
+    if scalp_mgr is not None:
+        scalp_mgr.reset()
+
     log(f"[NEW WINDOW] ts={window_ts} XRP={xrp_price} slug={slug}")
     # Window start — no telegram noise
 
@@ -630,11 +695,22 @@ def check_daily_limit():
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 def main():
-    global _state
+    global _state, scalp_mgr
     load_state()
     log("=" * 60)
+    scalp = ScalpExitManager(
+        engine="xrp15m",
+        venv_py=VENV_PY,
+        work_dir=WORK_DIR,
+        log_fn=log,
+        tg_fn=tg,
+        dry_run=DRY_RUN,
+        env_dict=ENV,
+    )
+    scalp_mgr = scalp
     log(f"[XRP-15M] STARTING {'(DRY RUN)' if DRY_RUN else '(LIVE)'}")
     log(f"[XRP-15M] Arb threshold=${ARB_THRESHOLD}, snipe delta>={SNIPE_DELTA_MIN}%, max daily loss=${MAX_DAILY_LOSS} | maker={MAKER_ENABLED} dry={MAKER_DRY_RUN} start=T-{MAKER_START_SEC} cancel=T-{MAKER_CANCEL_SEC} offset={MAKER_OFFSET}")
+    log(f"[XRP-15M] scalp_exit={scalp.is_enabled()} target=+{scalp.target_cents} stop=-{scalp.stop_cents}")
     tg("[XRP-15M] Engine started!")
 
     while True:
@@ -679,9 +755,22 @@ def main():
 
         # Strategy B: Snipe / Maker Snipe
         if MAKER_ENABLED:
-            check_maker_snipe(market, sec_rem)
+            maker_result = check_maker_snipe(market, sec_rem)
+            # Activate scalp exit on fresh maker fill
+            if maker_result is True and scalp.is_enabled() and not scalp.active:
+                scalp.on_fill(
+                    token_id=_state.get('maker_token_id', ''),
+                    entry_price=_state.get('maker_price', 0),
+                    shares=_state.get('maker_shares', 0),
+                    direction=_state.get('maker_side', 'UP'),
+                    market_label=_state.get('maker_market_ref', ''),
+                )
         elif sec_rem <= SNIPE_WINDOW and sec_rem > 5:
             check_snipe(market, sec_rem)
+
+        # Scalp exit monitoring
+        if scalp.active:
+            scalp.tick(market, sec_rem)
 
         # Sleep
         time.sleep(SCAN_SEC)
