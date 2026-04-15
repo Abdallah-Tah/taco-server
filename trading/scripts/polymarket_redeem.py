@@ -129,18 +129,19 @@ def get_usdc_balance(w3, wallet_address):
 def log_redeem_to_journal(title, condition_id, value, tx_hash, status):
     conn = sqlite3.connect(str(JOURNAL_DB))
     c = conn.cursor()
-    tid = f"redeem_{condition_id}_{int(time.time())}"
+    tid = f"redeem-{str(condition_id)[:16]}-{int(time.time())}"
     now = datetime.now(timezone.utc).isoformat()
     tx_canon = _normalize_tx_hash(tx_hash)
     c.execute(
         """
         INSERT INTO trades (
-            engine, timestamp_open, timestamp_close, asset, category, direction,
+            trade_id, engine, timestamp_open, timestamp_close, asset, category, direction,
             entry_price, exit_price, position_size, position_size_usd, pnl_absolute,
             pnl_percent, exit_type, hold_duration_seconds, regime, notes
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
+            tid,
             'polymarket_redeem', now, now, title[:200], 'redeem', 'REDEEM',
             0.0, 0.0, 0.0, 0.0, float(value or 0.0), 0.0,
             status, 0, 'normal', f'condition={condition_id} tx={tx_canon or tx_hash}'
@@ -278,8 +279,12 @@ def main():
                 usdc_after = get_usdc_balance(w3, funder_checksum)
                 actual_value = max(0.0, (usdc_after - usdc_before) / 1_000_000)
                 status = 'redeemed' if receipt.status == 1 else 'redeem_failed'
-                log_redeem_to_journal(title, condition_id, actual_value, tx_hash, status)
-                summary.append({
+                journal_error = None
+                try:
+                    log_redeem_to_journal(title, condition_id, actual_value, tx_hash, status)
+                except Exception as je:
+                    journal_error = str(je)
+                row = {
                     'title': title,
                     'conditionId': condition_id,
                     'value': actual_value,
@@ -287,16 +292,21 @@ def main():
                     'indexSets': index_sets,
                     'txHash': tx_hash,
                     'status': status,
-                })
+                }
+                if journal_error:
+                    row['journal_error'] = journal_error
+                summary.append(row)
                 nonce += 1
             except Exception as e:
+                msg = str(e)
+                # If tx already landed, surface as redeem_failed/tx_sent instead of generic error when possible
                 summary.append({
                     'title': title,
                     'conditionId': condition_id,
                     'value': estimated_value,
                     'indexSets': index_sets,
                     'status': 'error',
-                    'error': str(e),
+                    'error': msg,
                 })
 
         print(json.dumps(summary, indent=2) if json_mode else '\n'.join(json.dumps(x) for x in summary))

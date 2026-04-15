@@ -11,6 +11,7 @@
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
@@ -96,6 +97,25 @@ def acquire_lock():
             os.write(fd, str(os.getpid()).encode())
             os.close(fd)
             return True
+
+
+def ensure_single_instance():
+    """Exit if another daemon instance is already alive."""
+    try:
+        if PID_FILE.exists():
+            old_pid = int(PID_FILE.read_text().strip())
+            if old_pid and old_pid != os.getpid():
+                try:
+                    os.kill(old_pid, 0)
+                    log(f'[REDEEM] Another daemon already running (pid={old_pid}), exiting')
+                    return False
+                except Exception:
+                    pass
+        PID_FILE.write_text(str(os.getpid()))
+        return True
+    except Exception as e:
+        log(f'[REDEEM] PID guard error: {e}')
+        return True
 
 
 def release_lock():
@@ -271,48 +291,54 @@ def send_pushcut_notification(item):
 
 
 def main():
-    PID_FILE.write_text(str(os.getpid()))
+    if not ensure_single_instance():
+        return
     log('[REDEEM] Auto-redeem daemon started')
     state = load_state()
-    while True:
-        if acquire_lock():
-            try:
-                result = run_redeem_check()
-                if result['claimed']:
-                    for item in result['items']:
-                        val = float(item.get('value') or 0)
-                        if val <= 0:
-                            # Loss - notify but without celebration
-                            log(f"[REDEEM] Lost position: {item.get('title')} ($0.00)")
-                            send_telegram_loss(item)
-                        else:
-                            # Win - full celebration
-                            log(f"[REDEEM] Claimed ${val:.2f} from {item.get('title')}")
-                            send_telegram_cha_ching(item)
-                            # send_redeem_email(item)  # Disabled per user request
-                            send_pushcut_notification(item)
-                elif result.get('errors'):
-                    for item in result['errors']:
-                        status = item.get('status') or 'error'
-                        err = item.get('error') or ''
-                        if status == 'insufficient_gas':
-                            log(
-                                f"[REDEEM] Insufficient POL gas for {item.get('title')} "
-                                f"(need {float(item.get('requiredPol') or 0):.6f}, have {float(item.get('availablePol') or 0):.6f})"
-                            )
-                        else:
-                            log(f"[REDEEM] {status} for {item.get('title')}: {err}")
-                else:
-                    now = int(time.time())
-                    if now - int(state.get('last_nothing_log') or 0) >= NOTHING_LOG_EVERY_SEC:
-                        log('[REDEEM] Nothing to claim')
-                        state['last_nothing_log'] = now
-                        save_state(state)
-            except Exception as e:
-                log(f'[REDEEM] ERROR {e}')
-            finally:
-                release_lock()
-        time.sleep(CHECK_EVERY_SEC)
+    try:
+        while True:
+            if acquire_lock():
+                try:
+                    result = run_redeem_check()
+                    if result['claimed']:
+                        for item in result['items']:
+                            val = float(item.get('value') or 0)
+                            title = item.get('title') or ''
+                            if val > 0:
+                                log(f"[REDEEM] Claimed ${val:.2f} from {title}")
+                                send_telegram_cha_ching(item)
+                                # send_redeem_email(item)  # Disabled per user request
+                                send_pushcut_notification(item)
+                            else:
+                                log(f"[REDEEM] Zero-value redeem for {title} — suppressing loss alert")
+                    elif result.get('errors'):
+                        for item in result['errors']:
+                            status = item.get('status') or 'error'
+                            err = item.get('error') or ''
+                            if status == 'insufficient_gas':
+                                log(
+                                    f"[REDEEM] Insufficient POL gas for {item.get('title')} "
+                                    f"(need {float(item.get('requiredPol') or 0):.6f}, have {float(item.get('availablePol') or 0):.6f})"
+                                )
+                            else:
+                                log(f"[REDEEM] {status} for {item.get('title')}: {err}")
+                    else:
+                        now = int(time.time())
+                        if now - int(state.get('last_nothing_log') or 0) >= NOTHING_LOG_EVERY_SEC:
+                            log('[REDEEM] Nothing to claim')
+                            state['last_nothing_log'] = now
+                            save_state(state)
+                except Exception as e:
+                    log(f'[REDEEM] ERROR {e}')
+                finally:
+                    release_lock()
+            time.sleep(CHECK_EVERY_SEC)
+    finally:
+        try:
+            if PID_FILE.exists() and PID_FILE.read_text().strip() == str(os.getpid()):
+                PID_FILE.unlink()
+        except Exception:
+            pass
 
 
 if __name__ == '__main__':
