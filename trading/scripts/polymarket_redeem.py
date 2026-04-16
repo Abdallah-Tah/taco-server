@@ -76,14 +76,21 @@ def fetch_redeemables():
     return [p for p in positions if p.get('redeemable') is True and p.get('conditionId')]
 
 
-def _index_sets_for_position(position):
-    """Use the held outcome side when we know it, which is cheaper than redeeming both sides."""
-    try:
-        outcome_index = int(position.get('outcomeIndex'))
-        if outcome_index >= 0:
-            return [1 << outcome_index]
-    except Exception:
-        pass
+def _index_sets_for_positions(positions):
+    """Redeem all held outcome sides for a condition together.
+    Critical for failed-merge CTF windows: if both YES and NO remain, redeem both index sets
+    instead of overwriting one side and accidentally redeeming a zero-value single side.
+    """
+    bits = set()
+    for position in positions:
+        try:
+            outcome_index = int(position.get('outcomeIndex'))
+            if outcome_index >= 0:
+                bits.add(1 << outcome_index)
+        except Exception:
+            continue
+    if bits:
+        return sorted(bits)
     return [1, 2]
 
 
@@ -202,18 +209,21 @@ def main():
         redeemables = fetch_redeemables()
         grouped = {}
         for p in redeemables:
-            grouped[p['conditionId']] = p
+            grouped.setdefault(p['conditionId'], []).append(p)
 
         summary = []
         if dry or not grouped:
-            for condition_id, p in grouped.items():
+            for condition_id, positions in grouped.items():
+                title = positions[0].get('title') if positions else condition_id
+                estimated_value = sum(float(p.get('currentValue', 0) or 0) for p in positions)
                 summary.append({
-                    'title': p.get('title'),
+                    'title': title,
                     'conditionId': condition_id,
-                    'value': float(p.get('currentValue', 0) or 0),
+                    'value': estimated_value,
+                    'indexSets': _index_sets_for_positions(positions),
                     'status': 'READY'
                 })
-            print(json.dumps(summary, indent=2) if json_mode else '\n'.join(f"READY | ${x['value']:.2f} | {x['title']}" for x in summary))
+            print(json.dumps(summary, indent=2) if json_mode else '\n'.join(f"READY | ${x['value']:.2f} | {x['title']} | indexSets={x['indexSets']}" for x in summary))
             return
 
         s = load_secrets()
@@ -230,14 +240,14 @@ def main():
 
         ordered = sorted(
             grouped.items(),
-            key=lambda item: float(item[1].get('currentValue', 0) or 0),
+            key=lambda item: sum(float(p.get('currentValue', 0) or 0) for p in item[1]),
             reverse=True,
         )
 
-        for condition_id, p in ordered:
-            title = p.get('title', '')
-            estimated_value = float(p.get('currentValue', 0) or 0)
-            index_sets = _index_sets_for_position(p)
+        for condition_id, positions in ordered:
+            title = positions[0].get('title', '') if positions else ''
+            estimated_value = sum(float(p.get('currentValue', 0) or 0) for p in positions)
+            index_sets = _index_sets_for_positions(positions)
             try:
                 _, priority_fee, max_fee = _fee_caps(w3)
                 data = contract.functions.redeemPositions(

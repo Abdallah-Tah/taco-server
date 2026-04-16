@@ -380,15 +380,16 @@ def check_order_status(client, order_id):
         return {"status": "error", "order_id": order_id, "error": str(e)}
 
 
-def place_order(client, token_id, amount, price, side=BUY, market_question="", condition_id="", order_type=None, verify=False):
+def place_order(client, token_id, amount, price, side=BUY, market_question="", condition_id="", order_type=None, verify=False, post_only=False, max_trade_size_override=None):
     """Place an order. For 15m snipes we prefer FOK at/through the current best ask."""
     if price <= 0 or price >= 1:
         print(f"ERROR: Price must be between 0.01 and 0.99, got {price}", file=sys.stderr)
         return None
 
+    effective_max_trade_size = float(max_trade_size_override) if max_trade_size_override is not None else MAX_TRADE_SIZE
     dollar_cost = amount * price
-    if dollar_cost > MAX_TRADE_SIZE:
-        print(f"ERROR: Trade cost ${dollar_cost:.2f} exceeds max ${MAX_TRADE_SIZE}", file=sys.stderr)
+    if dollar_cost > effective_max_trade_size:
+        print(f"ERROR: Trade cost ${dollar_cost:.2f} exceeds max ${effective_max_trade_size}", file=sys.stderr)
         return None
     if amount < MIN_SHARES:
         print(f"ERROR: Shares {amount} below Polymarket minimum {MIN_SHARES}", file=sys.stderr)
@@ -447,7 +448,7 @@ def place_order(client, token_id, amount, price, side=BUY, market_question="", c
             side=side,
         )
         signed = client.create_order(order_args)
-        posted = client.post_order(signed, orderType=actual_order_type)
+        posted = client.post_order(signed, orderType=actual_order_type, post_only=post_only)
 
         order_id = None
         if isinstance(posted, dict):
@@ -464,7 +465,7 @@ def place_order(client, token_id, amount, price, side=BUY, market_question="", c
             price=actual_price,
             order_id=order_id,
             market_question=market_question,
-            extra={"order_type": str(actual_order_type), "best_ask": best_ask, "submitted_price": actual_price, "tick_size": tick},
+            extra={"order_type": str(actual_order_type), "post_only": bool(post_only), "best_ask": best_ask, "submitted_price": actual_price, "tick_size": tick},
         )
 
         fill = None
@@ -862,8 +863,17 @@ def main():
         token_id = args[1]
         amount = float(args[2])
         price = float(args[3])
+        post_only = any(a in ("--post-only", "post_only=true", "post-only") for a in args[4:])
+        max_override = None
+        for a in args[4:]:
+            if a.startswith("--max-trade-size="):
+                try:
+                    max_override = float(a.split("=", 1)[1])
+                except:
+                    pass
         client = get_client()
-        place_order(client, token_id, amount, price, SELL)
+        result = place_order(client, token_id, amount, price, SELL, post_only=post_only, max_trade_size_override=max_override)
+        print(json.dumps(result if result else {"success": False}, default=str))
 
     elif cmd == "cancel" and len(args) >= 2:
         order_id = args[1]
