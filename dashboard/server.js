@@ -1,37 +1,51 @@
 import express from "express";
 import http from "http";
-import net from "net";
 import { Readable } from "stream";
 import path from "path";
 import { fileURLToPath } from "url";
+import { createProxyMiddleware } from "http-proxy-middleware";
 import facesRouter from "./routes/faces.js";
 
 const PORT = process.env.PORT || 8080;
 const DASHBOARD_DIR = path.dirname(fileURLToPath(import.meta.url));
-const UI_DIR = process.env.UI_DIR || DASHBOARD_DIR;
+const UI_DIR = process.env.UI_DIR || path.join(DASHBOARD_DIR, "frontend", "dist");
 const LIVE_API = process.env.LIVE_API || "http://127.0.0.1:18791";
+const TTYD_URL = process.env.TTYD_URL || "http://127.0.0.1:7681";
 const app = express();
+
+const mobileTerminalProxy = createProxyMiddleware({
+  target: TTYD_URL,
+  changeOrigin: true,
+  ws: true,
+  pathRewrite: (path) => path.replace(/^\/(mobile-terminal|tty)/, "") || "/",
+});
 
 app.use(express.json());
 app.use("/api/faces", facesRouter);
 
-app.get("/api/events/stream", async (req, res) => {
-  try {
-    const r = await fetch(`${LIVE_API}/api/events/stream`);
+app.use(["/tty", "/mobile-terminal"], (req, res, next) => {
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("Expires", "0");
+  next();
+});
+
+app.use("/mobile-terminal", (req, res) => {
+  const suffix = req.originalUrl.replace(/^\/mobile-terminal/, "") || "";
+  res.redirect(302, `/tty${suffix}`);
+});
+
+app.get("/api/events/stream", (req, res) => {
+  const proxyReq = http.get(`${LIVE_API}/api/events/stream`, (proxyRes) => {
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache");
     res.setHeader("Connection", "keep-alive");
-    if (!r.ok || !r.body) {
-      res.status(502).end();
-      return;
-    }
-    const upstream = Readable.fromWeb(r.body);
-    req.on("close", () => upstream.destroy());
-    upstream.on("error", () => res.end());
-    upstream.pipe(res);
-  } catch (e) {
-    res.status(500).end();
-  }
+    proxyRes.pipe(res);
+    proxyRes.on("error", () => res.end());
+  });
+
+  proxyReq.on("error", () => res.status(502).end());
+  req.on("close", () => proxyReq.destroy());
 });
 
 app.all("/api/*", async (req, res) => {
@@ -57,7 +71,22 @@ app.all("/api/*", async (req, res) => {
   });
 });
 
+app.use("/tty", mobileTerminalProxy);
 app.use(express.static(UI_DIR));
+
+app.get("*", (req, res) => {
+  if (req.url.startsWith("/api") || req.url.startsWith("/system") || req.url.startsWith("/health") || req.url.startsWith("/mobile-terminal") || req.url.startsWith("/tty")) {
+    return;
+  }
+
+  const indexPath = path.join(UI_DIR, "index.html");
+  res.sendFile(indexPath, (err) => {
+    if (err) {
+      console.error("Error sending index.html:", err);
+      res.status(404).send("index.html not found in " + UI_DIR);
+    }
+  });
+});
 
 app.get("/faces", (req, res) => res.sendFile(path.join(UI_DIR, "faces.html")));
 
@@ -74,14 +103,12 @@ app.get("/token", async (req, res) => {
 const server = http.createServer(app);
 
 server.on("upgrade", (req, socket, head) => {
-  const proxy = net.connect(7681, "127.0.0.1", () => {
-    let r = `${req.method} ${req.url} HTTP/${req.httpVersion}\r\n`;
-    for (const [k, v] of Object.entries(req.headers)) r += `${k}: ${v}\r\n`;
-    r += "\r\n";
-    proxy.write(r);
-    proxy.write(head);
-    socket.pipe(proxy).pipe(socket);
-  });
+  if (req.url?.startsWith("/tty")) {
+    req.url = req.url.replace(/^\/tty/, "") || "/";
+    mobileTerminalProxy.upgrade(req, socket, head);
+    return;
+  }
+  socket.destroy();
 });
 
 server.listen(PORT, "0.0.0.0", () => console.log("Gateway Ready"));

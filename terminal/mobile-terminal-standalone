@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -e
+export TERM=${TERM:-xterm-256color}
+exec /home/abdaltm86/Documents/taco-servers/terminal/taco-menu
