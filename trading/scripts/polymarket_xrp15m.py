@@ -272,18 +272,6 @@ def get_market(slug):
         log(f"Gamma error: {e}")
     return None
 
-# ── CLOB: get order book ──────────────────────────────────────────────────────
-def get_clob_prices(condition_id):
-    try:
-        r = requests.get(
-            f"https://clob.polymarket.com/orders?condition_id={condition_id}&喝着=1",
-            timeout=10,
-        )
-        return r.json()
-    except Exception as e:
-        log(f"CLOB error: {e}")
-    return {}
-
 # ── Place order via polymarket_executor ───────────────────────────────────────
 def place_order(side, shares, price, condition_id, token_id):
     """Use aggressive FOK buy orders for immediate 15m fills and verify them."""

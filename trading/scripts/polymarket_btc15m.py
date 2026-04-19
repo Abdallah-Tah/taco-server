@@ -85,7 +85,8 @@ def _bool(key, default):
     return str(os.environ.get(key, ENV.get(key, str(default)))).lower() in ("1", "true", "yes", "on")
 
 TELEGRAM_TOKEN = ENV.get("TELEGRAM_TOKEN", "8457917317:AAHGueV-SogZl14cW5uMmIACpaWuyzByXOo")
-CHAT_ID        = ENV.get("CHAT_ID",        "7520899464")
+CHAT_ID        = ENV.get("CHAT_ID",        "-1003948211258")
+TOPIC_ID       = ENV.get("TOPIC_ID",       "3")
 POLY_WALLET    = ENV.get("POLY_WALLET",    "0x1a4c163a134D7154ebD5f7359919F9c439424f00")
 VENV_PY        = Path("/home/abdaltm86/.openclaw/workspace/trading/.polymarket-venv/bin/python3")
 USE_SHARED_JOURNAL = _bool("BTC15M_SHARED_JOURNAL", False)
@@ -102,6 +103,7 @@ MAKER_MIN_PRICE = _float("BTC15M_MAKER_MIN_PRICE", 0.01)
 MAKER_FOK_FALLBACK_SEC = _int("BTC15M_MAKER_FOK_FALLBACK_SEC", 60)
 # FIX #5: Allow retry after cancellation if >N seconds remain
 MAKER_RETRY_MIN_SEC = _int("BTC15M_MAKER_RETRY_MIN_SEC", 45)
+MAKER_MAX_RETRIES = _int("BTC15M_MAKER_MAX_RETRIES", 0)
 
 BTC15M_GABAGOOL_ENABLED = os.environ.get("BTC15M_GABAGOOL_ENABLED", ENV.get("BTC15M_GABAGOOL_ENABLED", "false")).lower() == "true"
 BTC15M_GABAGOOL_DRY_RUN = os.environ.get("BTC15M_GABAGOOL_DRY_RUN", ENV.get("BTC15M_GABAGOOL_DRY_RUN", "true")).lower() != "false"
@@ -126,6 +128,11 @@ SIGNAL_CONFIRM_SEC     = _int("BTC15M_SIGNAL_CONFIRM_SEC", 15)     # max age of 
 # FIX #17: Capped max entry at 0.50 — 0.45-0.49 bucket is 75% win rate, above 0.50 loses money
 SIGNAL_MAX_ENTRY_PRICE = _float("BTC15M_SIGNAL_MAX_ENTRY_PRICE", 0.50)
 SIGNAL_MIN_ENTRY_PRICE = _float("BTC15M_SIGNAL_MIN_ENTRY_PRICE", 0.45)
+# Soft band: allow entries in [SOFT_MIN, MIN) at reduced size (0.50–0.55 default).
+# Backtest showed 0.40–0.55 = 31.7% WR so we cap at SOFT_MIN; but 0.50–0.55 boundary is
+# adjacent to the 62.9% WR sweet-spot band and worth half-size probing.
+SIGNAL_SOFT_MIN_ENTRY_PRICE = _float("BTC15M_SIGNAL_SOFT_MIN_ENTRY_PRICE", 0.50)
+SIGNAL_SOFT_BAND_SIZE_MULT = _float("BTC15M_SIGNAL_SOFT_BAND_SIZE_MULT", 0.50)
 SNIPE_DEFAULT   = _float("BTC15M_SNIPE_DEFAULT_SIZE", 12.00)
 SNIPE_STRONG    = _float("BTC15M_SNIPE_STRONG_SIZE", 12.00)
 SNIPE_STRONG_D  = _float("BTC15M_SNIPE_STRONG_DELTA", 0.10)  # percent
@@ -140,10 +147,10 @@ SCAN_SEC        = _int("BTC15M_SCAN_INTERVAL", 10)
 MAX_DAILY_LOSS  = _float("BTC15M_MAX_DAILY_LOSS", 15.00)
 UP_MIN_DELTA = _float("BTC15M_UP_MIN_DELTA", 0.08)
 DOWN_MIN_DELTA = _float("BTC15M_DOWN_MIN_DELTA", 0.05)
-CONFIRM_TICKS = _int("BTC15M_CONFIRM_TICKS", 3)
+CONFIRM_TICKS = _int("BTC15M_CONFIRM_TICKS", 2)
 CONFIRM_INTERVAL_SEC = _int("BTC15M_CONFIRM_INTERVAL_SEC", 10)
 MAX_GAMMA_CLOB_DIFF = _float("BTC15M_MAX_GAMMA_CLOB_DIFF", 0.08)
-MAX_SPREAD = _float("BTC15M_MAX_SPREAD", 0.015)
+MAX_SPREAD = _float("BTC15M_MAX_SPREAD", 0.020)
 UP_MAX_ENTRY = _float("BTC15M_UP_MAX_ENTRY", 0.62)
 DOWN_MAX_ENTRY = _float("BTC15M_DOWN_MAX_ENTRY", 0.70)
 DIR_LOOKBACK = _int("BTC15M_DIR_LOOKBACK", 5)
@@ -154,9 +161,9 @@ DIR_PAUSE_HOURS = _float("BTC15M_DIR_PAUSE_HOURS", 6)
 ONE_TRADE_PER_WINDOW = _bool("BTC15M_ONE_TRADE_PER_WINDOW", True)
 SIGNAL_CONFIRM_COUNT = max(int(SIGNAL_CONFIRM_COUNT), int(CONFIRM_TICKS))
 SIGNAL_CONFIRM_SEC = max(int(SIGNAL_CONFIRM_SEC), int(CONFIRM_TICKS * CONFIRM_INTERVAL_SEC + 5))
-QUOTE_JUMP_MAX = _float("BTC15M_QUOTE_JUMP_MAX", 0.23)
-QUOTE_DIVERGENCE_MAX = _float("BTC15M_QUOTE_DIVERGENCE_MAX", 0.20)
-QUOTE_DIVERGENCE_CYCLES = _int("BTC15M_QUOTE_DIVERGENCE_CYCLES", 3)
+QUOTE_JUMP_MAX = _float("BTC15M_QUOTE_JUMP_MAX", 0.50)
+QUOTE_DIVERGENCE_MAX = _float("BTC15M_QUOTE_DIVERGENCE_MAX", 0.50)
+QUOTE_DIVERGENCE_CYCLES = _int("BTC15M_QUOTE_DIVERGENCE_CYCLES", 5)
 
 # ── Cooldown system (loss-based, DB-persisted) ──────────────────────────────
 COOLDOWN_LOSS_THRESHOLD = _int("BTC15M_COOLDOWN_LOSS_THRESHOLD", 2)     # losses to trigger
@@ -246,7 +253,7 @@ def tg(msg):
         try:
             r = requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                json={"chat_id": CHAT_ID, "text": msg},
+                json={"chat_id": CHAT_ID, "text": msg, "message_thread_id": int(TOPIC_ID)},
                 timeout=10,
             )
             if r.status_code != 200:
@@ -568,18 +575,6 @@ def get_market(slug):
         log(f"Gamma error: {e}")
     return None
 
-# ── CLOB: get order book ──────────────────────────────────────────────────────
-def get_clob_prices(condition_id):
-    try:
-        r = requests.get(
-            f"https://clob.polymarket.com/orders?condition_id={condition_id}&喝着=1",
-            timeout=10,
-        )
-        return r.json()
-    except Exception as e:
-        log(f"CLOB error: {e}")
-    return {}
-
 # ── Place order via polymarket_executor ───────────────────────────────────────
 def place_order(side, shares, price, condition_id, token_id):
     """Use aggressive FOK buy orders for immediate 15m fills and verify them."""
@@ -721,11 +716,11 @@ def shadow_bucket(price: float) -> str:
 
 
 def shadow_decision_btc(price: float) -> tuple[str, str]:
-    if price > 0.70:
-        return "filtered", "block_gt_0.70"
-    if 0.45 <= price <= 0.62:
-        return "kept", "allow_0.45_0.62"
-    return "filtered", "outside_0.45_0.62"
+    if price > 0.75:
+        return "filtered", "block_gt_0.75"
+    if 0.50 <= price <= 0.75:
+        return "kept", "allow_0.50_0.75"
+    return "filtered", "outside_0.50_0.75"
 
 
 def set_shadow_state_btc(price: float, context: str):
@@ -836,9 +831,9 @@ def choose_direction_book_btc(market: dict, direction: str, token_id: str, submi
         reason = f"clob_error:{raw_book.get('error')}"
     elif raw_ask is None:
         reason = 'missing_best_ask'
-    elif raw_mid is not None and abs(float(raw_mid) - float(gamma_price)) > 0.20:
+    elif raw_mid is not None and abs(float(raw_mid) - float(gamma_price)) > MAX_GAMMA_CLOB_DIFF:
         reason = f"mid_vs_gamma:{raw_mid:.4f}:{float(gamma_price):.4f}"
-    elif abs(float(raw_ask) - float(gamma_book['best_ask'])) > 0.20:
+    elif abs(float(raw_ask) - float(gamma_book['best_ask'])) > MAX_GAMMA_CLOB_DIFF:
         reason = f"ask_vs_gamma_quote:{raw_ask:.4f}:{float(gamma_book['best_ask']):.4f}"
     else:
         reason = None
@@ -848,12 +843,20 @@ def choose_direction_book_btc(market: dict, direction: str, token_id: str, submi
         raw_ask_val = raw_book.get('best_ask')
         raw_bid_str = f"{float(raw_bid_val):.4f}" if raw_bid_val is not None else 'NA'
         raw_ask_str = f"{float(raw_ask_val):.4f}" if raw_ask_val is not None else 'NA'
+        # Trust CLOB (live order book) over gamma when they disagree — gamma outcomePrices
+        # lag near resolution and near fast moves. Only fall back to gamma when CLOB itself
+        # is unavailable (clob_error / missing_best_ask). The divergence reason is still
+        # returned so downstream mismatch-abort can fire against real CLOB prices.
+        use_gamma = reason.startswith('clob_error') or reason == 'missing_best_ask'
+        chosen_book = gamma_book if use_gamma else raw_book
+        source_label = 'gamma_fallback' if use_gamma else 'clob_trusted_despite_divergence'
         log(
-            f"[BTC-BOOK] Using gamma market quote fallback direction={direction} token_id={token_id} "
+            f"[BTC-BOOK] {source_label} direction={direction} token_id={token_id} "
             f"reason={reason} raw_bid={raw_bid_str} raw_ask={raw_ask_str} "
-            f"gamma_bid={gamma_book['best_bid']:.4f} gamma_ask={gamma_book['best_ask']:.4f}"
+            f"gamma_bid={gamma_book['best_bid']:.4f} gamma_ask={gamma_book['best_ask']:.4f} "
+            f"threshold={MAX_GAMMA_CLOB_DIFF:.4f}"
         )
-        return gamma_book, reason
+        return chosen_book, reason
 
     return raw_book, None
 
@@ -1938,10 +1941,15 @@ def check_maker_snipe(market, seconds_remaining):
                     _state['snipe_done'] = True
                     save_state()
                 return True
-            log(f"[BTC-FILL] VERIFY order_id={oid} status={vf.get('status')} size={vf.get('filled_size', 0)} reason={vf.get('reason', 'no_recent_fill')}")
-            if seconds_remaining > MAKER_RETRY_MIN_SEC and _state.get('maker_attempt_count', 0) < 3:
+            no_fill_reason = vf.get('reason', 'no_recent_fill')
+            open_for = max(0, int(time.time()) - int(_state.get('maker_placed_ts', 0) or 0))
+            log(f"[BTC-FILL] VERIFY order_id={oid} status={vf.get('status')} size={vf.get('filled_size', 0)} reason={no_fill_reason}")
+            log(f"[BTC-MAKER] VERIFY NO FILL: {oid} | open_for={open_for}s | reason={no_fill_reason}")
+            tg(f"[BTC-MAKER] ORDER CANCELLED (verify no fill): {oid} | open_for={open_for}s")
+            _state['diag_orders_cancelled'] = _state.get('diag_orders_cancelled', 0) + 1
+            if seconds_remaining > MAKER_RETRY_MIN_SEC and _state.get('maker_attempt_count', 0) < MAKER_MAX_RETRIES:
                 _state['maker_attempt_count'] = _state.get('maker_attempt_count', 0) + 1
-                log(f"[BTC-MAKER] VERIFY unfilled, resetting for retry (attempt {_state['maker_attempt_count']}/3, {seconds_remaining}s remaining)")
+                log(f"[BTC-MAKER] VERIFY unfilled, resetting for retry (attempt {_state['maker_attempt_count']}/{MAKER_MAX_RETRIES}, {seconds_remaining}s remaining)")
                 _reset_maker_state_for_retry()
                 return None
             _reset_maker_state_for_retry()
@@ -1987,9 +1995,9 @@ def check_maker_snipe(market, seconds_remaining):
                 log(f"[BTC-MAKER] FOK fallback no fill, will retry if time permits")
                 _state['diag_orders_cancelled'] = _state.get('diag_orders_cancelled', 0) + 1
                 # FIX #5: Allow retry after FOK fallback fails
-                if seconds_remaining > MAKER_RETRY_MIN_SEC and _state.get('maker_attempt_count', 0) < 3:
+                if seconds_remaining > MAKER_RETRY_MIN_SEC and _state.get('maker_attempt_count', 0) < MAKER_MAX_RETRIES:
                     _state['maker_attempt_count'] = _state.get('maker_attempt_count', 0) + 1
-                    log(f"[BTC-MAKER] RETRY enabled (attempt {_state['maker_attempt_count']}/3, {seconds_remaining}s remaining)")
+                    log(f"[BTC-MAKER] RETRY enabled (attempt {_state['maker_attempt_count']}/{MAKER_MAX_RETRIES}, {seconds_remaining}s remaining)")
                     _reset_maker_state_for_retry()
                     return None
                 else:
@@ -2175,9 +2183,11 @@ def check_maker_snipe(market, seconds_remaining):
         price_bucket = "mid"
     elif token_price >= SIGNAL_MIN_ENTRY_PRICE:
         price_bucket = "sweet_spot"
+    elif token_price >= SIGNAL_SOFT_MIN_ENTRY_PRICE:
+        price_bucket = "soft_band"
     else:
         price_bucket = "low"
-        log(f"[BTC-MAKER] FILTER: pricing_source=CLOB entry_price={token_price:.4f} gamma_price={gamma_price:.4f} < min {SIGNAL_MIN_ENTRY_PRICE:.2f} (bucket={price_bucket}), skipping low price")
+        log(f"[BTC-MAKER] FILTER: pricing_source=CLOB entry_price={token_price:.4f} gamma_price={gamma_price:.4f} < min {SIGNAL_SOFT_MIN_ENTRY_PRICE:.2f} (bucket={price_bucket}), skipping low price")
         shadow_live_gate_btc(token_price, context='maker')
         write_edge_event(
             market,
@@ -2194,7 +2204,10 @@ def check_maker_snipe(market, seconds_remaining):
         return None
 
     if not shadow_live_gate_btc(token_price, context='maker'):
-        price_bucket = "mid" if token_price >= 0.60 else "sweet_spot" if token_price >= SIGNAL_MIN_ENTRY_PRICE else "low"
+        price_bucket = ("mid" if token_price >= 0.60 else
+                        "sweet_spot" if token_price >= SIGNAL_MIN_ENTRY_PRICE else
+                        "soft_band" if token_price >= SIGNAL_SOFT_MIN_ENTRY_PRICE else
+                        "low")
         log(f"[BTC-MAKER] SHADOW FILTER: pricing_source=CLOB entry_price={token_price:.4f} gamma_price={gamma_price:.4f} shadow_reason={_state.get('shadow_reason')} (bucket={price_bucket}), skipping")
         write_edge_event(
             market,
@@ -2252,7 +2265,8 @@ def check_maker_snipe(market, seconds_remaining):
     if ctx['abort_reason']:
         log(f"[BTC-MAKER] ABORT: pricing_source=CLOB slug={market.get('slug','')} side={side_label} token_id={token_id} gamma_price={gamma_price:.4f} clob_best_bid={bid_str} clob_best_ask={ask_str} clob_midpoint={mid_str} submitted_price=NA spread={spread_str} abort_reason={ctx['abort_reason']} attempt={attempt_num} family={family_id}")
         return None
-    maker_budget = SNIPE_DEFAULT * current_risk_multiplier()
+    size_mult = SIGNAL_SOFT_BAND_SIZE_MULT if price_bucket == "soft_band" else 1.0
+    maker_budget = SNIPE_DEFAULT * current_risk_multiplier() * size_mult
     shares = max(5.0, math.floor((maker_budget / max(limit_price, 0.01)) * 100) / 100)
     log(f"[BTC-MAKER] {direction} signal pricing_source=CLOB slug={market.get('slug','')} side={side_label} token_id={token_id} gamma_price={gamma_price:.4f} clob_best_bid={bid_str} clob_best_ask={ask_str} clob_midpoint={mid_str} submitted_price={limit_price:.4f} spread={spread_str} shares={shares:.2f} dry={MAKER_DRY_RUN} attempt={attempt_num} family={family_id}")
     write_edge_event(
@@ -2274,7 +2288,21 @@ def check_maker_snipe(market, seconds_remaining):
         for line in r['error'].splitlines():
             if line.strip():
                 log(f"[EXEC-ERR] {line.strip()}")
-    _state['maker_order_id'] = str(r.get('order_id') or (r.get('posted') or {}).get('order_id') or '')
+
+    posted_oid = str(r.get('order_id') or (r.get('posted') or {}).get('order_id') or '')
+    if not r.get('success') or not posted_oid:
+        _state['diag_orders_submit_failed'] = _state.get('diag_orders_submit_failed', 0) + 1
+        _state['maker_attempt_count'] = _state.get('maker_attempt_count', 0) + 1
+        fail_reason = 'missing_order_id' if r.get('success') and not posted_oid else 'executor_error'
+        log(f"[BTC-MAKER] submit failed reason={fail_reason} attempt={_state['maker_attempt_count']}/{MAKER_MAX_RETRIES} sec_rem={seconds_remaining} output_oid={posted_oid or 'none'}")
+        if seconds_remaining > MAKER_RETRY_MIN_SEC and _state.get('maker_attempt_count', 0) < MAKER_MAX_RETRIES:
+            save_state()
+            return None
+        _state['maker_done'] = True
+        save_state()
+        return False
+
+    _state['maker_order_id'] = posted_oid
     _state['maker_token_id'] = token_id
     _state['maker_side'] = direction
     _state['maker_price'] = limit_price
@@ -2294,8 +2322,8 @@ def check_maker_snipe(market, seconds_remaining):
     _state['maker_distance_to_ask'] = book.get('distance_to_ask')
     _state['diag_orders_placed'] = _state.get('diag_orders_placed', 0) + 1
     save_state()
-    tg(f"[BTC-MAKER] ORDER PLACED: {direction} {shares:.2f} shares @ {limit_price:.4f} | Order: {r.get('order_id') or (r.get('posted') or {}).get('order_id') or ''}")
-    return r.get('success')
+    tg(f"[BTC-MAKER] ORDER PLACED: {direction} {shares:.2f} shares @ {limit_price:.4f} | Order: {posted_oid}")
+    return True
 
 # ── Strategy A: Arb check ─────────────────────────────────────────────────────
 def check_gabagool(market, seconds_remaining=None):
@@ -2485,9 +2513,11 @@ def check_snipe(market, seconds_remaining):
         price_bucket = "mid"
     elif price >= SIGNAL_MIN_ENTRY_PRICE:
         price_bucket = "sweet_spot"
+    elif price >= SIGNAL_SOFT_MIN_ENTRY_PRICE:
+        price_bucket = "soft_band"
     else:
         price_bucket = "low"
-        log(f"[SNIPE] FILTER: pricing_source=CLOB entry_price={price:.4f} gamma_price={gamma_price:.4f} < floor {SIGNAL_MIN_ENTRY_PRICE:.2f} (bucket={price_bucket}), skipping low price")
+        log(f"[SNIPE] FILTER: pricing_source=CLOB entry_price={price:.4f} gamma_price={gamma_price:.4f} < floor {SIGNAL_SOFT_MIN_ENTRY_PRICE:.2f} (bucket={price_bucket}), skipping low price")
         shadow_live_gate_btc(price, context='snipe')
         write_edge_event(
             market,
@@ -2550,7 +2580,8 @@ def check_snipe(market, seconds_remaining):
 
     log(f"[SNIPE] PRICE_BUCKET: {price_bucket} (clob_price={price:.4f} gamma_price={gamma_price:.4f})")
     base_size = SNIPE_STRONG if abs(delta_pct) >= SNIPE_STRONG_D * 100 else SNIPE_DEFAULT
-    size = base_size * current_risk_multiplier()
+    size_mult = SIGNAL_SOFT_BAND_SIZE_MULT if price_bucket == "soft_band" else 1.0
+    size = base_size * current_risk_multiplier() * size_mult
     shares = size / submitted_price
     if shares < 5:
         shares = 5
@@ -2665,8 +2696,8 @@ def main():
     log("=" * 60)
     log(f"[BTC-15M] STARTING {'(DRY RUN)' if DRY_RUN else '(LIVE)'}")
     log(f"[BTC-15M] Arb threshold=${ARB_THRESHOLD}, up_delta>={UP_MIN_DELTA}% down_delta>={DOWN_MIN_DELTA}%, confirm={CONFIRM_TICKS} ticks, max daily loss=${MAX_DAILY_LOSS}")
-    log(f"[BTC-15M] min_entry={SIGNAL_MIN_ENTRY_PRICE:.2f} generic_max={SIGNAL_MAX_ENTRY_PRICE:.2f} up_max={UP_MAX_ENTRY:.2f} down_max={DOWN_MAX_ENTRY:.2f} spread_max={MAX_SPREAD:.3f} gamma_clob_max={MAX_GAMMA_CLOB_DIFF:.3f}")
-    log(f"[BTC-15M] maker={MAKER_ENABLED} dry={MAKER_DRY_RUN} start=T-{MAKER_START_SEC} cancel=T-{MAKER_CANCEL_SEC} offset={MAKER_OFFSET} fok_fallback={MAKER_FOK_FALLBACK_SEC}s retry_min={MAKER_RETRY_MIN_SEC}s")
+    log(f"[BTC-15M] min_entry={SIGNAL_MIN_ENTRY_PRICE:.2f} soft_min={SIGNAL_SOFT_MIN_ENTRY_PRICE:.2f} soft_mult={SIGNAL_SOFT_BAND_SIZE_MULT:.2f} generic_max={SIGNAL_MAX_ENTRY_PRICE:.2f} up_max={UP_MAX_ENTRY:.2f} down_max={DOWN_MAX_ENTRY:.2f} spread_max={MAX_SPREAD:.3f} gamma_clob_max={MAX_GAMMA_CLOB_DIFF:.3f}")
+    log(f"[BTC-15M] maker={MAKER_ENABLED} dry={MAKER_DRY_RUN} start=T-{MAKER_START_SEC} cancel=T-{MAKER_CANCEL_SEC} offset={MAKER_OFFSET} fok_fallback={MAKER_FOK_FALLBACK_SEC}s retry_min={MAKER_RETRY_MIN_SEC}s max_retries={MAKER_MAX_RETRIES}")
     log(f"[BTC-15M] dir_throttle: lookback={DIR_LOOKBACK} min_wr={DIR_MIN_WR:.2f} max_loss={DIR_MAX_LOSS:.2f} pause_h={DIR_PAUSE_HOURS} one_trade_per_window={ONE_TRADE_PER_WINDOW}")
     log(f"[BTC-15M] cooldown: threshold={COOLDOWN_LOSS_THRESHOLD} losses, duration={COOLDOWN_DURATION_SEC // 60}min, lookback={COOLDOWN_LOOKBACK_SEC // 60}min decel_threshold={MOMENTUM_DECEL_THRESHOLD}")
     log(f"[BTC-15M] quote_guard: jump_max={QUOTE_JUMP_MAX:.3f} divergence_max={QUOTE_DIVERGENCE_MAX:.3f} divergence_cycles={QUOTE_DIVERGENCE_CYCLES}")

@@ -25,6 +25,7 @@ from journal import journal_close as shared_journal_close
 from journal import journal_open as shared_journal_open
 from journal import open_journal
 from polymarket_clob_pricing import fetch_book, choose_buy_price
+from scalp_exit import ScalpExitManager
 
 # ── Paths & creds ──────────────────────────────────────────────────────────────
 WORK_DIR      = Path("/home/abdaltm86/.openclaw/workspace/trading")
@@ -65,7 +66,8 @@ def _bool(key, default):
     return str(os.environ.get(key, ENV.get(key, str(default)))).lower() in ("1", "true", "yes", "on")
 
 TELEGRAM_TOKEN = ENV.get("TELEGRAM_TOKEN", "8457917317:AAHGueV-SogZl14cW5uMmIACpaWuyzByXOo")
-CHAT_ID        = ENV.get("CHAT_ID",        "7520899464")
+CHAT_ID        = ENV.get("CHAT_ID",        "-1003948211258")
+TOPIC_ID       = ENV.get("TOPIC_ID",       "3")
 POLY_WALLET    = ENV.get("POLY_WALLET",    "0x1a4c163a134D7154ebD5f7359919F9c439424f00")
 VENV_PY        = Path("/home/abdaltm86/.openclaw/workspace/trading/.polymarket-venv/bin/python3")
 DRY_RUN        = os.environ.get("SOL15M_DRY_RUN",  ENV.get("SOL15M_DRY_RUN",  "true")).lower() != "false"
@@ -116,9 +118,14 @@ _state = {
     "maker_shares":     0.0,
     "maker_done":       False,
     "maker_last_poll":  0,
+    "maker_placed_ts":  0,
     "maker_seen_fills": [],
+    "diag_orders_placed": 0,
+    "diag_orders_cancelled": 0,
 }
 _positions = []   # list of dicts for open/confirmation positions
+
+scalp_mgr = None  # initialized in main()
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 def log(msg):
@@ -136,7 +143,7 @@ def tg(msg):
         try:
             r = requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                json={"chat_id": CHAT_ID, "text": msg},
+                json={"chat_id": CHAT_ID, "text": msg, "message_thread_id": int(TOPIC_ID)},
                 timeout=10,
             )
             if r.status_code != 200:
@@ -166,6 +173,9 @@ def load_state():
         with open(STATE_F) as f:
             _state = json.load(f)
     _state.setdefault('maker_seen_fills', [])
+    _state.setdefault('maker_placed_ts', 0)
+    _state.setdefault('diag_orders_placed', 0)
+    _state.setdefault('diag_orders_cancelled', 0)
 
 # ── SOL price from Coinbase ────────────────────────────────────────────────────
 def get_sol_price():
@@ -265,18 +275,6 @@ def get_market(slug):
     except Exception as e:
         log(f"Gamma error: {e}")
     return None
-
-# ── CLOB: get order book ──────────────────────────────────────────────────────
-def get_clob_prices(condition_id):
-    try:
-        r = requests.get(
-            f"https://clob.polymarket.com/orders?condition_id={condition_id}&喝着=1",
-            timeout=10,
-        )
-        return r.json()
-    except Exception as e:
-        log(f"CLOB error: {e}")
-    return {}
 
 # ── Place order via polymarket_executor ───────────────────────────────────────
 def _market_label(market):
@@ -532,6 +530,14 @@ def check_maker_snipe(market, seconds_remaining):
                 _state['snipe_done'] = True
                 save_state()
                 return True
+            no_fill_reason = vf.get('reason', 'no_recent_fill')
+            open_for = max(0, int(time.time()) - int(_state.get('maker_placed_ts', 0) or 0))
+            log(f"[SOL-MAKER] VERIFY NO FILL: {oid} | open_for={open_for}s | reason={no_fill_reason}")
+            tg(f"[SOL-MAKER] ORDER CANCELLED (verify no fill): {oid} | open_for={open_for}s")
+            _state['diag_orders_cancelled'] = _state.get('diag_orders_cancelled', 0) + 1
+            _state['maker_done'] = True
+            save_state()
+            return False
         if seconds_remaining <= MAKER_CANCEL_SEC and st.get('status') in ('open', 'partially_filled'):
             maker_cancel_order(oid)
             log(f"[SOL-MAKER] cancel by deadline order_id={oid} sec_rem={seconds_remaining}")
@@ -613,18 +619,27 @@ def check_maker_snipe(market, seconds_remaining):
         for line in r['error'].splitlines():
             if line.strip():
                 log(f"[EXEC-ERR] {line.strip()}")
-    _state['maker_order_id'] = str(r.get('order_id') or (r.get('posted') or {}).get('order_id') or '')
+    posted_oid = str(r.get('order_id') or (r.get('posted') or {}).get('order_id') or '')
+    if not r.get('success') or not posted_oid:
+        fail_reason = 'missing_order_id' if r.get('success') and not posted_oid else 'executor_error'
+        log(f"[SOL-MAKER] submit failed reason={fail_reason} sec_rem={seconds_remaining} output_oid={posted_oid or 'none'}")
+        _state['maker_done'] = True
+        save_state()
+        return False
+    _state['maker_order_id'] = posted_oid
     _state['maker_token_id'] = token_id
     _state['maker_side'] = direction
     _state['maker_price'] = limit_price
     _state['maker_shares'] = shares
     _state['maker_market_ref'] = _market_label(market)
     _state['maker_last_poll'] = int(time.time())
+    _state['maker_placed_ts'] = int(time.time())
     _state['maker_done'] = False
+    _state['diag_orders_placed'] = _state.get('diag_orders_placed', 0) + 1
     save_state()
     # Send Telegram notification for order placement
-    tg(f"[SOL-MAKER] ORDER PLACED: dir={direction} entry={limit_price:.4f} size=${shares*limit_price:.2f} shares={shares:.2f} market={_market_label(market)} order={r.get('order_id') or (r.get('posted') or {}).get('order_id') or ''}")
-    return r.get('success')
+    tg(f"[SOL-MAKER] ORDER PLACED: dir={direction} entry={limit_price:.4f} size=${shares*limit_price:.2f} shares={shares:.2f} market={_market_label(market)} order={posted_oid}")
+    return True
 
 # ── Strategy A: Arb check ─────────────────────────────────────────────────────
 def check_gabagool(market):
@@ -802,8 +817,11 @@ def setup_new_window(slug, window_ts):
     save_state()
     trigger_post_resolution_tasks()
 
+    # Reset scalp exit for new window
+    if scalp_mgr is not None:
+        scalp_mgr.reset()
+
     log(f"[NEW WINDOW] ts={window_ts} SOL={sol_price} slug={slug}")
-    # Window start — no telegram noise
 
 # ── Daily loss check ───────────────────────────────────────────────────────────
 def check_daily_limit():
@@ -835,13 +853,24 @@ def _acquire_lock():
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 def main():
-    global _state
+    global _state, scalp_mgr
     if not _acquire_lock():
         return
     load_state()
     log("=" * 60)
+    scalp = ScalpExitManager(
+        engine="sol15m",
+        venv_py=VENV_PY,
+        work_dir=WORK_DIR,
+        log_fn=log,
+        tg_fn=tg,
+        dry_run=DRY_RUN,
+        env_dict=ENV,
+    )
+    scalp_mgr = scalp
     log(f"[SOL-15M] STARTING {'(DRY RUN)' if DRY_RUN else '(LIVE)'}")
     log(f"[SOL-15M] Arb threshold=${ARB_THRESHOLD}, snipe delta>={SNIPE_DELTA_MIN}%, max daily loss=${MAX_DAILY_LOSS} | maker={MAKER_ENABLED} dry={MAKER_DRY_RUN} start=T-{MAKER_START_SEC} cancel=T-{MAKER_CANCEL_SEC} offset={MAKER_OFFSET}")
+    log(f"[SOL-15M] scalp_exit={scalp.is_enabled()} target=+{scalp.target_cents} stop=-{scalp.stop_cents}")
     tg("[SOL-15M] Engine started!")
 
     while True:
@@ -891,9 +920,22 @@ def main():
 
         # Strategy B: Snipe / Maker Snipe
         if MAKER_ENABLED:
-            check_maker_snipe(market, sec_rem)
+            maker_result = check_maker_snipe(market, sec_rem)
+            # Activate scalp exit on fresh maker fill
+            if maker_result is True and scalp.is_enabled() and not scalp.active:
+                scalp.on_fill(
+                    token_id=_state.get('maker_token_id', ''),
+                    entry_price=_state.get('maker_price', 0),
+                    shares=_state.get('maker_shares', 0),
+                    direction=_state.get('maker_side', 'UP'),
+                    market_label=_state.get('maker_market_ref', ''),
+                )
         elif sec_rem <= SNIPE_WINDOW and sec_rem > 5:
             check_snipe(market, sec_rem)
+
+        # Scalp exit monitoring
+        if scalp.active:
+            scalp.tick(market, sec_rem)
 
         # Sleep
         time.sleep(SCAN_SEC)
