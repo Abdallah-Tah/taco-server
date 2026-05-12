@@ -33,17 +33,20 @@ LOCK_FILE = Path('/tmp/polymarket_auto_redeem.lock')
 STATE_FILE = Path('/tmp/polymarket_auto_redeem_state.json')
 CHECK_EVERY_SEC = 300
 NOTHING_LOG_EVERY_SEC = 1800
-TELEGRAM_TARGET = '-1003948211258'
-TELEGRAM_TOPIC  = 3
+TELEGRAM_TARGET = '7520899464'
+TELEGRAM_TOPIC  = None
 
 # Load bot token from secrets, fallback to OpenClaw config
 _SECRETS = {}
 _secrets_path = Path('/home/abdaltm86/.config/openclaw/secrets.env')
 if _secrets_path.exists():
-    for line in _secrets_path.read_text().splitlines():
+    for line in (_secrets_path.read_text() + ("\n" + open('/home/abdaltm86/.config/openclaw/secrets_polymarket.env').read() if __import__('os').path.exists('/home/abdaltm86/.config/openclaw/secrets_polymarket.env') else '')).splitlines():
         if '=' in line and not line.startswith('#'):
             k, v = line.split('=', 1)
             _SECRETS[k.strip()] = v.strip().strip("'").strip('"')
+
+TELEGRAM_TARGET = _SECRETS.get('CHAT_ID', TELEGRAM_TARGET)
+TELEGRAM_TOPIC = int(_SECRETS.get('TOPIC_ID', '3') or 3) if str(TELEGRAM_TARGET).startswith('-100') else None
 
 TG_TOKEN = _SECRETS.get('TELEGRAM_TOKEN', os.environ.get('TELEGRAM_TOKEN', ''))
 if not TG_TOKEN:
@@ -61,7 +64,6 @@ def log(msg: str):
     line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
     with LOG_FILE.open('a') as f:
         f.write(line + '\n')
-    print(line, flush=True)
 
 
 def load_state():
@@ -107,7 +109,15 @@ def ensure_single_instance():
             if old_pid and old_pid != os.getpid():
                 try:
                     os.kill(old_pid, 0)
-                    log(f'[REDEEM] Another daemon already running (pid={old_pid}), exiting')
+                    state = load_state()
+                    now = int(time.time())
+                    last_log = int(state.get('last_duplicate_log') or 0)
+                    last_pid = int(state.get('last_duplicate_pid') or 0)
+                    if old_pid != last_pid or now - last_log >= 1800:
+                        log(f'[REDEEM] Another daemon already running (pid={old_pid}), exiting')
+                        state['last_duplicate_log'] = now
+                        state['last_duplicate_pid'] = old_pid
+                        save_state(state)
                     return False
                 except Exception:
                     pass
@@ -165,6 +175,8 @@ def _redeem_prefix(title: str) -> str:
         return '[BTC-REDEEM]'
     if 'ethereum up or down' in t:
         return '[ETH-REDEEM]'
+    if any(x in t for x in ('highest temperature', 'precipitation', 'weather')):
+        return '[WEATHER-REDEEM]'
     return '[REDEEM]'
 
 
@@ -196,38 +208,36 @@ def _get_trade_details(title: str):
         return None
 
 
+def _tg(message: str) -> None:
+    """Generic Telegram send for daemon lifecycle events."""
+    try:
+        payload = {"chat_id": TELEGRAM_TARGET, "text": message}
+        if TELEGRAM_TOPIC and str(TELEGRAM_TARGET).startswith('-100'):
+            payload["message_thread_id"] = TELEGRAM_TOPIC
+        r = _requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            json=payload,
+            timeout=10)
+        if r.status_code != 200:
+            log(f"[REDEEM] Telegram send failed code={r.status_code} body={r.text}")
+    except Exception as e:
+        log(f"[REDEEM] Telegram send failed: {e}")
+
+
 def send_telegram_cha_ching(item):
     """Send celebration notification for winning redeems."""
     title = item.get('title') or 'Polymarket redeem'
     value = float(item.get('value') or 0)
     tx = _normalize_tx_hash(item.get('txHash') or item.get('transactionHash')) or 'n/a'
     prefix = _redeem_prefix(title)
-
-    # Look up trade details from journal
-    details = _get_trade_details(title)
-    if details:
-        direction, entry_price, pnl_abs, size_usd = details
-        if direction == 'UP':
-            market_label = title.replace('Up or Down', 'UP ⬆️')
-        elif direction == 'DOWN':
-            market_label = title.replace('Up or Down', 'DOWN ⬇️')
-        else:
-            market_label = title
-        cost = float(size_usd or 0)
-        profit = value - cost
-        message = (
-            f"💰 CHA-CHING! {prefix}\n"
-            f"Market: {market_label}\n"
-            f"Entry: ${float(entry_price or 0):.2f} | Paid: ${cost:.2f}\n"
-            f"Redeemed: ${value:.2f} | Profit: +${profit:.2f}\n"
-            f"tx={tx}"
-        )
-    else:
-        message = f"💰 CHA-CHING! {prefix} Redeemed ${value:.2f} from {title} | pnl=${value:.2f} tx={tx}"
+    message = f"💰 CHA-CHING! {prefix} Redeemed ${value:.2f} from {title} tx={tx}"
     try:
+        payload = {"chat_id": TELEGRAM_TARGET, "text": message}
+        if TELEGRAM_TOPIC and str(TELEGRAM_TARGET).startswith('-100'):
+            payload["message_thread_id"] = TELEGRAM_TOPIC
         r = _requests.post(
             f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_TARGET, "text": message, "message_thread_id": TELEGRAM_TOPIC},
+            json=payload,
             timeout=10)
         if r.status_code != 200:
             log(f"[REDEEM] Telegram send failed code={r.status_code} body={r.text}")
@@ -243,9 +253,12 @@ def send_telegram_loss(item):
     prefix = _redeem_prefix(title)
     message = f"❌ {prefix} Lost position: {title} ($0.00) tx={tx}"
     try:
+        payload = {"chat_id": TELEGRAM_TARGET, "text": message}
+        if TELEGRAM_TOPIC and str(TELEGRAM_TARGET).startswith('-100'):
+            payload["message_thread_id"] = TELEGRAM_TOPIC
         r = _requests.post(
             f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_TARGET, "text": message, "message_thread_id": TELEGRAM_TOPIC},
+            json=payload,
             timeout=10)
         if r.status_code != 200:
             log(f"[REDEEM] Telegram loss send failed code={r.status_code} body={r.text}")
@@ -278,7 +291,8 @@ def send_redeem_email(item):
 def send_pushcut_notification(item):
     title = item.get('title') or 'Polymarket redeem'
     value = float(item.get('value') or 0)
-    body = f"Redeemed ${value:.2f} back to USDC.e — {title}"
+    # Post CLOB-V2 cutover redemptions settle in pUSD; pre-cutover in USDC.e.
+    body = f"Redeemed ${value:.2f} collateral — {title}"
     try:
         subprocess.run([
             'curl', '-sS', '-X', 'POST',
@@ -294,6 +308,7 @@ def main():
     if not ensure_single_instance():
         return
     log('[REDEEM] Auto-redeem daemon started')
+    _tg('[AUTO-REDEEM] 🔁 Daemon started')
     state = load_state()
     try:
         while True:
@@ -301,27 +316,29 @@ def main():
                 try:
                     result = run_redeem_check()
                     if result['claimed']:
-                        for item in result['items']:
+                        items = result['items']
+                        _tg(f"[AUTO-REDEEM] 💰 Found {len(items)} redeemable position(s)")
+                        for item in items:
                             val = float(item.get('value') or 0)
                             title = item.get('title') or ''
                             if val > 0:
                                 log(f"[REDEEM] Claimed ${val:.2f} from {title}")
-                                send_telegram_cha_ching(item)
-                                # send_redeem_email(item)  # Disabled per user request
-                                send_pushcut_notification(item)
                             else:
-                                log(f"[REDEEM] Zero-value redeem for {title} — suppressing loss alert")
+                                log(f"[REDEEM] Zero-value redeem for {title}")
+                            # Notifications are sent by polymarket_redeem.py directly
+                            # (single choke point covers engine-direct calls too).
                     elif result.get('errors'):
                         for item in result['errors']:
                             status = item.get('status') or 'error'
                             err = item.get('error') or ''
                             if status == 'insufficient_gas':
-                                log(
-                                    f"[REDEEM] Insufficient POL gas for {item.get('title')} "
-                                    f"(need {float(item.get('requiredPol') or 0):.6f}, have {float(item.get('availablePol') or 0):.6f})"
-                                )
+                                msg = (f"[AUTO-REDEEM] ⛽ Insufficient POL gas for {item.get('title')} "
+                                       f"need={float(item.get('requiredPol') or 0):.6f} have={float(item.get('availablePol') or 0):.6f}")
+                                log(msg)
+                                _tg(msg)
                             else:
                                 log(f"[REDEEM] {status} for {item.get('title')}: {err}")
+                                _tg(f"[AUTO-REDEEM] ❌ {status} for {item.get('title')}: {str(err)[:200]}")
                     else:
                         now = int(time.time())
                         if now - int(state.get('last_nothing_log') or 0) >= NOTHING_LOG_EVERY_SEC:
@@ -330,6 +347,7 @@ def main():
                             save_state(state)
                 except Exception as e:
                     log(f'[REDEEM] ERROR {e}')
+                    _tg(f'[AUTO-REDEEM] ⚠ Loop error: {str(e)[:200]}')
                 finally:
                     release_lock()
             time.sleep(CHECK_EVERY_SEC)
@@ -346,3 +364,4 @@ if __name__ == '__main__':
         main()
     except KeyboardInterrupt:
         log('[REDEEM] Auto-redeem daemon stopped')
+        _tg('[AUTO-REDEEM] 🛑 Daemon stopped')

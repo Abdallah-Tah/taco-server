@@ -22,37 +22,17 @@ import json
 import os
 import sys
 import time
+import math
 from datetime import datetime, timezone
+from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 
 DATA_API = "https://data-api.polymarket.com"
 
-# ─── Dependencies ───
-
-try:
-    from py_clob_client.client import ClobClient
-    from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType, BalanceAllowanceParams, AssetType
-    from py_clob_client.order_builder.constants import BUY, SELL
-except ImportError:
-    print("ERROR: py_clob_client not installed. Run: pip install py-clob-client", file=sys.stderr)
-    sys.exit(1)
-
 import requests
-
-# ─── CRITICAL: Patch httpx client for Tor SOCKS proxy ───
-# py_clob_client uses httpx internally, not requests.Session
-# We must replace the global _http_client before any API calls
-import httpx
-from py_clob_client.http_helpers import helpers as _clob_helpers
-_clob_helpers._http_client = httpx.Client(proxy='socks5://127.0.0.1:9050', http2=True)
 
 # ─── Config ───
 
-CLOB_HOST = "https://clob.polymarket.com"
-CHAIN_ID = 137
-SIGNATURE_TYPE = 0  # EOA
-
-TOR_PROXY = {"http": "socks5h://127.0.0.1:9050", "https": "socks5h://127.0.0.1:9050"}
 SECRETS_FILE = Path.home() / ".config" / "openclaw" / "secrets.env"
 
 # State files
@@ -63,7 +43,27 @@ POLY_TRADE_LOG = STATE_DIR / ".poly_trade_log.json"
 # ─── Load config constants ───
 import logging
 import sys as _sys
+_sys.path.insert(0, str(STATE_DIR))
 _sys.path.insert(0, str(STATE_DIR / "scripts"))
+
+from polymarket_core.client import (
+    BUY,
+    SELL,
+    AssetType,
+    BalanceAllowanceParams,
+    CLOB_HOST,
+    OrderArgs,
+    OrderPayload,
+    OrderType,
+    PolyApiException,
+    SDK_VERSION as _SDK_VERSION,
+    cancel_one as _cancel_one,
+    get_client,
+    list_open_orders as _list_open_orders,
+    load_secrets,
+    post_order_compat as _post_order_compat,
+)
+from polymarket_core.pretrade import pre_trade_check_buy
 
 try:
     from config import (
@@ -95,54 +95,40 @@ except ImportError:
     MAX_CORRELATED_POSITIONS = 2
     PAUSE_THRESHOLD_USD = 70.0
 
+
+def _normalize_amount_for_price(amount, price, min_shares):
+    """
+    Polymarket market buys require:
+    - maker amount (USDC notional) with max 2 decimals
+    - taker amount (shares) with max 4 decimals
+
+    Given a 2-decimal price, only certain share increments satisfy both.
+    We round the requested shares down to the nearest valid increment.
+    """
+    price_dec = Decimal(str(price)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+    price_cents = int(price_dec * 100)
+    if price_cents <= 0:
+        raise ValueError(f"invalid price for normalization: {price}")
+
+    requested_units = int((Decimal(str(amount)) * Decimal("10000")).to_integral_value(rounding=ROUND_DOWN))
+    min_units = int((Decimal(str(min_shares)) * Decimal("10000")).to_integral_value(rounding=ROUND_DOWN))
+
+    step_units = 10000 // math.gcd(price_cents, 10000)
+    normalized_units = (requested_units // step_units) * step_units
+    if normalized_units < min_units:
+        normalized_units = (min_units // step_units) * step_units
+        if normalized_units < min_units:
+            normalized_units += step_units
+
+    normalized_amount = Decimal(normalized_units) / Decimal("10000")
+    notional = normalized_amount * price_dec
+    return float(normalized_amount), float(price_dec), float(notional)
+
 MIN_TRADE_SIZE = 1.0  # Hard floor
 
 logger = logging.getLogger(__name__)
 
 # ─── Helpers ───
-
-def load_secrets():
-    """Load Polymarket credentials from secrets file."""
-    secrets = {}
-    if SECRETS_FILE.exists():
-        for line in SECRETS_FILE.read_text().splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, v = line.split("=", 1)
-                secrets[k.strip()] = v.strip().strip('"').strip("'")
-    return secrets
-
-def get_client():
-    """Create authenticated ClobClient routed through Tor."""
-    secrets = load_secrets()
-
-    funder = secrets.get("POLYMARKET_FUNDER")
-    private_key = secrets.get("POLYMARKET_PRIVATE_KEY")
-    api_key = secrets.get("POLYMARKET_API_KEY")
-    api_secret = secrets.get("POLYMARKET_API_SECRET")
-    passphrase = secrets.get("POLYMARKET_PASSPHRASE")
-
-    if not all([funder, private_key, api_key, api_secret, passphrase]):
-        print("ERROR: Missing Polymarket credentials in secrets.env", file=sys.stderr)
-        sys.exit(1)
-
-    creds = ApiCreds(
-        api_key=api_key,
-        api_secret=api_secret,
-        api_passphrase=passphrase,
-    )
-
-    client = ClobClient(
-        host=CLOB_HOST,
-        chain_id=CHAIN_ID,
-        key=private_key,
-        signature_type=SIGNATURE_TYPE,
-        funder=funder,
-        creds=creds,
-    )
-
-    # Tor routing is handled by the httpx monkey-patch at module level
-    return client
 
 def log_trade(action, token_id, amount, price, order_id=None, market_question="", extra=None):
     """Append trade to log file."""
@@ -209,11 +195,37 @@ def check_balance(client):
         print(f"ERROR getting balance: {e}", file=sys.stderr)
         return None
 
+
+def ensure_collateral_allowance(client, required_usdc: float = 0.0):
+    """Backward-compatible wrapper over the shared BUY pre-trade gate."""
+    result = pre_trade_check_buy(client, required_usdc, refresh_allowance=True)
+    detail = dict(result.get("account_state") or {})
+    detail["reason"] = (result.get("reason_code") or "").lower()
+    return result.get("ok", False), detail
+
+
+def get_buy_readiness(client, required_usdc: float = 1.0):
+    """Return a structured BUY readiness snapshot for operators and bots."""
+    result = pre_trade_check_buy(client, required_usdc, refresh_allowance=True)
+    account_state = result.get("account_state") or {}
+    return {
+        "ok": result.get("ok", False),
+        "reason_code": result.get("reason_code"),
+        "reason": result.get("reason"),
+        "required_usdc": required_usdc,
+        "balance": account_state.get("balance"),
+        "required": account_state.get("required"),
+        "allowances": account_state.get("allowances"),
+        "refresh_error": account_state.get("refresh_error"),
+        "refreshed": account_state.get("refreshed"),
+        "checks": result.get("checks") or [],
+    }
+
+
 def get_open_orders(client):
     """Get all open orders."""
     try:
-        orders = client.get_orders()
-        return orders
+        return _list_open_orders(client)
     except Exception as e:
         print(f"ERROR getting orders: {e}", file=sys.stderr)
         return []
@@ -235,9 +247,12 @@ def get_best_prices(token_id):
     return {"best_bid": best_bid, "best_ask": best_ask, "tick_size": tick, "raw": ob}
 
 
-def verify_fill(token_id, min_size=0.0, lookback_sec=120):
+def verify_fill(token_id, min_size=0.0, lookback_sec=300):
     """Check Data API for a recent executed BUY fill on this asset.
     Activity is usually faster than trades, so prefer that first.
+    Retries once after short delay to absorb data-api indexing lag — the
+    activity feed can trail on-chain events by 30-60s, causing false
+    'verified_unfilled' which leaves silent positions in the wallet.
     """
     def _enrich(hits, total, source):
         total_cost = 0.0
@@ -262,38 +277,32 @@ def verify_fill(token_id, min_size=0.0, lookback_sec=120):
             "effective_cost": total_cost if total > 0 else None,
             "tx_hashes": tx_hashes,
         }
-    try:
-        user = load_secrets().get("POLYMARKET_FUNDER")
-        if not user:
-            return {"filled": False, "reason": "missing_funder"}
-        after = int(time.time()) - lookback_sec
-
-        # Fast path: activity feed
+    def _activity_hits(user, after):
         ra = requests.get(f"{DATA_API}/activity", params={"user": user, "limit": 200, "offset": 0}, timeout=15)
-        if ra.status_code == 200:
-            acts = ra.json()
-            hits = []
-            total = 0.0
-            for a in acts:
-                if a.get("type") != "TRADE":
-                    continue
-                if str(a.get("asset")) != str(token_id):
-                    continue
-                if str(a.get("side", "")).upper() != "BUY":
-                    continue
-                ts = int(a.get("timestamp") or 0)
-                if ts < after:
-                    continue
-                sz = float(a.get("size") or 0)
-                total += sz
-                hits.append(a)
-            if total > 0:
-                return _enrich(hits, total, "activity")
+        if ra.status_code != 200:
+            return None, 0.0
+        acts = ra.json()
+        hits = []
+        total = 0.0
+        for a in acts:
+            if a.get("type") != "TRADE":
+                continue
+            if str(a.get("asset")) != str(token_id):
+                continue
+            if str(a.get("side", "")).upper() != "BUY":
+                continue
+            ts = int(a.get("timestamp") or 0)
+            if ts < after:
+                continue
+            sz = float(a.get("size") or 0)
+            total += sz
+            hits.append(a)
+        return hits, total
 
-        # Slower fallback: trades feed
+    def _trade_hits(user, after):
         r = requests.get(f"{DATA_API}/trades", params={"user": user, "limit": 500, "offset": 0, "takerOnly": "false"}, timeout=15)
         if r.status_code != 200:
-            return {"filled": False, "reason": f"trades_http_{r.status_code}"}
+            return None, 0.0, f"trades_http_{r.status_code}"
         trades = r.json()
         hits = []
         total = 0.0
@@ -308,28 +317,57 @@ def verify_fill(token_id, min_size=0.0, lookback_sec=120):
             sz = float(t.get("size") or 0)
             total += sz
             hits.append(t)
-        return _enrich(hits, total, "trades")
+        return hits, total, None
+    try:
+        user = load_secrets().get("POLYMARKET_FUNDER")
+        if not user:
+            return {"filled": False, "reason": "missing_funder"}
+        after = int(time.time()) - lookback_sec
+        retry_attempts = max(1, int(os.environ.get("POLY_VERIFY_FILL_RETRIES", "4")))
+        retry_delay = max(1, int(os.environ.get("POLY_VERIFY_FILL_RETRY_SEC", "5")))
+        last_trades_hits = []
+        last_trades_total = 0.0
+        last_trade_error = None
+        for attempt in range(retry_attempts):
+            hits, total = _activity_hits(user, after)
+            if total > 0:
+                source = "activity" if attempt == 0 else f"activity_retry_{attempt}"
+                return _enrich(hits, total, source)
+
+            trades_hits, trades_total, trade_error = _trade_hits(user, after)
+            if trade_error:
+                last_trade_error = trade_error
+            else:
+                last_trades_hits = trades_hits or []
+                last_trades_total = trades_total
+                if trades_total > 0:
+                    source = "trades" if attempt == 0 else f"trades_retry_{attempt}"
+                    return _enrich(last_trades_hits, last_trades_total, source)
+
+            if attempt < retry_attempts - 1:
+                time.sleep(retry_delay)
+        if last_trade_error and not last_trades_hits:
+            return {"filled": False, "reason": last_trade_error}
+        return _enrich(last_trades_hits, last_trades_total, "trades")
     except Exception as e:
         return {"filled": False, "reason": str(e)}
 
 
 def place_maker_order(client, token_id, amount, price, side=BUY, market_question="", condition_id="", verify=False):
     """Place a maker GTC order; caller is responsible for later status polling/cancel."""
-    import math
     if price <= 0 or price >= 1:
         print(f"ERROR: Price must be between 0.01 and 0.99, got {price}", file=sys.stderr)
         return None
     side_str = "BUY" if side == BUY else "SELL"
-    price = round(float(price), 2)
-    amount = math.floor(float(amount) * 100) / 100
-    if amount < MIN_SHARES:
-        amount = float(MIN_SHARES)
-    dollar_cost = round(amount * price, 2)
+    raw_amount = float(amount)
+    amount, price, dollar_cost = _normalize_amount_for_price(amount, price, MIN_SHARES)
+    if amount != raw_amount:
+        print(f"[MAKER-NORMALIZE] shares {raw_amount:.4f} -> {amount:.4f} for price={price:.4f}")
     print(f"[MAKER-ATTEMPT] side={side_str} submitted_price={price:.4f} shares={amount} size=${dollar_cost:.2f}")
     try:
         order_args = OrderArgs(token_id=token_id, price=price, size=amount, side=side)
         signed = client.create_order(order_args)
-        posted = client.post_order(signed, orderType=OrderType.GTC)
+        posted = _post_order_compat(client, signed, OrderType.GTC, post_only=False)
         order_id = None
         if isinstance(posted, dict):
             order_id = posted.get("orderID") or posted.get("id")
@@ -357,7 +395,7 @@ def place_maker_order(client, token_id, amount, price, side=BUY, market_question
 def check_order_status(client, order_id):
     """Normalize order status using open orders list; not_found means not currently open."""
     try:
-        orders = client.get_orders() or []
+        orders = _list_open_orders(client)
         found = None
         for o in orders:
             oid = o.get("orderID") or o.get("id")
@@ -388,7 +426,7 @@ def place_order(client, token_id, amount, price, side=BUY, market_question="", c
 
     effective_max_trade_size = float(max_trade_size_override) if max_trade_size_override is not None else MAX_TRADE_SIZE
     dollar_cost = amount * price
-    if dollar_cost > effective_max_trade_size:
+    if round(dollar_cost, 2) > round(effective_max_trade_size, 2):
         print(f"ERROR: Trade cost ${dollar_cost:.2f} exceeds max ${effective_max_trade_size}", file=sys.stderr)
         return None
     if amount < MIN_SHARES:
@@ -399,13 +437,10 @@ def place_order(client, token_id, amount, price, side=BUY, market_question="", c
     # --- PRECISION FIX: Polymarket decimal constraints ---
     # maker_amount (USDC): max 2 decimals | taker_amount (shares): max 4 decimals
     # We must ensure: shares * price rounds cleanly to 2 decimals
-    import math
-    price = round(price, 2)
-    # Floor shares to 2 decimals so shares*price stays within 2-decimal USDC precision
-    amount = math.floor(amount * 100) / 100
-    if amount < 5:
-        amount = 5.0  # Polymarket minimum
-    dollar_cost = round(amount * price, 2)
+    raw_amount = float(amount)
+    amount, price, dollar_cost = _normalize_amount_for_price(amount, price, MIN_SHARES)
+    if amount != raw_amount:
+        print(f"[NORMALIZE] shares {raw_amount:.4f} -> {amount:.4f} for price={price:.4f}")
 
     print(f"Placing {side_str} order: {amount} shares @ ${price:.3f} = ${dollar_cost:.2f}")
     print(f"  Market: {market_question[:80]}")
@@ -429,17 +464,56 @@ def place_order(client, token_id, amount, price, side=BUY, market_question="", c
                     return None
                 actual_price = min(0.99, max(price, aggressive_price))
                 actual_price = round(actual_price, 2)
-                # Re-floor shares for the actual submitted price
-                amount = math.floor(amount * 100) / 100
-                if amount < 5:
-                    amount = 5.0
-                dollar_cost = round(amount * actual_price, 2)
+                amount, actual_price, dollar_cost = _normalize_amount_for_price(amount, actual_price, MIN_SHARES)
                 print(f"[ATTEMPT] side={side_str} best_ask={best_ask:.4f} submitted_price={actual_price:.4f} slippage_cap={slippage_cap:.4f} shares={amount} size=${dollar_cost:.2f}")
             else:
                 print(f"[ATTEMPT] side={side_str} best_ask=NONE -- skipping FOK order", file=sys.stderr)
                 return None
         else:
             print(f"[ATTEMPT] side={side_str} price={actual_price:.4f} shares={amount} size=${dollar_cost:.2f} order_type={actual_order_type}")
+
+        if side == BUY:
+            allowance_needed = round(dollar_cost * 1.05, 6)  # small fee/slippage buffer
+            pretrade = pre_trade_check_buy(
+                client,
+                allowance_needed,
+                refresh_allowance=True,
+                metadata={
+                    "token_id": token_id,
+                    "market_question": market_question,
+                    "side": side_str,
+                    "order_type": str(actual_order_type),
+                },
+            )
+            if not pretrade.get("ok"):
+                account_state = pretrade.get("account_state") or {}
+                detail = {
+                    "allowance_reason": pretrade.get("reason_code"),
+                    "required": account_state.get("required"),
+                    "balance": account_state.get("balance"),
+                    "allowances": account_state.get("allowances"),
+                    "refresh_error": account_state.get("refresh_error"),
+                    "refreshed": account_state.get("refreshed"),
+                }
+                print(f"[BLOCKED] missing collateral allowance: {json.dumps(detail, default=str)}", file=sys.stderr)
+                log_trade(
+                    action=f"BLOCKED_{side_str}",
+                    token_id=token_id,
+                    amount=amount,
+                    price=actual_price,
+                    market_question=market_question,
+                    extra={"error": f"missing collateral allowance: {json.dumps(detail, default=str)[:200]}"},
+                )
+                return {
+                    "success": False,
+                    "status": "blocked",
+                    "error": "missing collateral allowance",
+                    "errorMsg": "missing collateral allowance",
+                    "allowance": detail,
+                    "pretrade": pretrade,
+                    "submitted_price": actual_price,
+                    "submitted_order_type": str(actual_order_type),
+                }
 
         order_args = OrderArgs(
             token_id=token_id,
@@ -448,7 +522,7 @@ def place_order(client, token_id, amount, price, side=BUY, market_question="", c
             side=side,
         )
         signed = client.create_order(order_args)
-        posted = client.post_order(signed, orderType=actual_order_type, post_only=post_only)
+        posted = _post_order_compat(client, signed, actual_order_type, post_only=post_only)
 
         order_id = None
         if isinstance(posted, dict):
@@ -486,6 +560,29 @@ def place_order(client, token_id, amount, price, side=BUY, market_question="", c
 
     except Exception as e:
         error_msg = str(e)
+        # Detect allowance failures so upstream bots can auto-pause
+        is_allowance_error = (
+            "allowance" in error_msg.lower()
+            or "not enough balance" in error_msg.lower()
+        )
+        if is_allowance_error:
+            print(f"❌ Order BLOCKED by allowance: {error_msg}", file=sys.stderr)
+            log_trade(
+                action=f"BLOCKED_{side_str}",
+                token_id=token_id,
+                amount=amount,
+                price=price,
+                market_question=market_question,
+                extra={"error": error_msg[:200]},
+            )
+            return {
+                "success": False,
+                "status": "blocked",
+                "error": "missing collateral allowance",
+                "errorMsg": error_msg[:200],
+                "submitted_price": actual_price if "actual_price" in dir() else price,
+                "submitted_order_type": str(actual_order_type) if "actual_order_type" in dir() else str(order_type or OrderType.GTC),
+            }
         print(f"❌ Order failed: {error_msg}", file=sys.stderr)
         log_trade(
             action=f"FAILED_{side_str}",
@@ -500,7 +597,7 @@ def place_order(client, token_id, amount, price, side=BUY, market_question="", c
 def cancel_order(client, order_id):
     """Cancel an open order."""
     try:
-        result = client.cancel(order_id)
+        result = _cancel_one(client, order_id)
         print(f"✅ Cancelled order {order_id}: {result}")
         log_trade("CANCEL", "", 0, 0, order_id=order_id)
         return result
@@ -834,6 +931,8 @@ def main():
         question = " ".join(args[4:]) if len(args) > 4 else ""
         client = get_client()
         result = place_order(client, token_id, amount, price, BUY, question, order_type=OrderType.FOK, verify=True)
+        if result is None:
+            sys.exit(2)
         if isinstance(result, dict):
             print("__RESULT__" + json.dumps(result, default=str))
 
@@ -844,6 +943,8 @@ def main():
         question = " ".join(args[4:]) if len(args) > 4 else ""
         client = get_client()
         result = place_maker_order(client, token_id, amount, price, BUY, question)
+        if result is None:
+            sys.exit(2)
         if isinstance(result, dict):
             print("__RESULT__" + json.dumps(result, default=str))
 
@@ -886,6 +987,12 @@ def main():
     elif cmd == "auto":
         client = get_client()
         auto_trade(client)
+
+    elif cmd == "readiness":
+        required_usdc = float(args[1]) if len(args) >= 2 else 1.0
+        client = get_client()
+        result = get_buy_readiness(client, required_usdc=required_usdc)
+        print(json.dumps(result, indent=2, default=str))
 
     elif cmd == "test":
         # Test connectivity only

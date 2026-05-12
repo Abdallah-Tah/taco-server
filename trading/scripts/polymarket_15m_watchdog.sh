@@ -1,6 +1,14 @@
 #!/bin/bash
 set -u
 
+# ── DISABLED ENGINES (Phase 1 cleanup, 2026-04-30) ──
+# These engines must NOT be auto-restarted by this watchdog.
+# To re-enable an engine:
+#   1. Remove it from DISABLED_ENGINES below
+#   2. Get Master approval
+DISABLED_ENGINES="SOL15M XRP15M DOGE15M COINBASE_GRID COINBASE_EMA SOLANA_SNIPER"
+# ─────────────────────────────────────────────────────────────
+
 WORK="/home/abdaltm86/.openclaw/workspace"
 TRADING="$WORK/trading"
 VENV="$TRADING/.polymarket-venv/bin/python3"
@@ -14,6 +22,9 @@ TELEGRAM_TOKEN=""
 CHAT_ID=""
 BTC15M_PAUSED="false"
 ETH15M_PAUSED="false"
+SOL15M_PAUSED="false"
+XRP15M_PAUSED="false"
+DOGE15M_PAUSED="false"
 if [ -f "$SECRETS" ]; then
   while IFS='=' read -r k v; do
     case "$k" in
@@ -21,6 +32,9 @@ if [ -f "$SECRETS" ]; then
       CHAT_ID) CHAT_ID=$(printf '%s' "$v" | sed "s/^['\"]//;s/['\"]$//") ;;
       BTC15M_PAUSED) BTC15M_PAUSED=$(printf '%s' "$v" | tr '[:upper:]' '[:lower:]' | sed "s/^['\"]//;s/['\"]$//") ;;
       ETH15M_PAUSED) ETH15M_PAUSED=$(printf '%s' "$v" | tr '[:upper:]' '[:lower:]' | sed "s/^['\"]//;s/['\"]$//") ;;
+      SOL15M_PAUSED) SOL15M_PAUSED=$(printf '%s' "$v" | tr '[:upper:]' '[:lower:]' | sed "s/^['\"]//;s/['\"]$//") ;;
+      XRP15M_PAUSED) XRP15M_PAUSED=$(printf '%s' "$v" | tr '[:upper:]' '[:lower:]' | sed "s/^['\"]//;s/['\"]$//") ;;
+      DOGE15M_PAUSED) DOGE15M_PAUSED=$(printf '%s' "$v" | tr '[:upper:]' '[:lower:]' | sed "s/^['\"]//;s/['\"]$//") ;;
     esac
   done < "$SECRETS"
 fi
@@ -31,7 +45,7 @@ send_tg() {
   [ -n "$CHAT_ID" ] || return 0
   curl -sS -m 10 -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
     -H 'Content-Type: application/json' \
-    -d "{\"chat_id\":\"${CHAT_ID}\",\"text\":$(python3 - <<'PY' "$msg"
+    -d "{\"chat_id\":\"-1003948211258\",\"message_thread_id\":3,\"text\":$(python3 - <<'PY' "$msg"
 import json,sys
 print(json.dumps(sys.argv[1]))
 PY
@@ -79,9 +93,9 @@ check_engine() {
 
   log "$name DOWN — restarting"
   if [ "$mode" = "shell" ]; then
-    nohup env -u BTC15M_SIGNAL_MAX_ENTRY_PRICE -u ETH15M_SIGNAL_MAX_ENTRY_PRICE "$TRADING/scripts/$script" >> "$logfile" 2>&1 &
+    nohup env -u BTC15M_SIGNAL_MAX_ENTRY_PRICE -u ETH15M_SIGNAL_MAX_ENTRY_PRICE -u BTC15M_DOWN_ENABLED -u BTC15M_UP_ENABLED -u ETH15M_DOWN_ENABLED -u ETH15M_UP_ENABLED -u SOL15M_DOWN_ENABLED -u SOL15M_UP_ENABLED -u DOGE15M_DOWN_ENABLED -u DOGE15M_UP_ENABLED -u POLYMARKET_CLOB_FUNDER -u POLYMARKET_CLOB_SIGNATURE_TYPE -u POLYMARKET_DEPOSIT_WALLET -u WEATHER_BOUNDARY_MARGIN_SIMPLE -u WEATHER_BOUNDARY_MARGIN_RANGE "$TRADING/scripts/$script" >> "$logfile" 2>&1 &
   else
-    nohup env -u BTC15M_SIGNAL_MAX_ENTRY_PRICE -u ETH15M_SIGNAL_MAX_ENTRY_PRICE "$VENV" "$TRADING/scripts/$script" >> "$logfile" 2>&1 &
+    nohup env -u BTC15M_SIGNAL_MAX_ENTRY_PRICE -u ETH15M_SIGNAL_MAX_ENTRY_PRICE -u BTC15M_DOWN_ENABLED -u BTC15M_UP_ENABLED -u ETH15M_DOWN_ENABLED -u ETH15M_UP_ENABLED -u SOL15M_DOWN_ENABLED -u SOL15M_UP_ENABLED -u DOGE15M_DOWN_ENABLED -u DOGE15M_UP_ENABLED -u POLYMARKET_CLOB_FUNDER -u POLYMARKET_CLOB_SIGNATURE_TYPE -u POLYMARKET_DEPOSIT_WALLET -u WEATHER_BOUNDARY_MARGIN_SIMPLE -u WEATHER_BOUNDARY_MARGIN_RANGE "$VENV" "$TRADING/scripts/$script" >> "$logfile" 2>&1 &
   fi
   local newpid=$!
   echo "$newpid" > "$pidfile"
@@ -98,16 +112,82 @@ check_engine() {
   fi
 }
 
+# ═══════════════════════════════════════════════════════════════
+#  APPROVED ENGINES — auto-restart enabled
+# ═══════════════════════════════════════════════════════════════
+
+# ── BTC-15m (LIVE) ──
 if [ "$BTC15M_PAUSED" != "true" ]; then
   check_engine "BTC-15m" "polymarket_btc15m.py" "/tmp/polymarket_btc15m.pid" "/tmp/polymarket_btc15m.log"
 else
   log "BTC-15m paused via BTC15M_PAUSED=true"
 fi
 
+# ── ETH-15m (LIVE) ──
 if [ "$ETH15M_PAUSED" != "true" ]; then
   check_engine "ETH-15m" "polymarket_eth15m.py" "/tmp/polymarket_eth15m.pid" "/tmp/polymarket_eth15m.log"
 else
   log "ETH-15m paused via ETH15M_PAUSED=true"
 fi
 
+# ── AUTO-REDEEM ──
 check_engine "AUTO-REDEEM" "polymarket_auto_redeem_daemon.py" "/tmp/polymarket_auto_redeem.pid" "/tmp/polymarket_auto_redeem.log"
+
+# ── Weather v2.1 ──
+WEATHER_PAUSED="false"
+if [ -f "$SECRETS" ]; then
+  while IFS='=' read -r k v; do
+    case "$k" in
+      WEATHER_PAUSED) WEATHER_PAUSED=$(printf '%s' "$v" | tr '[:upper:]' '[:lower:]' | sed "s/^['\"]//;s/['\"]$//") ;;
+    esac
+  done < "$SECRETS"
+fi
+if [ "$WEATHER_PAUSED" != "true" ]; then
+  export WEATHER_DRY_RUN=false
+  export WEATHER_LIVE_CONFIRM=I_UNDERSTAND_REAL_MONEY
+  check_engine "WEATHER" "polymarket_weather.py" "/tmp/polymarket_weather.pid" "/tmp/polymarket_weather.log"
+  unset WEATHER_DRY_RUN
+  unset WEATHER_LIVE_CONFIRM
+else
+  log "WEATHER paused via WEATHER_PAUSED=true"
+fi
+
+# ═══════════════════════════════════════════════════════════════
+#  DISABLED ENGINES — auto-restart blocked
+#  To re-enable: remove from DISABLED_ENGINES at top of file
+# ═══════════════════════════════════════════════════════════════
+
+# ── SOL-15m (DISABLED per Phase 1) ──
+if [[ " $DISABLED_ENGINES " =~ " SOL15M " ]]; then
+  log "SOL-15m disabled (Phase 1 cleanup)"
+else
+  log "SOL-15m would restart but DISABLED_ENGINES gate removed — WARNING"
+fi
+
+# ── XRP-15m (DISABLED per Phase 1) ──
+if [[ " $DISABLED_ENGINES " =~ " XRP15M " ]]; then
+  log "XRP-15m disabled (Phase 1 cleanup)"
+else
+  log "XRP-15m would restart but DISABLED_ENGINES gate removed — WARNING"
+fi
+
+# ── DOGE-15m (DISABLED per Phase 1) ──
+if [[ " $DISABLED_ENGINES " =~ " DOGE15M " ]]; then
+  log "DOGE-15m disabled (Phase 1 cleanup)"
+else
+  log "DOGE-15m would restart but DISABLED_ENGINES gate removed — WARNING"
+fi
+
+# ── AERO Grid (DISABLED per Phase 1) ──
+if [[ " $DISABLED_ENGINES " =~ " AERO_GRID " ]]; then
+  log "AERO-GRID disabled (Phase 1 cleanup)"
+else
+  log "AERO-GRID would restart but DISABLED_ENGINES gate removed — WARNING"
+fi
+
+# ── Coinbase Grid (DISABLED per Phase 1) ──
+if [[ " $DISABLED_ENGINES " =~ " COINBASE_GRID " ]]; then
+  log "CB-GRID disabled (Phase 1 cleanup)"
+else
+  log "CB-GRID would restart but DISABLED_ENGINES gate removed — WARNING"
+fi

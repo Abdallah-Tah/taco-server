@@ -29,6 +29,7 @@ Two strategies:
 Dry run by default. Set DRY_RUN=false to go live.
 """
 import json
+import fcntl
 import hashlib
 import math
 import os
@@ -45,6 +46,7 @@ from journal import journal_close as shared_journal_close
 from journal import journal_open as shared_journal_open
 from journal import open_journal
 from polymarket_clob_pricing import fetch_book, choose_buy_price
+from rolling_circuit_breaker import RollingCircuitBreaker
 
 # ── Paths & creds ──────────────────────────────────────────────────────────────
 WORK_DIR      = Path("/home/abdaltm86/.openclaw/workspace/trading")
@@ -55,12 +57,14 @@ POSITIONS_F  = WORK_DIR / ".poly_btc15m_positions.json"
 STATE_F       = WORK_DIR / ".poly_btc15m_state.json"
 LOG_F        = WORK_DIR / ".poly_btc15m.log"
 VALIDATION_F = WORK_DIR / "validation" / "live_window_validation.jsonl"
+INSTANCE_LOCK_F = Path("/tmp/polymarket_btc15m.instance.lock")
+_INSTANCE_LOCK_HANDLE = None
 
 # ── Load credentials ─────────────────────────────────────────────────────────
 def _load_env():
     env = {}
     if CREDS_FILE.exists():
-        for line in CREDS_FILE.read_text().splitlines():
+        for line in (CREDS_FILE.read_text() + ("\n" + open('/home/abdaltm86/.config/openclaw/secrets_polymarket.env').read() if __import__('os').path.exists('/home/abdaltm86/.config/openclaw/secrets_polymarket.env') else '')).splitlines():
             if "=" in line and not line.startswith("#"):
                 k, v = line.split("=", 1)
                 env[k.strip()] = v.strip().strip('"').strip("'")
@@ -100,10 +104,10 @@ MAKER_OFFSET = _float("BTC15M_MAKER_OFFSET", 0.001)
 MAKER_POLL_SEC = _int("BTC15M_MAKER_POLL_SEC", 10)
 MAKER_MIN_PRICE = _float("BTC15M_MAKER_MIN_PRICE", 0.01)
 # FIX #5: FOK fallback after N seconds of unfilled maker order
-MAKER_FOK_FALLBACK_SEC = _int("BTC15M_MAKER_FOK_FALLBACK_SEC", 60)
+MAKER_FOK_FALLBACK_SEC = _int("BTC15M_MAKER_FOK_FALLBACK_SEC", 45)
 # FIX #5: Allow retry after cancellation if >N seconds remain
 MAKER_RETRY_MIN_SEC = _int("BTC15M_MAKER_RETRY_MIN_SEC", 45)
-MAKER_MAX_RETRIES = _int("BTC15M_MAKER_MAX_RETRIES", 0)
+MAKER_MAX_RETRIES = _int("BTC15M_MAKER_MAX_RETRIES", 2)  # AUDIT-2026-05-01: 0→2 (allows 1 retry after network error)
 
 BTC15M_GABAGOOL_ENABLED = os.environ.get("BTC15M_GABAGOOL_ENABLED", ENV.get("BTC15M_GABAGOOL_ENABLED", "false")).lower() == "true"
 BTC15M_GABAGOOL_DRY_RUN = os.environ.get("BTC15M_GABAGOOL_DRY_RUN", ENV.get("BTC15M_GABAGOOL_DRY_RUN", "true")).lower() != "false"
@@ -118,7 +122,9 @@ SNIPE_DELTA_MIN = _float("BTC15M_SNIPE_DELTA_MIN", 0.025)
 # FIX #14: Asymmetric delta — DOWN needs stronger signal (25% win rate at 0.025% was terrible)
 SNIPE_DELTA_MIN_DOWN = _float("BTC15M_SNIPE_DELTA_MIN_DOWN", 0.10)
 # FIX #16: Disable DOWN entirely — 25% win rate, -$37.96 over 2 days. Only trade UP.
+# AUDIT-2026-05-01: DOWN_ENABLED gates signal evaluation. DOWN_EXECUTION_ENABLED gates live orders.
 DOWN_ENABLED = os.environ.get("BTC15M_DOWN_ENABLED", ENV.get("BTC15M_DOWN_ENABLED", "false")).lower() == "true"
+DOWN_EXECUTION_ENABLED = os.environ.get("BTC15M_DOWN_EXECUTION_ENABLED", ENV.get("BTC15M_DOWN_EXECUTION_ENABLED", "false")).lower() == "true"
 UP_ENABLED = os.environ.get("BTC15M_UP_ENABLED", ENV.get("BTC15M_UP_ENABLED", "true")).lower() == "true"
 SNIPE_MAX_PRICE = _float("BTC15M_SNIPE_MAX_PRICE", 0.90)
 EXEC_SPREAD_CAP = _float("BTC15M_EXEC_SPREAD_CAP", 0.10)
@@ -126,7 +132,7 @@ EXEC_SPREAD_CAP = _float("BTC15M_EXEC_SPREAD_CAP", 0.10)
 SIGNAL_CONFIRM_COUNT   = _int("BTC15M_SIGNAL_CONFIRM_COUNT", 2)   # consecutive polls needed
 SIGNAL_CONFIRM_SEC     = _int("BTC15M_SIGNAL_CONFIRM_SEC", 15)     # max age of confirm samples
 # FIX #17: Capped max entry at 0.50 — 0.45-0.49 bucket is 75% win rate, above 0.50 loses money
-SIGNAL_MAX_ENTRY_PRICE = _float("BTC15M_SIGNAL_MAX_ENTRY_PRICE", 0.50)
+SIGNAL_MAX_ENTRY_PRICE = _float("BTC15M_SIGNAL_MAX_ENTRY_PRICE", 0.47)
 SIGNAL_MIN_ENTRY_PRICE = _float("BTC15M_SIGNAL_MIN_ENTRY_PRICE", 0.45)
 # Soft band: allow entries in [SOFT_MIN, MIN) at reduced size (0.50–0.55 default).
 # Backtest showed 0.40–0.55 = 31.7% WR so we cap at SOFT_MIN; but 0.50–0.55 boundary is
@@ -145,11 +151,34 @@ SNIPE_WINDOW    = _int("BTC15M_SNIPE_WINDOW_SEC", 30)
 POLL_SEC        = _int("BTC15M_PRICE_POLL_SEC", 5)
 SCAN_SEC        = _int("BTC15M_SCAN_INTERVAL", 10)
 MAX_DAILY_LOSS  = _float("BTC15M_MAX_DAILY_LOSS", 15.00)
-UP_MIN_DELTA = _float("BTC15M_UP_MIN_DELTA", 0.08)
-DOWN_MIN_DELTA = _float("BTC15M_DOWN_MIN_DELTA", 0.05)
+UP_MIN_DELTA = _float("BTC15M_UP_MIN_DELTA", 0.15)
+DOWN_MIN_DELTA = _float("BTC15M_DOWN_MIN_DELTA", 0.15)
+SIGNAL_MIN_SEC_REMAINING = _int("BTC15M_SIGNAL_MIN_SEC_REMAINING", 180)
+
+# ── Reversal module (contrarian entry on early overreaction) ──────────────────
+REVERSAL_ENABLED         = _bool("BTC15M_REVERSAL_ENABLED", True)
+REVERSAL_MIN_DELTA       = _float("BTC15M_REVERSAL_MIN_DELTA", 0.4)
+REVERSAL_MAX_ENTRY_PRICE = _float("BTC15M_REVERSAL_MAX_ENTRY_PRICE", 0.25)
+REVERSAL_MIN_ENTRY_PRICE = _float("BTC15M_REVERSAL_MIN_ENTRY_PRICE", 0.05)
+REVERSAL_MIN_SEC_REM     = _int("BTC15M_REVERSAL_MIN_SEC_REM", 720)
+REVERSAL_SIZE_USD        = _float("BTC15M_REVERSAL_SIZE_USD", 3.00)
+REVERSAL_TP_PRICE        = _float("BTC15M_REVERSAL_TP_PRICE", 0.50)
+REVERSAL_DRY_RUN         = _bool("BTC15M_REVERSAL_DRY_RUN", False)
+
 CONFIRM_TICKS = _int("BTC15M_CONFIRM_TICKS", 2)
 CONFIRM_INTERVAL_SEC = _int("BTC15M_CONFIRM_INTERVAL_SEC", 10)
 MAX_GAMMA_CLOB_DIFF = _float("BTC15M_MAX_GAMMA_CLOB_DIFF", 0.08)
+MAX_GAMMA_CLOB_DIFF_SOFT = _float("BTC15M_MAX_GAMMA_CLOB_DIFF_SOFT", 0.10)
+SOFT_GUARD_MAX_ENTRY = _float("BTC15M_SOFT_GUARD_MAX_ENTRY", 0.85)
+SOFT_GUARD_MIN_EDGE = _float("BTC15M_SOFT_GUARD_MIN_EDGE", 0.06)
+# Polymarket dynamic taker fee buffer (~3.15% as of 2026-04). Subtracted from
+# edge calculations so soft-guard math reflects post-fee EV instead of payout-only.
+TAKER_FEE_BUFFER = _float("BTC15M_TAKER_FEE_BUFFER", 0.0315)
+SOFT_GUARD_MAX_SPREAD = _float("BTC15M_SOFT_GUARD_MAX_SPREAD", 0.02)
+SOFT_GUARD_MIN_LIQ = _float("BTC15M_SOFT_GUARD_MIN_LIQ", 2.0)
+REJECTED_COOLDOWN_SECONDS = _int("BTC15M_REJECTED_COOLDOWN", 90)
+MAKER_MAX_FILLS_PER_DAY = _int("BTC15M_MAKER_MAX_FILLS_PER_DAY", 1)
+MAKER_MAX_POSTS_PER_DAY = _int("BTC15M_MAKER_MAX_POSTS_PER_DAY", 3)
 MAX_SPREAD = _float("BTC15M_MAX_SPREAD", 0.020)
 UP_MAX_ENTRY = _float("BTC15M_UP_MAX_ENTRY", 0.62)
 DOWN_MAX_ENTRY = _float("BTC15M_DOWN_MAX_ENTRY", 0.70)
@@ -162,6 +191,7 @@ ONE_TRADE_PER_WINDOW = _bool("BTC15M_ONE_TRADE_PER_WINDOW", True)
 SIGNAL_CONFIRM_COUNT = max(int(SIGNAL_CONFIRM_COUNT), int(CONFIRM_TICKS))
 SIGNAL_CONFIRM_SEC = max(int(SIGNAL_CONFIRM_SEC), int(CONFIRM_TICKS * CONFIRM_INTERVAL_SEC + 5))
 QUOTE_JUMP_MAX = _float("BTC15M_QUOTE_JUMP_MAX", 0.50)
+QUOTE_JUMP_CONFIRM_CYCLES = _int("BTC15M_QUOTE_JUMP_CONFIRM_CYCLES", 2)
 QUOTE_DIVERGENCE_MAX = _float("BTC15M_QUOTE_DIVERGENCE_MAX", 0.50)
 QUOTE_DIVERGENCE_CYCLES = _int("BTC15M_QUOTE_DIVERGENCE_CYCLES", 5)
 
@@ -212,11 +242,14 @@ _state = {
     "confirm_count": 0,
     "confirm_last_ts": 0,
     "confirm_window_ts": 0,
+    "reversal_done": False,
+    "reversal_position": None,
     "dir_pause_until_up": 0,
     "dir_pause_until_down": 0,
     "quote_prev_window_ts": 0,
     "quote_prev_yes": None,
     "quote_prev_no": None,
+    "quote_jump_count": 0,
     "quote_guard_window_ts": 0,
     "quote_guard_reason": "",
     "quote_divergence_count_up": 0,
@@ -235,6 +268,21 @@ def log(msg):
         f.write(line + "\n")
 
 
+def acquire_instance_lock():
+    """Prevent two BTC engines from placing/cancelling orders in the same market."""
+    global _INSTANCE_LOCK_HANDLE
+    _INSTANCE_LOCK_HANDLE = INSTANCE_LOCK_F.open("w")
+    try:
+        fcntl.flock(_INSTANCE_LOCK_HANDLE.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        log(f"[BTC-15M] another instance is already running; exiting pid={os.getpid()}")
+        sys.exit(0)
+    _INSTANCE_LOCK_HANDLE.seek(0)
+    _INSTANCE_LOCK_HANDLE.truncate()
+    _INSTANCE_LOCK_HANDLE.write(str(os.getpid()))
+    _INSTANCE_LOCK_HANDLE.flush()
+
+
 def safe_log(msg):
     try:
         log(msg)
@@ -251,9 +299,15 @@ def tg(msg):
     is_maker_msg = msg.startswith("[BTC-MAKER]")
     def _send():
         try:
+            payload = {"chat_id": CHAT_ID, "text": msg}
+            # Telegram forum topics only work in supergroups (chat ids like -100...).
+            # If CHAT_ID points to a direct chat/user, sending message_thread_id causes:
+            # "Bad Request: message thread not found".
+            if TOPIC_ID and str(CHAT_ID).startswith("-100"):
+                payload["message_thread_id"] = int(TOPIC_ID)
             r = requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                json={"chat_id": CHAT_ID, "text": msg, "message_thread_id": int(TOPIC_ID)},
+                json=payload,
                 timeout=10,
             )
             if r.status_code != 200:
@@ -272,7 +326,8 @@ def notify_recent_resolutions():
     def _load_notified():
         try:
             if NOTIFIED_F.exists(): return set(json.load(NOTIFIED_F.open()))
-        except Exception: pass
+        except Exception as e:
+            log(f"[BTC-NOTIFIED] load failed: {e}")
         return set()
     def _save_notified(ids):
         try:
@@ -498,8 +553,10 @@ def check_consecutive_losses():
 
 # ── Persistence ───────────────────────────────────────────────────────────────
 def save_state():
-    with open(STATE_F, "w") as f:
+    tmp = STATE_F.with_suffix('.tmp')
+    with open(tmp, "w") as f:
         json.dump(_state, f, indent=2)
+    tmp.replace(STATE_F)
 
 def load_state():
     global _state
@@ -516,23 +573,57 @@ def load_state():
     _state.setdefault('quote_prev_window_ts', 0)
     _state.setdefault('quote_prev_yes', None)
     _state.setdefault('quote_prev_no', None)
+    _state.setdefault('quote_jump_count', 0)
     _state.setdefault('quote_guard_window_ts', 0)
     _state.setdefault('quote_guard_reason', '')
     _state.setdefault('quote_divergence_count_up', 0)
     _state.setdefault('quote_divergence_count_down', 0)
     _state.setdefault('validation_last_finalized_ts', 0)
+    _state.setdefault('reversal_done', False)
+    _state.setdefault('reversal_position', None)
 
-# ── BTC price from Coinbase ────────────────────────────────────────────────────
+# ── BTC price (multi-provider with cache) ───────────────────────────────────────
+_btc_price_cache = {"price": None, "ts": 0}
+
 def get_btc_price():
-    try:
-        r = requests.get(
-            "https://api.exchange.coinbase.com/products/BTC-USD/ticker",
-            timeout=5,
-        )
-        return float(r.json()["price"])
-    except Exception as e:
-        log(f"BTC price error: {e}")
-        return None
+    global _btc_price_cache
+    now = time.time()
+    # Return cached price if fresh (< 60s)
+    if _btc_price_cache["price"] and (now - _btc_price_cache["ts"]) < 60:
+        return _btc_price_cache["price"]
+
+    providers = [
+        ("Coinbase", lambda: requests.get(
+            "https://api.exchange.coinbase.com/products/BTC-USD/ticker", timeout=3
+        ).json()["price"]),
+        ("Kraken", lambda: requests.get(
+            "https://api.kraken.com/0/public/Ticker", params={"pair": "XXBTZUSD"}, timeout=3
+        ).json()["result"]["XXBTZUSD"]["c"][0]),
+        ("Binance", lambda: requests.get(
+            "https://api.binance.us/api/v3/ticker/price", params={"symbol": "BTCUSDT"}, timeout=3
+        ).json()["price"]),
+        ("CoinGecko", lambda: requests.get(
+            "https://api.coingecko.com/api/v3/simple/price",
+            params={"ids": "bitcoin", "vs_currencies": "usd"}, timeout=3
+        ).json()["bitcoin"]["usd"]),
+    ]
+
+    for name, fetcher in providers:
+        try:
+            price = float(fetcher())
+            if price and 1000 < price < 1000000:
+                _btc_price_cache = {"price": price, "ts": now}
+                return price
+            log(f"BTC {name} price out of range: {price}")
+        except Exception as e:
+            log(f"BTC {name} price error: {e}")
+
+    # Return stale cache as last resort (up to 5 min)
+    if _btc_price_cache["price"] and (now - _btc_price_cache["ts"]) < 300:
+        log("BTC price using stale cache")
+        return _btc_price_cache["price"]
+
+    return None
 
 # ── Find current market slug ──────────────────────────────────────────────────
 def get_current_slug():
@@ -552,6 +643,8 @@ def get_market(slug):
             m = data[0]
             outcomes = json.loads(m.get("outcomes", "[]")) if m.get("outcomes") else []
             outcome_prices = json.loads(m["outcomePrices"])
+            liquidity_raw = m.get("liquidity")
+            volume_raw = m.get("volume")
             return {
                 "id":           m["id"],
                 "question":     m["question"],
@@ -566,8 +659,8 @@ def get_market(slug):
                 "market_best_bid": float(m["bestBid"]) if m.get("bestBid") not in (None, "") else None,
                 "market_best_ask": float(m["bestAsk"]) if m.get("bestAsk") not in (None, "") else None,
                 "market_last_trade": float(m["lastTradePrice"]) if m.get("lastTradePrice") not in (None, "") else None,
-                "liquidity":    float(m["liquidity"]),
-                "volume":       float(m["volume"]),
+                "liquidity":    float(liquidity_raw) if liquidity_raw not in (None, "") else 0.0,
+                "volume":       float(volume_raw) if volume_raw not in (None, "") else 0.0,
                 "end_date":     m["endDate"],
                 "closed":       m.get("closed", False),
             }
@@ -649,6 +742,8 @@ def write_edge_event(
     best_ask: float | None = None,
     spread: float | None = None,
     midprice: float | None = None,
+    model_p_yes: float | None = None,
+    model_p_no: float | None = None,
 ):
     try:
         conn = sqlite3.connect(str(JOURNAL_DB))
@@ -677,8 +772,8 @@ def write_edge_event(
                 best_ask,
                 spread,
                 midprice,
-                float(market.get("yes_price") or 0.0),
-                float(market.get("no_price") or 0.0),
+                float(model_p_yes) if model_p_yes is not None else float(market.get("yes_price") or 0.0),
+                float(model_p_no) if model_p_no is not None else float(market.get("no_price") or 0.0),
                 1,
                 skip_reason or None,
                 float(intended_entry_price or 0.0) if intended_entry_price is not None else None,
@@ -716,11 +811,12 @@ def shadow_bucket(price: float) -> str:
 
 
 def shadow_decision_btc(price: float) -> tuple[str, str]:
-    if price > 0.75:
-        return "filtered", "block_gt_0.75"
-    if 0.50 <= price <= 0.75:
-        return "kept", "allow_0.50_0.75"
-    return "filtered", "outside_0.50_0.75"
+    # ENG-2026-05-11: raised from 0.75 -> 0.85 to match eth15m fix
+    if price > 0.85:
+        return "filtered", "block_gt_0.85"
+    if 0.50 <= price <= 0.85:
+        return "kept", "allow_0.50_0.85"
+    return "filtered", "outside_0.50_0.85"
 
 
 def set_shadow_state_btc(price: float, context: str):
@@ -736,6 +832,217 @@ def set_shadow_state_btc(price: float, context: str):
 def shadow_live_gate_btc(price: float, context: str) -> bool:
     set_shadow_state_btc(price, context=context)
     return _state.get('shadow_decision') == 'kept'
+
+
+def maybe_log_down_shadow_btc(market, signal_type: str, delta_pct: float, seconds_remaining: int, *, mode: str, price_cap: float):
+    """Record a hypothetical DOWN entry when DOWN is disabled.
+
+    This is intentionally logging-only: it never submits, sizes, cancels, or mutates live order state.
+    One event per window/signal_type is enough to evaluate whether disabled DOWN would have helped.
+    """
+    if DOWN_ENABLED or delta_pct > -DOWN_MIN_DELTA:
+        return
+    window_ts = int(_state.get('window_ts') or 0)
+    state_key = f"down_shadow_{signal_type}_window_ts"
+    if window_ts and int(_state.get(state_key) or 0) == window_ts:
+        return
+    try:
+        ctx = get_exec_buy_context(market, 'DOWN', mode=mode, price_cap=price_cap, submitted_hint=0.0)
+        book = ctx.get('book') or {}
+        gamma_price = ctx.get('gamma_price')
+        entry_price = ctx.get('submitted_price')
+        if entry_price is None:
+            entry_price = ctx.get('clob_ref_price') if ctx.get('clob_ref_price') is not None else gamma_price
+
+        shadow_decision, shadow_reason = ('filtered', 'missing_price')
+        if entry_price is not None:
+            shadow_decision, shadow_reason = shadow_decision_btc(float(entry_price))
+
+        compare_price = directional_clob_price(book, 'DOWN', fallback=entry_price)
+        mismatch = abs(gamma_price - compare_price) if gamma_price is not None and compare_price is not None else 0.0
+        notes = []
+        if ctx.get('abort_reason'):
+            notes.append(str(ctx.get('abort_reason')))
+        if gamma_price is not None and compare_price is not None and mismatch > MAX_GAMMA_CLOB_DIFF:
+            notes.append(f"gamma_clob_mismatch:{mismatch:.4f}>{MAX_GAMMA_CLOB_DIFF:.4f}")
+        if notes:
+            shadow_reason = "|".join([shadow_reason, *notes])
+
+        log(
+            f"[BTC-DOWN-SHADOW] {signal_type} signal while DOWN disabled "
+            f"delta={delta_pct:+.3f}% sec_rem={seconds_remaining} entry={entry_price if entry_price is not None else 'NA'} "
+            f"gamma={gamma_price if gamma_price is not None else 'NA'} bid={book.get('best_bid')} ask={book.get('best_ask')} "
+            f"spread={book.get('spread')} shadow={shadow_decision} reason={shadow_reason}"
+        )
+        write_edge_event(
+            market,
+            signal_type=signal_type,
+            side='DOWN',
+            intended_entry_price=float(entry_price) if entry_price is not None else None,
+            decision='shadow_down_signal',
+            skip_reason='down_disabled',
+            execution_status='shadow',
+            seconds_remaining=seconds_remaining,
+            shadow_decision=shadow_decision,
+            shadow_skip_reason=shadow_reason,
+            best_bid=book.get('best_bid'),
+            best_ask=book.get('best_ask'),
+            spread=book.get('spread'),
+            midprice=book.get('midpoint'),
+        )
+        if window_ts:
+            _state[state_key] = window_ts
+            save_state()
+    except Exception as e:
+        log(f"[BTC-DOWN-SHADOW] error signal_type={signal_type}: {e}")
+
+
+def eval_down_shadow_full_btc(market, signal_type: str, delta_pct: float, seconds_remaining: int, *, mode: str):
+    """Full-signal DOWN evaluation — shadow only, no execution.
+
+    Runs the complete maker/snipe signal pipeline for DOWN:
+    - get_exec_buy_context → pricing, book, edge
+    - All filters: gamma/CLOB mismatch, price caps, spread, shadow gate
+    - Logs every field the audit requires
+    - Writes edge_event with execution_status='shadow_down_eval'
+    - Never submits an order
+    """
+    window_ts = int(_state.get('window_ts') or 0)
+    state_key = f"down_full_shadow_{signal_type}_window_ts"
+    if window_ts and int(_state.get(state_key) or 0) == window_ts:
+        return  # one eval per window per signal_type
+
+    if not DOWN_ENABLED or delta_pct > -DOWN_MIN_DELTA:
+        return
+
+    try:
+        direction = 'DOWN'
+        ctx = get_exec_buy_context(market, direction, mode=mode, price_cap=SIGNAL_MAX_ENTRY_PRICE if mode == 'maker' else SNIPE_MAX_PRICE, submitted_hint=0.0)
+        book = ctx.get('book') or {}
+        gamma_price = ctx.get('gamma_price')
+        entry_price = ctx.get('submitted_price')
+        token_price = ctx.get('clob_ref_price')
+        abort_reason = ctx.get('abort_reason')
+
+        if entry_price is None:
+            entry_price = token_price if token_price is not None else gamma_price
+
+        # ── Compute directional CLOB price (NO side for DOWN) ──
+        dir_clob_price = directional_clob_price(book, direction, fallback=entry_price)
+        mismatch_diff = abs(gamma_price - dir_clob_price) if gamma_price is not None and dir_clob_price is not None else 0.0
+
+        # ── Shadow decision ──
+        shadow_decision, shadow_reason = shadow_decision_btc(float(entry_price)) if entry_price is not None else ('filtered', 'missing_price')
+
+        # ── Would it have posted? ──
+        would_post = True
+        post_blockers = []
+
+        # Check gamma/CLOB hard guard
+        if gamma_price is not None and dir_clob_price is not None and mismatch_diff > MAX_GAMMA_CLOB_DIFF_SOFT:
+            would_post = False
+            post_blockers.append(f"gamma_clob_hard:{mismatch_diff:.4f}>{MAX_GAMMA_CLOB_DIFF_SOFT:.4f}")
+        elif gamma_price is not None and dir_clob_price is not None and mismatch_diff > MAX_GAMMA_CLOB_DIFF:
+            # Soft guard zone
+            allowed, soft_reason, soft_meta = soft_guard_check_btc(book, direction, dir_clob_price, gamma_price, mismatch_diff)
+            if not allowed:
+                would_post = False
+                post_blockers.append(f"soft_guard:{soft_reason}")
+
+        # Check entry price cap
+        if token_price is not None and token_price > SIGNAL_MAX_ENTRY_PRICE:
+            would_post = False
+            post_blockers.append(f"entry_price_above_max:{token_price:.4f}>{SIGNAL_MAX_ENTRY_PRICE:.2f}")
+
+        # Check shadow gate
+        if shadow_decision != 'kept':
+            would_post = False
+            post_blockers.append(f"shadow_gate:{shadow_reason}")
+
+        # Check abort
+        if abort_reason:
+            would_post = False
+            post_blockers.append(f"abort:{abort_reason}")
+
+        # Check time
+        if seconds_remaining < SIGNAL_MIN_SEC_REMAINING:
+            would_post = False
+            post_blockers.append(f"late_entry:{seconds_remaining}s<{SIGNAL_MIN_SEC_REMAINING}s")
+
+        # ── Would it have filled realistically? ──
+        would_fill = would_post  # base assumption: posted = fills at maker price on CLOB
+        fill_blockers = list(post_blockers)
+
+        # NO side liquidity check: if spread > EXEC_SPREAD_CAP, taker would struggle
+        spread_val = book.get('spread')
+        if would_post and spread_val is not None and spread_val > EXEC_SPREAD_CAP:
+            would_fill = False
+            fill_blockers.append(f"wide_spread:{spread_val:.4f}>{EXEC_SPREAD_CAP:.4f}")
+
+        # ── Expected edge after realistic CLOB fill ──
+        expected_edge = None
+        if entry_price is not None:
+            # For DOWN (BUY NO): expected edge = 1.0 - fill_price (since NO pays 1.0 if DOWN wins)
+            expected_edge = round(1.0 - float(entry_price) * (1.0 + TAKER_FEE_BUFFER), 4)
+
+        # ── Confirmation count in this window ──
+        confirmations = 0
+        open_price = _state.get('window_open_btc')
+        if open_price:
+            now_ts = int(time.time())
+            cutoff_ts = now_ts - SIGNAL_CONFIRM_SEC
+            recent_prices = [(t, p) for t, p in _state.get('btc_prices', []) if t >= cutoff_ts]
+            for _, p in recent_prices[-SIGNAL_CONFIRM_COUNT:]:
+                d = (p - open_price) / open_price * 100
+                if d < -DOWN_MIN_DELTA:
+                    confirmations += 1
+
+        # ── Log ──
+        log(
+            f"[BTC-DOWN-FULL-SHADOW] {signal_type} slug={market.get('slug','')} "
+            f"direction=DOWN open={open_price} btc_now={_state.get('window_open_btc') and (open_price * (1 + delta_pct/100)) if open_price else 'NA'} "
+            f"delta={delta_pct:+.3f}% confirms={confirmations}/{SIGNAL_CONFIRM_COUNT} "
+            f"yes_bid={book.get('yes_bid','NA')} yes_ask={book.get('yes_ask','NA')} "
+            f"no_bid={book.get('best_bid','NA')} no_ask={book.get('best_ask','NA')} "
+            f"no_entry={entry_price if entry_price is not None else 'NA'} spread={spread_val if spread_val is not None else 'NA'} "
+            f"gamma_clob_diff={mismatch_diff:.4f} expected_edge={expected_edge} "
+            f"would_post={would_post} would_fill={would_fill} "
+            f"blockers={'|'.join(fill_blockers) if fill_blockers else 'none'} "
+            f"shadow={shadow_decision}"
+        )
+
+        # ── Write edge_event ──
+        write_edge_event(
+            market,
+            signal_type=signal_type,
+            side='DOWN',
+            intended_entry_price=float(entry_price) if entry_price is not None else None,
+            decision='shadow_down_eval',
+            skip_reason='|'.join(fill_blockers) if fill_blockers else 'would_have_posted' if would_post else 'would_have_filled' if would_fill else 'filtered',
+            execution_status='shadow_down_eval',
+            seconds_remaining=seconds_remaining,
+            shadow_decision=shadow_decision,
+            shadow_skip_reason=shadow_reason,
+            best_bid=book.get('best_bid'),
+            best_ask=book.get('best_ask'),
+            spread=spread_val,
+            midprice=token_price,
+            model_p_yes=float(market.get('yes_price') or 0.0),
+            model_p_no=float(market.get('no_price') or 0.0),
+        )
+
+        # ── Persist eval metadata in state for validation ──
+        _state[f"down_shadow_{signal_type}_entry_price"] = float(entry_price) if entry_price is not None else None
+        _state[f"down_shadow_{signal_type}_would_fill"] = would_fill
+        _state[f"down_shadow_{signal_type}_expected_edge"] = expected_edge
+        _state[f"down_shadow_{signal_type}_open_price"] = open_price
+
+        if window_ts:
+            _state[state_key] = window_ts
+            save_state()
+
+    except Exception as e:
+        log(f"[BTC-DOWN-FULL-SHADOW] error signal_type={signal_type}: {e}")
 
 
 def direction_min_delta_btc(direction: str) -> float:
@@ -804,6 +1111,118 @@ def direction_market_quote_btc(market: dict, direction: str) -> dict:
         'error': None,
         'source': 'gamma_market_quote',
     }
+
+
+def soft_guard_check_btc(book, direction, dir_clob_price, gamma_price, mismatch, size_usd=5.0):
+    """Soft guard for gamma/CLOB mismatch in the 0.08-0.10 zone.
+    Trade passes ONLY if ALL conditions met.
+    Returns (allowed: bool, reason: str, metadata: dict)"""
+    
+    # 1. Max entry price cap
+    if dir_clob_price > SOFT_GUARD_MAX_ENTRY:
+        return False, f"entry_above_soft_cap:{dir_clob_price:.4f}>{SOFT_GUARD_MAX_ENTRY:.2f}", {}
+    
+    # 2. Expected edge after real fill — must retain ≥ SOFT_GUARD_MIN_EDGE after
+    #    Polymarket dynamic taker fee. Buying at p costs p*(1+fee); winning pays 1.0.
+    expected_edge = 1.0 - dir_clob_price * (1.0 + TAKER_FEE_BUFFER)
+    if expected_edge < SOFT_GUARD_MIN_EDGE:
+        return False, f"insufficient_edge:{expected_edge:.4f}<{SOFT_GUARD_MIN_EDGE:.2f}", {}
+    
+    # 3. CLOB spread must be tight
+    spread = book.get('spread')
+    if spread is not None and spread > SOFT_GUARD_MAX_SPREAD:
+        return False, f"spread_too_wide:{spread:.4f}>{SOFT_GUARD_MAX_SPREAD:.2f}", {}
+    
+    # 4. Liquidity — enough size at best level for $5 order
+    shares_needed = size_usd / dir_clob_price if dir_clob_price > 0 else float('inf')
+    if direction == 'UP':
+        asks = book.get('asks', [])
+        top_size = asks[0]["size"] if asks else 0
+    else:
+        bids = book.get('bids', [])
+        top_size = bids[0]["size"] if bids else 0
+    
+    if top_size < shares_needed:
+        return False, f"insufficient_liquidity:{top_size:.1f}<{shares_needed:.1f}", {}
+    if top_size < SOFT_GUARD_MIN_LIQ:
+        return False, f"thin_liquidity:{top_size:.1f}<{SOFT_GUARD_MIN_LIQ:.1f}", {}
+    
+    # 5. No one-sided/stuck risk — both sides must have real liquidity
+    top_bid = book['bids'][0] if book.get('bids') else None
+    top_ask = book['asks'][0] if book.get('asks') else None
+    if not top_bid or not top_ask:
+        return False, "one_sided_book", {}
+    if top_bid["size"] < 1.0 or top_ask["size"] < 1.0:
+        return False, "thin_book_both_sides", {}
+    
+    metadata = {
+        'gamma_price': gamma_price,
+        'clob_price': dir_clob_price,
+        'gamma_clob_diff': mismatch,
+        'max_allowed_diff': MAX_GAMMA_CLOB_DIFF_SOFT,
+        'real_fill_price': dir_clob_price,
+        'expected_edge_after_fill': expected_edge,
+        'spread': spread,
+        'ask_size': top_ask["size"] if top_ask else 0,
+        'bid_size': top_bid["size"] if top_bid else 0,
+    }
+    
+    return True, "SOFT_GUARD_PASS", metadata
+
+
+def _get_daily_key():
+    return datetime.now(timezone.utc).strftime('%Y-%m-%d')
+
+def _reset_daily_caps_if_new_day():
+    today = _get_daily_key()
+    if _state.get('daily_date') != today:
+        _state['daily_date'] = today
+        _state['daily_fills'] = 0
+        _state['daily_posts'] = 0
+        save_state()
+
+def _check_daily_caps():
+    """Returns (allowed: bool, reason: str). Blocks if daily caps hit."""
+    _reset_daily_caps_if_new_day()
+    fills = _state.get('daily_fills', 0)
+    posts = _state.get('daily_posts', 0)
+    cooldown_ts = _state.get('rejected_cooldown_ts', 0)
+    if cooldown_ts and int(time.time()) - cooldown_ts < REJECTED_COOLDOWN_SECONDS:
+        remaining = REJECTED_COOLDOWN_SECONDS - (int(time.time()) - cooldown_ts)
+        return False, f"REJECTED_COOLDOWN_ACTIVE remaining={remaining}s"
+    if fills >= MAKER_MAX_FILLS_PER_DAY:
+        return False, f"DAILY_TRADE_CAP_HIT fills={fills}/{MAKER_MAX_FILLS_PER_DAY}"
+    if posts >= MAKER_MAX_POSTS_PER_DAY:
+        return False, f"DAILY_ATTEMPT_CAP_HIT posts={posts}/{MAKER_MAX_POSTS_PER_DAY}"
+    return True, "ok"
+
+def _record_daily_post():
+    _reset_daily_caps_if_new_day()
+    _state['daily_posts'] = _state.get('daily_posts', 0) + 1
+    save_state()
+
+def _record_daily_fill():
+    _reset_daily_caps_if_new_day()
+    _state['daily_fills'] = _state.get('daily_fills', 0) + 1
+    save_state()
+
+
+def maker_fok_only_place(order_id_for_log, token_id, shares, limit_price, market):
+    """FOK-only order placement — no GTC, no polling, no fallback.
+    Used exclusively for SOFT_GUARD_PASS trades."""
+    if MAKER_DRY_RUN:
+        log(f"[BTC-MAKER-FOK-DRY] FOK_ONLY {shares} @{limit_price:.4f} token={token_id}")
+        return {"success": True, "dry": True, "order_id": f"dry-fok-{int(time.time())}"}
+    cmd = [str(VENV_PY), str(WORK_DIR / "scripts" / "polymarket_executor.py"), "buy_fok", str(token_id), str(shares), str(limit_price)]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
+    payload = {"success": result.returncode == 0, "output": result.stdout, "error": result.stderr}
+    for line in result.stdout.splitlines():
+        if line.startswith('__RESULT__'):
+            import json as _json2
+            payload['posted'] = _json2.loads(line[len('__RESULT__'):])
+            payload['order_id'] = payload['posted'].get('order_id') or payload['posted'].get('orderID') or payload['posted'].get('id')
+            break
+    return payload
 
 
 def directional_clob_price(book: dict, direction: str, fallback=None):
@@ -894,13 +1313,26 @@ def update_quote_guard_btc(market: dict, seconds_remaining: int):
         jump_yes = abs(current_yes - float(prev_yes))
         jump_no = abs(current_no - float(prev_no))
         jump = max(jump_yes, jump_no)
-        if jump >= QUOTE_JUMP_MAX and int(_state.get('quote_guard_window_ts') or 0) != current_window:
-            _state['quote_guard_window_ts'] = current_window
-            _state['quote_guard_reason'] = f"gamma_quote_jump:{float(prev_yes):.3f}->{current_yes:.3f}"
+        if jump >= QUOTE_JUMP_MAX:
+            count = int(_state.get('quote_jump_count') or 0) + 1
+            if int(_state.get('quote_jump_count') or 0) != count:
+                _state['quote_jump_count'] = count
+                changed = True
             log(
-                f"[BTC-GUARD] WINDOW PAUSE reason=gamma_quote_jump prev_yes={float(prev_yes):.3f} "
-                f"new_yes={current_yes:.3f} prev_no={float(prev_no):.3f} new_no={current_no:.3f} sec_rem={seconds_remaining}"
+                f"[BTC-GUARD] jump signal prev_yes={float(prev_yes):.3f} new_yes={current_yes:.3f} "
+                f"prev_no={float(prev_no):.3f} new_no={current_no:.3f} jump={jump:.3f} "
+                f"count={count}/{QUOTE_JUMP_CONFIRM_CYCLES} sec_rem={seconds_remaining}"
             )
+            if count >= QUOTE_JUMP_CONFIRM_CYCLES and int(_state.get('quote_guard_window_ts') or 0) != current_window:
+                _state['quote_guard_window_ts'] = current_window
+                _state['quote_guard_reason'] = f"gamma_quote_jump:{float(prev_yes):.3f}->{current_yes:.3f}"
+                log(
+                    f"[BTC-GUARD] WINDOW PAUSE reason=gamma_quote_jump prev_yes={float(prev_yes):.3f} "
+                    f"new_yes={current_yes:.3f} prev_no={float(prev_no):.3f} new_no={current_no:.3f} sec_rem={seconds_remaining}"
+                )
+                changed = True
+        elif int(_state.get('quote_jump_count') or 0) != 0:
+            _state['quote_jump_count'] = 0
             changed = True
 
     if prev_window != current_window or prev_yes != current_yes or prev_no != current_no:
@@ -1070,6 +1502,59 @@ def finalize_window_validation_btc():
     except Exception as e:
         log(f"[BTC-VALIDATION] summary query error: {e}")
 
+    # ── DOWN SHADOW PnL computation ──
+    down_shadow = {'candidates': 0, 'would_post': 0, 'would_fill': 0,
+                   'theoretical_pnl': 0.0, 'realistic_pnl': 0.0,
+                   'wins': 0, 'losses': 0, 'entry_prices': []}
+    try:
+        conn = sqlite3.connect(str(JOURNAL_DB))
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT intended_entry_price, execution_status, skip_reason
+            FROM edge_events
+            WHERE engine='btc15m' AND market_slug=?
+              AND execution_status='shadow_down_eval' AND side='DOWN'
+            ORDER BY timestamp_et ASC
+            """,
+            (prev_slug,),
+        )
+        shadow_rows = cur.fetchall()
+        conn.close()
+        if shadow_rows:
+            for sr in shadow_rows:
+                entry = sr['intended_entry_price']
+                skip = sr['skip_reason'] or ''
+                if entry is None:
+                    continue
+                down_shadow['candidates'] += 1
+                down_shadow['entry_prices'].append(float(entry))
+                would_post = 'would_have_posted' in skip or 'would_have_filled' in skip
+                would_fill = 'would_have_filled' in skip
+                if would_post:
+                    down_shadow['would_post'] += 1
+                if would_fill:
+                    down_shadow['would_fill'] += 1
+                # PnL: entry_price is NO price. If market resolved DOWN, NO pays 1.0.
+                # Win = 1.0 - entry_price per share. Loss = -entry_price per share.
+                # $5 / entry_price = shares. PnL = shares * (1.0 - entry_price) if DOWN else shares * (-entry_price)
+                if market_outcome:
+                    shares = 5.0 / float(entry) if float(entry) > 0 else 0
+                    if market_outcome == 'DOWN':
+                        trade_pnl = shares * (1.0 - float(entry))
+                        down_shadow['wins'] += 1
+                    else:
+                        trade_pnl = shares * (0.0 - float(entry))
+                        down_shadow['losses'] += 1
+                    down_shadow['theoretical_pnl'] += trade_pnl
+                    if would_fill:
+                        down_shadow['realistic_pnl'] += trade_pnl
+            down_shadow['theoretical_pnl'] = round(down_shadow['theoretical_pnl'], 2)
+            down_shadow['realistic_pnl'] = round(down_shadow['realistic_pnl'], 2)
+    except Exception as e:
+        log(f"[BTC-VALIDATION] down shadow pnl error: {e}")
+
     if trades_summary['resolved_count'] > 0:
         action_outcome = 'resolved_win' if trades_summary['net_pnl'] > 0 else ('resolved_loss' if trades_summary['net_pnl'] < 0 else 'resolved_flat')
     elif trades_summary['count'] > 0:
@@ -1084,6 +1569,8 @@ def finalize_window_validation_btc():
         action_outcome = 'blocked_gamma_mismatch'
     elif 'delta_below_threshold' in skip_reasons:
         action_outcome = 'no_signal'
+    elif any('shadow_down_eval' in str(r) for r in decisions):
+        action_outcome = 'shadow_down_eval'
     else:
         action_outcome = 'no_trade'
 
@@ -1103,6 +1590,13 @@ def finalize_window_validation_btc():
         'trade_count': trades_summary['count'],
         'resolved_count': trades_summary['resolved_count'],
         'net_pnl': trades_summary['net_pnl'],
+        'down_shadow_candidates': down_shadow['candidates'],
+        'down_shadow_would_post': down_shadow['would_post'],
+        'down_shadow_would_fill': down_shadow['would_fill'],
+        'down_shadow_theoretical_pnl': down_shadow['theoretical_pnl'],
+        'down_shadow_realistic_pnl': down_shadow['realistic_pnl'],
+        'down_shadow_wins': down_shadow['wins'],
+        'down_shadow_losses': down_shadow['losses'],
         **metrics,
     }
     append_window_validation_btc(record)
@@ -1280,7 +1774,7 @@ def passes_trade_gate_btc(signal_type: str, direction: str, delta_pct: float, to
     compare_price = directional_clob_price(book or {}, direction, fallback=token_price)
     if gamma_price is not None and compare_price is not None:
         mismatch = abs(float(gamma_price) - float(compare_price))
-        if mismatch > MAX_GAMMA_CLOB_DIFF:
+        if mismatch > MAX_GAMMA_CLOB_DIFF_SOFT:
             return gate_block_btc(
                 signal_type,
                 direction,
@@ -1289,8 +1783,11 @@ def passes_trade_gate_btc(signal_type: str, direction: str, delta_pct: float, to
                 token_price,
                 gamma_price,
                 book,
-                extra=f"diff={mismatch:.4f} max={MAX_GAMMA_CLOB_DIFF:.4f}",
+                extra=f"diff={mismatch:.4f} max={MAX_GAMMA_CLOB_DIFF_SOFT:.4f} (hard)",
             )
+        elif mismatch > MAX_GAMMA_CLOB_DIFF:
+            # Soft guard zone: let it through to maker where detailed conditions are checked
+            pass
 
     max_entry = direction_max_entry_btc(direction)
     if token_price is not None and float(token_price) > max_entry:
@@ -1856,6 +2353,7 @@ def _handle_maker_fill(oid, source="status", vf=None):
     _state['snipe_done'] = True
     _state["consecutive_losses"] = 0
     _state["diag_orders_filled"] = _state.get("diag_orders_filled", 0) + 1
+    _record_daily_fill()
     record_active_fill("btc15m", _state.get("window_ts"), fill_side)
     _state['maker_order_id'] = ""
     _state['maker_token_id'] = ""
@@ -2039,10 +2537,15 @@ def check_maker_snipe(market, seconds_remaining):
     delta_pct = (base_price - _state['window_open_btc']) / _state['window_open_btc'] * 100
     log(f"[BTC-MAKER] now={base_price} open={_state['window_open_btc']} delta={delta_pct:+.3f}% sec_rem={seconds_remaining}")
     # FIX #14/16: UP only by default. DOWN disabled (25% win rate).
+    # AUDIT-2026-05-01: DOWN shadow eval when DOWN_ENABLED=true but DOWN_EXECUTION_ENABLED=false
     if UP_ENABLED and delta_pct > UP_MIN_DELTA:
         direction = 'UP'
     elif DOWN_ENABLED and delta_pct < -DOWN_MIN_DELTA:
-        direction = 'DOWN'
+        if DOWN_EXECUTION_ENABLED:
+            direction = 'DOWN'
+        else:
+            eval_down_shadow_full_btc(market, 'maker', delta_pct, seconds_remaining, mode='maker')
+            direction = None
     else:
         direction = None
     if not direction:
@@ -2138,8 +2641,8 @@ def check_maker_snipe(market, seconds_remaining):
     book = ctx['book']
     
     # ── FILTERS: sec_remaining and entry_price ──
-    if seconds_remaining < 15:
-        log(f"[BTC-MAKER] FILTER: sec_remaining={seconds_remaining}s < 15s, skipping ultra-late entry")
+    if seconds_remaining < SIGNAL_MIN_SEC_REMAINING:
+        log(f"[BTC-MAKER] FILTER: sec_remaining={seconds_remaining}s < {SIGNAL_MIN_SEC_REMAINING}s, skipping late-window entry")
         write_edge_event(
             market,
             signal_type="maker",
@@ -2158,8 +2661,21 @@ def check_maker_snipe(market, seconds_remaining):
     dir_clob_price = directional_clob_price(ctx['book'], direction, fallback=token_price)
     mismatch_diff = abs(gamma_price - dir_clob_price) if gamma_price is not None and dir_clob_price is not None else 0
     if gamma_price is not None and dir_clob_price is not None and mismatch_diff > MAX_GAMMA_CLOB_DIFF:
-        log(f"[BTC-MAKER] ABORT: gamma/clob mismatch gamma_price={gamma_price:.4f} dir_clob={dir_clob_price:.4f} midpoint={token_price:.4f} diff={mismatch_diff:.4f}")
-        return None
+        if mismatch_diff > MAX_GAMMA_CLOB_DIFF_SOFT:
+            log(f"[BTC-MAKER] HARD_GUARD_ABORT: gamma/clob mismatch gamma_price={gamma_price:.4f} dir_clob={dir_clob_price:.4f} midpoint={token_price:.4f} diff={mismatch_diff:.4f} (diff > {MAX_GAMMA_CLOB_DIFF_SOFT})")
+            return None
+        # Soft guard zone: 0.08 < diff <= 0.10 → check conditions
+        allowed, soft_reason, soft_meta = soft_guard_check_btc(ctx['book'], direction, dir_clob_price, gamma_price, mismatch_diff)
+        if allowed:
+            log(f"[BTC-MAKER] SOFT_GUARD_PASS gamma={gamma_price:.4f} clob={dir_clob_price:.4f} diff={mismatch_diff:.4f}/{MAX_GAMMA_CLOB_DIFF_SOFT:.4f} fill_price={dir_clob_price:.4f} edge={soft_meta['expected_edge_after_fill']:.4f} spread={soft_meta['spread']} liq_ask={soft_meta['ask_size']}")
+            _state['force_fok_only'] = True
+            _state['soft_guard_meta'] = soft_meta
+        else:
+            log(f"[BTC-MAKER] SOFT_GUARD_BLOCK reason={soft_reason} gamma={gamma_price:.4f} clob={dir_clob_price:.4f} diff={mismatch_diff:.4f}")
+            return None
+    else:
+        _state['force_fok_only'] = False
+        log(f"[BTC-MAKER] NORMAL_GUARD_PASS gamma={gamma_price:.4f} clob={dir_clob_price:.4f} diff={mismatch_diff:.4f}")
     
     
     if token_price > SIGNAL_MAX_ENTRY_PRICE:
@@ -2269,6 +2785,8 @@ def check_maker_snipe(market, seconds_remaining):
     maker_budget = SNIPE_DEFAULT * current_risk_multiplier() * size_mult
     shares = max(5.0, math.floor((maker_budget / max(limit_price, 0.01)) * 100) / 100)
     log(f"[BTC-MAKER] {direction} signal pricing_source=CLOB slug={market.get('slug','')} side={side_label} token_id={token_id} gamma_price={gamma_price:.4f} clob_best_bid={bid_str} clob_best_ask={ask_str} clob_midpoint={mid_str} submitted_price={limit_price:.4f} spread={spread_str} shares={shares:.2f} dry={MAKER_DRY_RUN} attempt={attempt_num} family={family_id}")
+    if attempt_num == 1:
+        tg(f"[BTC-MAKER] 🎯 SIGNAL: {direction} {shares:.2f} sh @ {limit_price:.4f} sec_rem={seconds_remaining}s — attempting maker order")
     write_edge_event(
         market,
         signal_type="maker",
@@ -2280,6 +2798,48 @@ def check_maker_snipe(market, seconds_remaining):
         shadow_decision=_state.get('shadow_decision', ''),
         shadow_skip_reason=_state.get('shadow_reason', ''),
     )
+    # ── DAILY CAP CHECK ──
+    cap_ok, cap_reason = _check_daily_caps()
+    if not cap_ok:
+        log(f"[BTC-MAKER] {cap_reason}")
+        _state['maker_done'] = True
+        save_state()
+        return None
+    
+    force_fok = _state.pop('force_fok_only', False)
+    soft_meta = _state.pop('soft_guard_meta', None)
+    
+    if force_fok:
+        # ── FOK-ONLY PATH (SOFT GUARD) ──
+        log(f"[BTC-MAKER] SOFT_GUARD_PASS_FOK_ONLY gamma={gamma_price:.4f} clob={dir_clob_price:.4f} diff={mismatch_diff:.4f} fill_price={dir_clob_price:.4f} edge={1.0-dir_clob_price:.4f} shares={shares:.2f}")
+        r = maker_fok_only_place(posted_oid or 'fok-soft', token_id_order, shares, limit_price, market)
+        for line in (r.get('output') or '').splitlines():
+            if line.strip() and ('FILL' in line or 'ATTEMPT' in line or 'RESULT' in line):
+                log(f"[EXEC-FOK] {line.strip()}")
+        if r.get('error'):
+            for line in r['error'].splitlines():
+                if line.strip():
+                    log(f"[EXEC-FOK-ERR] {line.strip()}")
+        fok_oid = str(r.get('order_id') or (r.get('posted') or {}).get('order_id') or '')
+        if r.get('filled') or (r.get('posted') or {}).get('status') == 'FILLED':
+            _record_daily_post()
+            log(f"[BTC-MAKER] SOFT_GUARD_FOK_FILLED order_id={fok_oid}")
+            _state['maker_order_id'] = fok_oid
+            _state['maker_side'] = direction
+            _state['maker_price'] = limit_price
+            _state['maker_shares'] = shares
+            _state['maker_sec_remaining'] = seconds_remaining
+            _state['maker_price_bucket'] = price_bucket
+            _handle_maker_fill(fok_oid, source="soft_guard_fok")
+            return True
+        else:
+            _state['rejected_cooldown_ts'] = int(time.time())
+            log(f"[BTC-MAKER] SOFT_GUARD_FOK_NO_FILL order_id={fok_oid} cooldown={REJECTED_COOLDOWN_SECONDS}s")
+            _state['maker_done'] = True
+            save_state()
+            return False
+    
+    # ── NORMAL GTC MAKER PATH ──
     r = maker_place_order('BUY', shares, limit_price, market['condition_id'], token_id_order)
     for line in (r.get('output') or '').splitlines():
         if line.strip() and ('[MAKER' in line or '[RESULT' in line or '[ATTEMPT' in line):
@@ -2290,12 +2850,33 @@ def check_maker_snipe(market, seconds_remaining):
                 log(f"[EXEC-ERR] {line.strip()}")
 
     posted_oid = str(r.get('order_id') or (r.get('posted') or {}).get('order_id') or '')
+    if r.get('success') and posted_oid:
+        _record_daily_post()
     if not r.get('success') or not posted_oid:
         _state['diag_orders_submit_failed'] = _state.get('diag_orders_submit_failed', 0) + 1
         _state['maker_attempt_count'] = _state.get('maker_attempt_count', 0) + 1
         fail_reason = 'missing_order_id' if r.get('success') and not posted_oid else 'executor_error'
-        log(f"[BTC-MAKER] submit failed reason={fail_reason} attempt={_state['maker_attempt_count']}/{MAKER_MAX_RETRIES} sec_rem={seconds_remaining} output_oid={posted_oid or 'none'}")
-        if seconds_remaining > MAKER_RETRY_MIN_SEC and _state.get('maker_attempt_count', 0) < MAKER_MAX_RETRIES:
+        # AUDIT-2026-05-01: Write edge_event to correct the premature "posted" status
+        write_edge_event(
+            market,
+            signal_type="maker",
+            side=direction,
+            intended_entry_price=token_price,
+            decision="exec_error",
+            skip_reason=fail_reason,
+            execution_status="exec_error",
+            seconds_remaining=seconds_remaining,
+            best_bid=book.get('best_bid'),
+            best_ask=book.get('best_ask'),
+            spread=book.get('spread'),
+            midprice=token_price,
+        )
+        # Only set cooldown if NO retry possible
+        retry_possible = seconds_remaining > MAKER_RETRY_MIN_SEC and _state.get('maker_attempt_count', 0) <= MAKER_MAX_RETRIES
+        if not retry_possible:
+            _state['rejected_cooldown_ts'] = int(time.time())
+        log(f"[BTC-MAKER] submit failed reason={fail_reason} attempt={_state['maker_attempt_count']}/{MAKER_MAX_RETRIES} sec_rem={seconds_remaining} output_oid={posted_oid or 'none'} cooldown={REJECTED_COOLDOWN_SECONDS if not retry_possible else 0}s")
+        if retry_possible:
             save_state()
             return None
         _state['maker_done'] = True
@@ -2367,6 +2948,92 @@ def check_gabagool(market, seconds_remaining=None):
         save_state()
     return None
 
+def check_reversal(market, seconds_remaining):
+    """Contrarian entry: buy the LOSING side cheap after a strong early move.
+
+    Signal: within first 3 min of a window, if BTC has moved |delta| >= REVERSAL_MIN_DELTA%
+    and the opposite side is priced <= REVERSAL_MAX_ENTRY_PRICE, place a small ($3) BUY
+    on the losing side. Exit at REVERSAL_TP_PRICE or hold to resolution.
+    """
+    if not REVERSAL_ENABLED:
+        return
+    if _state.get("reversal_done"):
+        return
+    if seconds_remaining < REVERSAL_MIN_SEC_REM:
+        return
+
+    btc = get_btc_price()
+    open_btc = _state.get("window_open_btc") or 0.0
+    if not btc or not open_btc:
+        return
+
+    delta_pct = (btc - open_btc) / open_btc * 100.0
+    if abs(delta_pct) < REVERSAL_MIN_DELTA:
+        return
+
+    losing_direction = "DOWN" if delta_pct > 0 else "UP"
+    losing_price = direction_gamma_price_btc(market, losing_direction)
+    if losing_price is None:
+        return
+    if losing_price > REVERSAL_MAX_ENTRY_PRICE or losing_price < REVERSAL_MIN_ENTRY_PRICE:
+        return
+
+    token_id = direction_token_id_btc(market, losing_direction)
+    if not token_id:
+        return
+
+    shares = round(REVERSAL_SIZE_USD / losing_price, 2)
+    log(f"[BTC-REVERSAL] signal delta={delta_pct:+.3f}% BUY {losing_direction} @ {losing_price:.3f} size=${REVERSAL_SIZE_USD:.2f} shares={shares}")
+
+    if REVERSAL_DRY_RUN:
+        log(f"[BTC-REVERSAL] [DRY] would place BUY {losing_direction}")
+        _state["reversal_done"] = True
+        save_state()
+        return
+
+    r = place_order("BUY", shares, losing_price, market["condition_id"], token_id)
+    if r.get("success") and r.get("filled"):
+        _state["reversal_done"] = True
+        _state["reversal_position"] = {
+            "token_id": token_id,
+            "direction": losing_direction,
+            "size_usd": REVERSAL_SIZE_USD,
+            "entry_price": losing_price,
+            "shares": shares,
+            "timestamp": int(time.time()),
+            "window_ts": _state["window_ts"],
+        }
+        save_state()
+        tg(f"[BTC-REVERSAL] BUY {losing_direction} @ {losing_price:.3f} size=${REVERSAL_SIZE_USD:.2f}")
+    else:
+        log(f"[BTC-REVERSAL] order failed/unfilled: success={r.get('success')} filled={r.get('filled')}")
+
+
+def check_reversal_exit(market):
+    """Take profit on open reversal position if price reached TP."""
+    pos = _state.get("reversal_position")
+    if not pos:
+        return
+    current = direction_gamma_price_btc(market, pos["direction"])
+    if current is None:
+        return
+    if current < REVERSAL_TP_PRICE:
+        return
+    log(f"[BTC-REVERSAL] TP hit: {pos['direction']} {pos['entry_price']:.3f} -> {current:.3f}")
+    if REVERSAL_DRY_RUN:
+        _state["reversal_position"] = None
+        save_state()
+        return
+    r = place_order("SELL", pos["shares"], current, market["condition_id"], pos["token_id"])
+    if r.get("success"):
+        pnl = (current - pos["entry_price"]) * pos["shares"]
+        tg(f"[BTC-REVERSAL] SOLD {pos['direction']} @ {current:.3f} pnl=${pnl:+.2f}")
+        _state["reversal_position"] = None
+        save_state()
+    else:
+        log(f"[BTC-REVERSAL] sell failed: {r}")
+
+
 def check_arb(market):
     if _state["arb_done"]:
         return None
@@ -2420,11 +3087,18 @@ def check_snipe(market, seconds_remaining):
     # FIX #14: Asymmetric delta — DOWN requires stronger signal
     direction = None
     # FIX #16: DOWN disabled by default
+    # AUDIT-2026-05-01: DOWN shadow eval when DOWN_ENABLED=true but DOWN_EXECUTION_ENABLED=false
     if UP_ENABLED and delta_pct > UP_MIN_DELTA:
         direction = "UP"
     elif DOWN_ENABLED and delta_pct < -DOWN_MIN_DELTA:
-        direction = "DOWN"
+        if DOWN_EXECUTION_ENABLED:
+            direction = "DOWN"
+        else:
+            eval_down_shadow_full_btc(market, 'snipe', delta_pct, seconds_remaining, mode='taker')
+            direction = None
     else:
+        direction = None
+    if not direction:
         log(f"[SNIPE] Delta {delta_pct:+.3f}% — no valid signal (DOWN_ENABLED={DOWN_ENABLED})")
         write_edge_event(
             market,
@@ -2468,8 +3142,8 @@ def check_snipe(market, seconds_remaining):
     price = ctx['clob_ref_price']
     book = ctx['book']
 
-    if seconds_remaining < 15:
-        log(f"[SNIPE] FILTER: sec_remaining={seconds_remaining}s < 15s, skipping ultra-late entry")
+    if seconds_remaining < SIGNAL_MIN_SEC_REMAINING:
+        log(f"[SNIPE] FILTER: sec_remaining={seconds_remaining}s < {SIGNAL_MIN_SEC_REMAINING}s, skipping late-window entry")
         write_edge_event(
             market,
             signal_type="snipe",
@@ -2488,8 +3162,16 @@ def check_snipe(market, seconds_remaining):
     snipe_compare = directional_clob_price(ctx.get('book', {}), direction, fallback=price)
     snipe_mismatch = abs(gamma_price - snipe_compare) if gamma_price is not None and snipe_compare is not None else 0
     if gamma_price is not None and snipe_compare is not None and snipe_mismatch > MAX_GAMMA_CLOB_DIFF:
-        log(f"[BTC-SNIPE] ABORT: gamma/clob mismatch gamma_price={gamma_price:.4f} dir_clob={snipe_compare:.4f} midpoint={price:.4f} diff={snipe_mismatch:.4f}")
-        return None
+        if snipe_mismatch > MAX_GAMMA_CLOB_DIFF_SOFT:
+            log(f"[BTC-SNIPE] HARD_GUARD_ABORT: gamma/clob mismatch gamma_price={gamma_price:.4f} dir_clob={snipe_compare:.4f} midpoint={price:.4f} diff={snipe_mismatch:.4f} (diff > {MAX_GAMMA_CLOB_DIFF_SOFT})")
+            return None
+        # Soft guard zone
+        allowed, soft_reason, soft_meta = soft_guard_check_btc(ctx.get('book', {}), direction, snipe_compare, gamma_price, snipe_mismatch)
+        if allowed:
+            log(f"[BTC-SNIPE] SOFT_GUARD_PASS gamma={gamma_price:.4f} clob={snipe_compare:.4f} diff={snipe_mismatch:.4f}/{MAX_GAMMA_CLOB_DIFF_SOFT:.4f} fill_price={snipe_compare:.4f} edge={soft_meta['expected_edge_after_fill']:.4f} spread={soft_meta['spread']}")
+        else:
+            log(f"[BTC-SNIPE] SOFT_GUARD_BLOCK reason={soft_reason} gamma={gamma_price:.4f} clob={snipe_compare:.4f} diff={snipe_mismatch:.4f}")
+            return None
     
     
     if price > SIGNAL_MAX_ENTRY_PRICE:
@@ -2655,6 +3337,11 @@ def setup_new_window(slug, window_ts):
     _state["arb_done"]        = False
     _state["arb_logged"]      = False  # FIX #7: reset arb log flag
     _state["snipe_done"]      = False
+    if _state.get("reversal_position") is not None:
+        pos = _state["reversal_position"]
+        log(f"[BTC-REVERSAL] window closed with open position {pos['direction']} @ {pos['entry_price']:.3f} shares={pos['shares']} — held to resolution")
+        _state["reversal_position"] = None
+    _state["reversal_done"]   = False
     _state["maker_order_id"]  = ""
     _state["maker_token_id"]  = ""
     _state["maker_side"]      = ""
@@ -2668,6 +3355,7 @@ def setup_new_window(slug, window_ts):
     _state['quote_prev_window_ts'] = window_ts
     _state['quote_prev_yes'] = None
     _state['quote_prev_no'] = None
+    _state['quote_jump_count'] = 0
     _state['quote_guard_window_ts'] = 0
     _state['quote_guard_reason'] = ''
     _state['quote_divergence_count_up'] = 0
@@ -2690,17 +3378,23 @@ def check_daily_limit():
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 def main():
-    global _state
+    global _state, rcb
+    acquire_instance_lock()
     load_state()
     init_runtime_db()
+    rcb = RollingCircuitBreaker("btc15m", log_fn=log)
     log("=" * 60)
     log(f"[BTC-15M] STARTING {'(DRY RUN)' if DRY_RUN else '(LIVE)'}")
-    log(f"[BTC-15M] Arb threshold=${ARB_THRESHOLD}, up_delta>={UP_MIN_DELTA}% down_delta>={DOWN_MIN_DELTA}%, confirm={CONFIRM_TICKS} ticks, max daily loss=${MAX_DAILY_LOSS}")
-    log(f"[BTC-15M] min_entry={SIGNAL_MIN_ENTRY_PRICE:.2f} soft_min={SIGNAL_SOFT_MIN_ENTRY_PRICE:.2f} soft_mult={SIGNAL_SOFT_BAND_SIZE_MULT:.2f} generic_max={SIGNAL_MAX_ENTRY_PRICE:.2f} up_max={UP_MAX_ENTRY:.2f} down_max={DOWN_MAX_ENTRY:.2f} spread_max={MAX_SPREAD:.3f} gamma_clob_max={MAX_GAMMA_CLOB_DIFF:.3f}")
+    log(f"[BTC-15M] Arb threshold=${ARB_THRESHOLD}, up_delta>={UP_MIN_DELTA}% down_delta>={DOWN_MIN_DELTA}%, min_sec_rem={SIGNAL_MIN_SEC_REMAINING}s, confirm={CONFIRM_TICKS} ticks, max daily loss=${MAX_DAILY_LOSS}")
+    log(f"[BTC-15M] min_entry={SIGNAL_MIN_ENTRY_PRICE:.2f} soft_min={SIGNAL_SOFT_MIN_ENTRY_PRICE:.2f} soft_mult={SIGNAL_SOFT_BAND_SIZE_MULT:.2f} generic_max={SIGNAL_MAX_ENTRY_PRICE:.2f} up_max={UP_MAX_ENTRY:.2f} down_max={DOWN_MAX_ENTRY:.2f} spread_max={MAX_SPREAD:.3f} gamma_clob_max={MAX_GAMMA_CLOB_DIFF:.3f} gamma_clob_soft={MAX_GAMMA_CLOB_DIFF_SOFT:.3f} soft_guard_cap={SOFT_GUARD_MAX_ENTRY:.2f} soft_guard_edge={SOFT_GUARD_MIN_EDGE:.2f} max_fills_day={MAKER_MAX_FILLS_PER_DAY} max_posts_day={MAKER_MAX_POSTS_PER_DAY}")
+    log(f"[BTC-15M] directions: up_enabled={UP_ENABLED} down_enabled={DOWN_ENABLED} down_exec={DOWN_EXECUTION_ENABLED} default_size=${SNIPE_DEFAULT:.2f} strong_size=${SNIPE_STRONG:.2f}")
     log(f"[BTC-15M] maker={MAKER_ENABLED} dry={MAKER_DRY_RUN} start=T-{MAKER_START_SEC} cancel=T-{MAKER_CANCEL_SEC} offset={MAKER_OFFSET} fok_fallback={MAKER_FOK_FALLBACK_SEC}s retry_min={MAKER_RETRY_MIN_SEC}s max_retries={MAKER_MAX_RETRIES}")
     log(f"[BTC-15M] dir_throttle: lookback={DIR_LOOKBACK} min_wr={DIR_MIN_WR:.2f} max_loss={DIR_MAX_LOSS:.2f} pause_h={DIR_PAUSE_HOURS} one_trade_per_window={ONE_TRADE_PER_WINDOW}")
     log(f"[BTC-15M] cooldown: threshold={COOLDOWN_LOSS_THRESHOLD} losses, duration={COOLDOWN_DURATION_SEC // 60}min, lookback={COOLDOWN_LOOKBACK_SEC // 60}min decel_threshold={MOMENTUM_DECEL_THRESHOLD}")
-    log(f"[BTC-15M] quote_guard: jump_max={QUOTE_JUMP_MAX:.3f} divergence_max={QUOTE_DIVERGENCE_MAX:.3f} divergence_cycles={QUOTE_DIVERGENCE_CYCLES}")
+    s = rcb.status()
+    log(f"[BTC-15M] RCB: lookback={s['lookback']} min_wr={s['min_win_rate']:.0%} cooldown={s['cooldown_sec'] // 60}min enabled={s['enabled']}")
+    log(f"[BTC-15M] quote_guard: jump_max={QUOTE_JUMP_MAX:.3f} jump_confirm={QUOTE_JUMP_CONFIRM_CYCLES} divergence_max={QUOTE_DIVERGENCE_MAX:.3f} divergence_cycles={QUOTE_DIVERGENCE_CYCLES}")
+    log(f"[BTC-15M] reversal={REVERSAL_ENABLED} dry={REVERSAL_DRY_RUN} min_delta={REVERSAL_MIN_DELTA}% entry=[{REVERSAL_MIN_ENTRY_PRICE:.2f},{REVERSAL_MAX_ENTRY_PRICE:.2f}] size=${REVERSAL_SIZE_USD:.2f} tp={REVERSAL_TP_PRICE:.2f} min_sec_rem={REVERSAL_MIN_SEC_REM}s")
     tg("[BTC-15M] Engine started!")
 
     while True:
@@ -2731,6 +3425,11 @@ def main():
             time.sleep(60)
             continue
 
+        # Rolling win rate circuit breaker
+        if not rcb.ok():
+            time.sleep(60)
+            continue
+
         # Cooldown check (loss-based, DB-persisted)
         if not check_and_manage_cooldown():
             time.sleep(SCAN_SEC)
@@ -2758,6 +3457,11 @@ def main():
         # Strategy A: Arb (first 14.75 min)
         if sec_rem > 15:
             check_arb(market)
+
+        # Strategy C: Reversal (contrarian, first 3 min)
+        if REVERSAL_ENABLED:
+            check_reversal(market, sec_rem)
+            check_reversal_exit(market)
 
         # Gabagool tracking
         check_gabagool(market, sec_rem)
